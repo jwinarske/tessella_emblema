@@ -13,6 +13,11 @@
 //! depth-stencil attachment means owning the obligation to *query* what the device supports, and
 //! that obligation is what the module encodes.
 //!
+//! And [`spec`], which turns a shader's permutation switches back into specialization constants
+//! after naga has resolved them away. That is the whole of what stands between one module per
+//! (family, surface) and one module per permutation — see `tests/naga_overrides.rs` for why it is
+//! needed and `spec` for what it does.
+//!
 //! # What is not here yet
 //!
 //! In dependency order: the reader half (`tessella-consume`, ported once to Rust and living in
@@ -27,6 +32,8 @@
 #![forbid(unsafe_code)]
 
 pub mod device;
+pub mod spec;
+mod spirv;
 
 /// The ABI this crate consumes, re-exported so a caller pins one version of it with this crate.
 ///

@@ -1,0 +1,9 @@
+# The compiler this repository is built with, pinned rather than left to whatever `stable`
+# resolves to on the day.
+#
+# 1.94.1 because that is what Yocto wrynose (6.0) ships in oe-core, and because both trees this
+# crate sits between pin the same one: tessella's `rust-toolchain.toml` and emblema's. A mirror
+# built with a third compiler is how an MSRV surprise reaches the board instead of CI.
+[toolchain]
+channel = "1.94.1"
+components = ["clippy", "rustfmt"]

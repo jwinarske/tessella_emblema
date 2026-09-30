@@ -1,0 +1,122 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: nothing here writes to the repository.
+permissions:
+  contents: read
+
+# A push that supersedes an in-flight run cancels it rather than queueing behind it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Third-party actions are pinned by commit SHA, not by tag: a tag is a movable ref, and moving it
+# is the whole shape of a GitHub Actions supply-chain compromise. The trailing comment records
+# which tag each SHA was at when pinned.
+#
+# The toolchain is not installed by an action anywhere below. `rust-toolchain.toml` pins it to the
+# Rust that Yocto wrynose ships, which is also what tessella and emblema pin, and `rustup show`
+# materializes it along with the cross target.
+#
+# # Why every job checks out two repositories
+#
+# This crate depends on `tessella-capture-abi` by path, as a sibling. That is not incidental: the
+# ABI is the boundary this crate exists to sit on, and a version of it resolved from a registry
+# could be older than the producer it is meant to read. So CI lays the trees out the way a
+# developer does -- side by side -- and reads the ABI from tessella's `main`.
+#
+# The consequence is deliberate: a change in tessella that breaks this crate breaks this crate's
+# CI, on its own next run rather than whenever someone next builds it. That is the boundary doing
+# its job. It also means a red run here is not always a change here.
+
+jobs:
+  check:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          path: tessella_emblema
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: jwinarske/tessella
+          path: tessella
+      - run: rustup show
+        working-directory: tessella_emblema
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: tessella_emblema
+      - run: cargo fmt --all --check
+        working-directory: tessella_emblema
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+        working-directory: tessella_emblema
+      - run: cargo test --all-features
+        working-directory: tessella_emblema
+      # The crate denies `missing_docs`, so this catches the other half: a link that resolves to
+      # nothing, which the lint does not see.
+      - run: cargo doc --no-deps
+        working-directory: tessella_emblema
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  cross:
+    # The gating target is a Raspberry Pi 5, and nothing here is built for it in development.
+    # `check` rather than `build`: no cross linker is needed to find a type that is a different
+    # size on the board, and that is the class of break worth catching on every push.
+    name: cross-check aarch64-unknown-linux-gnu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          path: tessella_emblema
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: jwinarske/tessella
+          path: tessella
+      - run: rustup show
+        working-directory: tessella_emblema
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: tessella_emblema
+          key: aarch64
+      - run: cargo check --all-targets --all-features --target aarch64-unknown-linux-gnu
+        working-directory: tessella_emblema
+
+  canary:
+    # Stable is ahead of the pinned toolchain, so its clippy knows lints the pinned one does not.
+    # Advisory because a new lint landing upstream is not this repository failing -- but it is
+    # worth seeing on the day it lands rather than at the next toolchain bump, which is a bump plus
+    # a pile of unrelated diagnostics.
+    #
+    # It earns its keep: it caught `explicit_counter_loop` in tessella on the day that lint
+    # reached stable, where the pinned toolchain was silent.
+    name: stable canary (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          path: tessella_emblema
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: jwinarske/tessella
+          path: tessella
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: tessella_emblema
+          key: stable
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+        working-directory: tessella_emblema
+      - run: cargo test --all-features
+        working-directory: tessella_emblema

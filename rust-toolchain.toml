@@ -7,3 +7,6 @@
 [toolchain]
 channel = "1.94.1"
 components = ["clippy", "rustfmt"]
+# The gating target. Named here rather than added in CI so `rustup show` materializes it for a
+# developer too, and a cross-check is one command on a fresh clone.
+targets = ["aarch64-unknown-linux-gnu"]

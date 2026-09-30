@@ -13,9 +13,8 @@ other, one of them reads the ABI wrong.
 
 ## Why raw Vulkan, and not emblema's HAL
 
-tessella's plan of record (DR-14) says the map draws "at entity/HAL level" inside emblema. That
-layer does not exist in the shape DR-14 assumes, and building it would break emblema's own
-recorded scope:
+tessella's DR-14 says the map draws "at entity/HAL level" inside emblema. That layer does not
+exist in the shape DR-14 assumes, and building it would break emblema's own recorded scope:
 
 - emblema's entity layer is coverage-only and nothing routes through it.
 - Its HAL is a *batch* HAL — one fixed vertex, a closed material enum, fragment-only runtime
@@ -30,9 +29,8 @@ A map pass needs the opposite of most of that: retained device-local geometry ke
 sub-rect texture updates.
 
 So the *intent* of DR-14 is kept — never canvas-level, pipelines compiled ahead of time, the
-canvas composites the result — and the *mechanism* moves here. emblema is asked for four small
-seams instead of a map renderer, and its HAL trait is untouched. This is decision **TI-1** of the
-integration plan.
+canvas composites the result — and the *mechanism* moves here. emblema is asked for a few small
+seams instead of a map renderer, and its HAL trait is untouched.
 
 ## What it needs from emblema, and does not have yet
 
@@ -42,13 +40,12 @@ layout* — so an image emblema created (tracked `UNDEFINED`) and this crate ren
 transitioned from `UNDEFINED` at first sample, which permits the driver to discard the map's
 pixels.
 
-That is **IR-1**, `VulkanTexture::assume_layout`. Until it lands there is no correct hand-off, and
-its test has to run on a tiler: on lavapipe the discard does not show.
+What it needs is a `VulkanTexture::assume_layout`. Until that lands there is no correct hand-off,
+and its test has to run on a tiler: on lavapipe the discard does not show.
 
-## Open question 1, answered
+## Whether naga can emit specialization constants
 
-Whether naga can emit SPIR-V specialization constants from WGSL `override` decides the *form* of
-the permutation mechanism, not whether it happens. `tests/naga_overrides.rs` answers it against
+The answer decides the *form* of the permutation mechanism, not whether it happens. `tests/naga_overrides.rs` answers it against
 naga 23 and pins the answer so it cannot go stale:
 
 - The SPIR-V backend **refuses** a module that still carries an override — `Error::Override`, not
@@ -67,12 +64,13 @@ explosion.
 ## Status
 
 Scaffolding. What is here is the repository, its pins, and the device-side decisions that can be
-made and tested without a GPU, a stream, or IR-1 — chiefly format selection, which is an
+made and tested without a GPU, a stream, or the layout hand-off — chiefly format selection,
+which is an
 obligation this crate inherits directly by owning its own depth-stencil attachment.
 
-Not here yet, in dependency order: `tessella-consume` (the reader/draw-list/stencil-partition
-half, ported once to Rust and living in the tessella workspace — decision TI-7), the geometry and
-uniform stores, the shader modules, and the hand-off that waits on IR-1.
+Not here yet, in dependency order: `tessella-consume` (the reader, draw list and stencil partition,
+living once in the tessella workspace), the geometry and uniform stores, the shader modules, and
+the hand-off that waits on `assume_layout`.
 
 ## Targets
 

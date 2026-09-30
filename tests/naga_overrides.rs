@@ -1,12 +1,12 @@
-//! What naga does with a WGSL `override`, and what that leaves of TI-4.
+//! What naga does with a WGSL `override`, and what that leaves of the permutation mechanism.
 //!
-//! This is open question 1 of the integration plan. A permutation of a shader family — "this
+//! A permutation of a shader family — "this
 //! layer's color comes from an attribute, that one's is uniform" — has to be *folded out* at
 //! pipeline creation, not branched around at run time, because on the gating target a fragment
 //! shader costs what its whole body needs and not what the taken branch needs: three unrelated
 //! additions once cost about ten per cent on a path that used none of them.
 //!
-//! The plan allowed for two shapes. Either naga emits `OpSpecConstantTrue`/`False` with a `SpecId`
+//! There were two possible shapes. Either naga emits `OpSpecConstantTrue`/`False` with a `SpecId`
 //! decoration and the mechanism is literal, or it resolves overrides before emission and the
 //! fallback is a build-time SPIR-V rewrite: emit each constant as a boolean `OpConstant` carrying
 //! a marker and patch it to `OpSpecConstantFalse` plus a `SpecId`.
@@ -89,7 +89,7 @@ fn front(source: &str) -> (naga::Module, naga::valid::ModuleInfo) {
 /// **The answer: naga's SPIR-V backend refuses a module that still has an override.**
 ///
 /// Not "resolves it first" — it will not emit at all, returning `spv::Error::Override`. So the
-/// literal form of TI-4 is unavailable, and so is any scheme that hoped to catch the override on
+/// literal form is unavailable, and so is any scheme that hoped to catch the override on
 /// its way through the backend.
 #[test]
 fn the_spirv_backend_refuses_an_unresolved_override() {
@@ -104,7 +104,7 @@ fn the_spirv_backend_refuses_an_unresolved_override() {
 
 /// And substituting the value leaves exactly what a build-time rewrite needs.
 ///
-/// This is the half that decides TI-4, and it is the opposite of what the plan feared.
+/// This is the half that decides the mechanism, and it is the opposite of the worry.
 /// `process_overrides` does **not** constant-fold the branch: the module comes out carrying one
 /// boolean `OpConstant` and one `OpBranchConditional` that reads it. So there is a constant to
 /// patch and a branch for it to steer.
@@ -117,7 +117,7 @@ fn the_spirv_backend_refuses_an_unresolved_override() {
 /// time.
 ///
 /// One module per (family, surface), permutations as pipeline-creation arguments, no translator at
-/// run time, and no module-count explosion. R-4's ~200 lines of tooling, and not a shader-cost
+/// run time, and no module-count explosion: a couple of hundred lines of tooling, not a shader-cost
 /// regression.
 #[test]
 fn a_substituted_override_leaves_a_constant_and_a_branch_to_patch() {
@@ -145,7 +145,7 @@ fn a_substituted_override_leaves_a_constant_and_a_branch_to_patch() {
             // The switch, still a constant in the module.
             plain_bool_constants: 1,
             // And the branch reading it, un-folded. If naga ever folds this, the rewrite has
-            // nothing to steer and TI-4 needs rethinking -- which is why the count is pinned.
+            // nothing to steer and the mechanism needs rethinking, which is why this is pinned.
             conditional_branches: 1,
         }
     );

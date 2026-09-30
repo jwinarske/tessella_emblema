@@ -27,3 +27,6 @@ pedantic = { level = "deny", priority = -1 }
 # Every Vulkan enum is a `u32` newtype and every size is a `usize`; the casts between them are
 # the API's, not this crate's judgment to second-guess.
 cast_possible_truncation = "allow"
+
+[dev-dependencies]
+naga = { version = "23", features = ["wgsl-in", "spv-out"] }

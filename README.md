@@ -45,6 +45,25 @@ pixels.
 That is **IR-1**, `VulkanTexture::assume_layout`. Until it lands there is no correct hand-off, and
 its test has to run on a tiler: on lavapipe the discard does not show.
 
+## Open question 1, answered
+
+Whether naga can emit SPIR-V specialization constants from WGSL `override` decides the *form* of
+the permutation mechanism, not whether it happens. `tests/naga_overrides.rs` answers it against
+naga 23 and pins the answer so it cannot go stale:
+
+- The SPIR-V backend **refuses** a module that still carries an override — `Error::Override`, not
+  a silent resolution. So the literal form, where the driver binds specialization constants, is
+  unavailable.
+- `process_overrides` substitutes a value and emits, and **does not fold the branch**: the module
+  comes out with one boolean `OpConstant` and one `OpBranchConditional` reading it.
+
+That second point is the one that matters, and it is the opposite of what the plan feared. There
+is a constant to patch and a branch for it to steer, so the fallback works as written: substitute,
+then rewrite that `OpConstantFalse` into `OpSpecConstantFalse` with a `SpecId` decoration, and let
+the driver fold the branch and the dead arm at pipeline creation. One module per (family, surface),
+permutations as pipeline-creation arguments, nothing translated at run time, and no module-count
+explosion.
+
 ## Status
 
 Scaffolding. What is here is the repository, its pins, and the device-side decisions that can be

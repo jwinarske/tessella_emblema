@@ -45,6 +45,7 @@
 pub mod device;
 pub mod preamble;
 pub mod residency;
+pub mod shaders;
 pub mod spec;
 mod spirv;
 pub mod textures;

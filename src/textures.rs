@@ -1,0 +1,276 @@
+//! What the device holds for each texture, and which parts of it are owed.
+//!
+//! Two things that are not the geometry story.
+//!
+//! A texture is created once and written many times. A `TextureUpdate` carrying a different size
+//! or format is not an upload, it is a different image: the old one has to go and a new one be
+//! made, and a backend that writes the new pixels into the old allocation either overruns it or
+//! leaves a stale border. So that case is reported rather than handled as damage.
+//!
+//! And an update names *regions*. §6.4 caps the producer's list and spills to a union past it,
+//! which stops the opposite-corners pathology — two small writes in opposite corners whose union
+//! is the whole texture. The same discipline is needed here, because a consumer accumulates across
+//! several updates before it flushes, and four tidy rects per update become sixteen untidy ones by
+//! the time anything is uploaded.
+//!
+//! Freeing follows the geometry rule exactly: a retire is the producer's clock, a frame completing
+//! is the device's, and nothing is freed on the first.
+
+use std::collections::BTreeMap;
+
+use tessella_capture_abi::envelope::{Extent, Rect16, TextureId};
+
+use crate::residency::FrameNo;
+
+/// What an update asks the backend to do before it uploads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Needs {
+    /// Nothing: the texture exists at this size and format, and the regions are damage.
+    Upload,
+    /// The texture does not exist yet.
+    Create,
+    /// It exists at a different size or format, so it has to be made again.
+    ///
+    /// The old allocation is scheduled for freeing on the frame given, not dropped here: a frame
+    /// recorded earlier may still be sampling it.
+    Recreate,
+}
+
+/// The damage owed on one texture.
+///
+/// Rects are kept disjoint-ish rather than exactly: two that overlap or touch are unioned, which
+/// can grow the area a little and saves a region. Past `cap` they all become one union, which is
+/// the whole-texture write this is otherwise avoiding — deliberately, because beyond a handful of
+/// regions the per-region overhead is the larger cost.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Damage {
+    rects: Vec<Rect16>,
+}
+
+/// The widest a rect can be before the arithmetic below would not fit.
+fn bounds(rect: Rect16) -> (u32, u32, u32, u32) {
+    let x = u32::from(rect.x);
+    let y = u32::from(rect.y);
+    (x, y, x + u32::from(rect.w), y + u32::from(rect.h))
+}
+
+/// Whether two rects overlap or touch, so that one rect covers both no worse than two do.
+fn meets(a: Rect16, b: Rect16) -> bool {
+    let (ax0, ay0, ax1, ay1) = bounds(a);
+    let (bx0, by0, bx1, by1) = bounds(b);
+    ax0 <= bx1 && bx0 <= ax1 && ay0 <= by1 && by0 <= ay1
+}
+
+/// The smallest rect covering both.
+fn union(a: Rect16, b: Rect16) -> Rect16 {
+    let (ax0, ay0, ax1, ay1) = bounds(a);
+    let (bx0, by0, bx1, by1) = bounds(b);
+    let (x0, y0) = (ax0.min(bx0), ay0.min(by0));
+    let (x1, y1) = (ax1.max(bx1), ay1.max(by1));
+    Rect16 {
+        x: x0 as u16,
+        y: y0 as u16,
+        w: (x1 - x0) as u16,
+        h: (y1 - y0) as u16,
+    }
+}
+
+impl Damage {
+    /// No damage.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a region, unioning it with any it meets.
+    ///
+    /// Unioning can make the result meet a rect it did not before, so this settles rather than
+    /// doing one pass: a rect bridging two others collapses all three.
+    ///
+    /// Past `cap` regions everything becomes one union. An empty rect is dropped — a zero-area
+    /// update is a producer saying nothing changed, and keeping it would spend a region on it.
+    pub fn add(&mut self, rect: Rect16, cap: usize) {
+        if rect.w == 0 || rect.h == 0 {
+            return;
+        }
+        let mut merged = rect;
+        let mut settled = false;
+        while !settled {
+            settled = true;
+            let mut keep = Vec::with_capacity(self.rects.len());
+            for held in self.rects.drain(..) {
+                if meets(merged, held) {
+                    merged = union(merged, held);
+                    settled = false;
+                } else {
+                    keep.push(held);
+                }
+            }
+            self.rects = keep;
+        }
+        self.rects.push(merged);
+
+        if self.rects.len() > cap
+            && let Some(all) = self.rects.drain(..).reduce(union)
+        {
+            self.rects.push(all);
+        }
+    }
+
+    /// The regions owed, in no particular order.
+    #[must_use]
+    pub fn rects(&self) -> &[Rect16] {
+        &self.rects
+    }
+
+    /// Whether anything is owed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rects.is_empty()
+    }
+
+    /// Takes the damage, leaving none.
+    pub fn take(&mut self) -> Vec<Rect16> {
+        core::mem::take(&mut self.rects)
+    }
+}
+
+/// One texture the device holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Held {
+    size: Extent,
+    format: u8,
+    damage: Damage,
+}
+
+/// Every texture the device holds, and what each is owed.
+#[derive(Debug, Clone, Default)]
+pub struct Textures {
+    held: BTreeMap<TextureId, Held>,
+    retiring: BTreeMap<TextureId, FrameNo>,
+}
+
+impl Textures {
+    /// Nothing held.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Takes an update, and says what the backend has to do about it.
+    ///
+    /// An empty rect list is a whole-texture write, which is how the producer says it has no
+    /// damage worth describing — so it becomes damage covering the whole image rather than nothing.
+    ///
+    /// `frame` is the frame being recorded, used only if the texture has to be remade.
+    pub fn updated(
+        &mut self,
+        texture: TextureId,
+        size: Extent,
+        format: u8,
+        rects: &[Rect16],
+        cap: usize,
+        frame: FrameNo,
+    ) -> Needs {
+        let needs = match self.held.get(&texture) {
+            None => Needs::Create,
+            Some(held) if held.size != size || held.format != format => Needs::Recreate,
+            Some(_) => Needs::Upload,
+        };
+
+        if needs != Needs::Upload {
+            if needs == Needs::Recreate {
+                // The old allocation outlives this call: a frame recorded earlier may still be
+                // sampling it, which is the same reason geometry is not freed on retire.
+                self.retiring.insert(texture, frame);
+            }
+            self.held.insert(
+                texture,
+                Held {
+                    size,
+                    format,
+                    damage: Damage::new(),
+                },
+            );
+        }
+
+        // Present either way: `Upload` means it was already there, and the other two just
+        // inserted it. Written as a lookup that can fail rather than one that cannot, so the
+        // function has no panic to document.
+        let Some(held) = self.held.get_mut(&texture) else {
+            return needs;
+        };
+        if rects.is_empty() {
+            // An extent is `u32` and a rect is `u16`, so a texture larger than a rect can
+            // address is clamped rather than wrapped. The producer could not have described
+            // damage on such a texture either -- its own rects are the same type -- so a backend
+            // taking this as "write what you can address" is reading it the way the ABI means it.
+            held.damage.add(
+                Rect16 {
+                    x: 0,
+                    y: 0,
+                    w: u16::try_from(size.width).unwrap_or(u16::MAX),
+                    h: u16::try_from(size.height).unwrap_or(u16::MAX),
+                },
+                cap,
+            );
+        } else {
+            for rect in rects {
+                held.damage.add(*rect, cap);
+            }
+        }
+        needs
+    }
+
+    /// The regions owed on one texture.
+    #[must_use]
+    pub fn damage(&self, texture: TextureId) -> &[Rect16] {
+        self.held
+            .get(&texture)
+            .map_or(&[], |held| held.damage.rects())
+    }
+
+    /// Takes the damage owed, leaving the texture held and clean.
+    pub fn uploaded(&mut self, texture: TextureId) -> Vec<Rect16> {
+        self.held
+            .get_mut(&texture)
+            .map(|held| held.damage.take())
+            .unwrap_or_default()
+    }
+
+    /// The producer retired it, during `frame`.
+    pub fn retired(&mut self, texture: TextureId, frame: FrameNo) {
+        if self.held.remove(&texture).is_some() {
+            self.retiring.insert(texture, frame);
+        }
+    }
+
+    /// Every allocation that may now be freed, given every frame through `frame` has completed.
+    ///
+    /// Drains, as the geometry side does: what this returns is no longer tracked, so ignoring it
+    /// leaks rather than double-frees.
+    pub fn completed(&mut self, frame: FrameNo) -> Vec<TextureId> {
+        let freeable: Vec<TextureId> = self
+            .retiring
+            .iter()
+            .filter(|(_, retired)| **retired <= frame)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &freeable {
+            self.retiring.remove(id);
+        }
+        freeable
+    }
+
+    /// How many textures the device holds.
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.held.len()
+    }
+
+    /// How many allocations are waiting to be freed.
+    #[must_use]
+    pub fn retiring(&self) -> usize {
+        self.retiring.len()
+    }
+}

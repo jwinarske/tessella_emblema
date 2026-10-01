@@ -17,6 +17,10 @@
 //! holds, what it still needs, and what it may let go of. The use-after-free lives there rather
 //! than in the allocation, which is why it is the half that can be tested without a device.
 //!
+//! [`textures`], the same bookkeeping for images, plus the part geometry does not have: an update
+//! naming a different size or format is a different image rather than damage, and regions
+//! accumulate across updates and have to be kept from becoming a whole-texture write by accident.
+//!
 //! [`uniforms`], which shadows a layer's consolidated buffer so a frame's scattered slot writes
 //! become the few contiguous ranges §11.7 asks for rather than a whole-buffer rewrite.
 //!
@@ -42,6 +46,7 @@ pub mod device;
 pub mod residency;
 pub mod spec;
 mod spirv;
+pub mod textures;
 pub mod uniforms;
 
 /// The ABI this crate consumes, re-exported so a caller pins one version of it with this crate.

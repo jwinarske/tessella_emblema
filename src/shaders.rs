@@ -15,6 +15,9 @@
 //! blocks arrive as a consolidated buffer indexed per drawable — an array of blocks, one slot per
 //! draw — which is what the producer's `ubo_index` indexes into. A uniform buffer would need one
 //! binding per draw.
+//!
+//! The family's blocks come first, then the surface's, then a texture and a sampler for each image
+//! the surface samples. So a module is one (family, surface) pair and the pair decides the set.
 
 use std::fmt::Write as _;
 
@@ -23,6 +26,7 @@ use tessella_capture_abi::generated::shader_attributes::ShaderAttribute;
 use tessella_capture_abi::generated::ubo_layouts::UboLayout;
 
 use crate::preamble::{Unrepresentable, declare, type_name};
+use crate::surface::Surface;
 
 /// Why a family could not be assembled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,15 +117,18 @@ pub fn attribute_name(declared: &str) -> String {
     out
 }
 
-/// Assembles a module: the blocks, the vertex input, then the body.
+/// Assembles a module for one (family, surface) pair: the blocks, the vertex input, the surface's
+/// placement, then the family's body.
 ///
-/// Blocks bind in the order given, from zero. The body sees each block as a binding named after
-/// its type in snake case, and the vertex input as `In`.
+/// The family's blocks bind first, from zero, then the surface's, then two bindings for each
+/// texture the surface samples. The body sees each block as a binding named after its type in
+/// snake case, the vertex input as `In`, and the surface as `place`.
 ///
 /// # Errors
 ///
 /// [`Error`] from a block that cannot be declared, or an attribute the ABI calls invalid.
 pub fn module(
+    surface: Surface,
     blocks: &[&UboLayout],
     attributes: &[ShaderAttribute],
     body: &str,
@@ -129,18 +136,43 @@ pub fn module(
     let mut out = String::new();
     out.push_str("// Generated declarations. The body below is the only hand-written part.\n\n");
 
-    for layout in blocks {
+    let all: Vec<&UboLayout> = blocks
+        .iter()
+        .copied()
+        .chain(surface.blocks().iter().copied())
+        .collect();
+
+    for layout in &all {
         out.push_str(&declare(layout)?);
         out.push('\n');
     }
 
-    for (binding, layout) in blocks.iter().enumerate() {
+    for (binding, layout) in all.iter().enumerate() {
         let name = type_name(layout.name);
         let _ = writeln!(
             out,
             "@group(0) @binding({binding}) var<storage, read> {}: array<{name}>;",
             binding_name(&name)
         );
+    }
+    // A texture and the sampler that reads it, which a placement names together. After the blocks
+    // rather than in a group of their own: a family with no texture then has no gap in its set,
+    // and the whole of a draw's state is one descriptor set either way.
+    //
+    // Counted rather than computed from the index. One surface samples one image, so an index
+    // formula would be arithmetic no test could distinguish from a wrong one.
+    let mut binding = all.len();
+    for texture in surface.textures() {
+        let _ = writeln!(
+            out,
+            "@group(0) @binding({binding}) var {texture}: texture_2d<f32>;"
+        );
+        binding += 1;
+        let _ = writeln!(
+            out,
+            "@group(0) @binding({binding}) var {texture}_sampler: sampler;"
+        );
+        binding += 1;
     }
     out.push('\n');
 
@@ -164,6 +196,8 @@ pub fn module(
     out.push_str("}\n\n");
 
     out.push_str(PRELUDE);
+    out.push('\n');
+    out.push_str(surface.placement());
     out.push('\n');
     out.push_str(body);
     Ok(out)
@@ -191,11 +225,10 @@ fn binding_name(type_name: &str) -> String {
 /// against the generated declarations above it, so a field renamed in the ABI breaks the build
 /// here rather than drawing something else.
 ///
-/// `ubo_index` reaches the vertex stage as a push constant, which is why the slot is read from one
-/// rather than passed per vertex.
+/// The position goes through `place` rather than through a matrix multiply, which is what lets the
+/// same body draw on a plane and on a globe. A background has no surface beyond those two: it
+/// covers the viewport rather than a tile, so the producer neither anchors it nor raises it.
 pub const BACKGROUND_BODY: &str = r"
-var<push_constant> ubo_index: u32;
-
 struct Out {
     @builtin(position) clip: vec4<f32>,
 }
@@ -204,7 +237,7 @@ struct Out {
 fn vertex_main(in: In) -> Out {
     let drawable = background_drawable_ubo[ubo_index];
     var out: Out;
-    out.clip = drawable.matrix * vec4<f32>(in.background_pos, 1.0);
+    out.clip = place(in.background_pos, drawable.matrix);
     return out;
 }
 
@@ -215,7 +248,11 @@ fn fragment_main() -> @location(0) vec4<f32> {
 }
 ";
 
-/// Helpers every family's body may use, prepended to the body by [`module`].
+/// What every body and every placement may use, prepended to both by [`module`].
+///
+/// `ubo_index` is the drawable's slot in the consolidated blocks, and it reaches the vertex stage
+/// as a push constant rather than per vertex: it is one number a draw, not one a vertex. Declared
+/// here because a placement reads it too — the bend and the raise are both per drawable.
 ///
 /// A data-driven paint property arrives twice: as a vertex attribute holding the value at two zoom
 /// levels, and as a `_t` field in the drawable block saying how far between them this frame is.
@@ -225,6 +262,8 @@ fn fragment_main() -> @location(0) vec4<f32> {
 /// two floats. Unpacking is mbgl's, and the constant is its own -- 255 per channel, the high
 /// channel scaled by 256.
 pub const PRELUDE: &str = r"
+var<push_constant> ubo_index: u32;
+
 fn mix_value(packed: vec2<f32>, t: f32) -> f32 {
     return mix(packed.x, packed.y, t);
 }
@@ -242,11 +281,12 @@ fn mix_color(packed: vec4<f32>, t: f32) -> vec4<f32> {
 
 /// The fill family's body.
 ///
-/// Position in tile units through the drawable's matrix; color and opacity are data-driven, so
-/// each is mixed between its two zoom endpoints by the `_t` the block carries.
+/// Position in tile units through the surface's `place`; color and opacity are data-driven, so each
+/// is mixed between its two zoom endpoints by the `_t` the block carries.
+///
+/// Nothing here knows which surface it is on. A fill has no height of its own, so the third
+/// component is zero -- the plane and the raise both read it, and only an extrusion ever sends one.
 pub const FILL_BODY: &str = r"
-var<push_constant> ubo_index: u32;
-
 struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) color: vec4<f32>,
@@ -257,7 +297,7 @@ struct Out {
 fn vertex_main(in: In) -> Out {
     let drawable = fill_drawable_ubo[ubo_index];
     var out: Out;
-    out.clip = drawable.matrix * vec4<f32>(vec2<f32>(in.fill_pos), 0.0, 1.0);
+    out.clip = place(vec3<f32>(vec2<f32>(in.fill_pos), 0.0), drawable.matrix);
     out.color = mix_color(in.fill_color, drawable.color_t);
     out.opacity = mix_value(in.fill_opacity, drawable.opacity_t);
     return out;
@@ -274,8 +314,6 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
 /// The same geometry as a fill, drawn as lines with the outline color. `fill_outline_color` is its
 /// own attribute: an outline is not the fill's color at a different opacity.
 pub const FILL_OUTLINE_BODY: &str = r"
-var<push_constant> ubo_index: u32;
-
 struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) outline_color: vec4<f32>,
@@ -286,7 +324,7 @@ struct Out {
 fn vertex_main(in: In) -> Out {
     let drawable = fill_drawable_ubo[ubo_index];
     var out: Out;
-    out.clip = drawable.matrix * vec4<f32>(vec2<f32>(in.fill_pos), 0.0, 1.0);
+    out.clip = place(vec3<f32>(vec2<f32>(in.fill_pos), 0.0), drawable.matrix);
     out.outline_color = mix_color(in.fill_outline_color, drawable.color_t);
     out.opacity = mix_value(in.fill_opacity, drawable.opacity_t);
     return out;
@@ -304,8 +342,6 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
 /// to, which is what makes one vertex buffer draw a disc. Six data-driven properties, each with
 /// its own `_t`.
 pub const CIRCLE_BODY: &str = r"
-var<push_constant> ubo_index: u32;
-
 struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) color: vec4<f32>,
@@ -329,7 +365,7 @@ fn vertex_main(in: In) -> Out {
     let corner = vec2<f32>(vec2<i32>(in.circle_pos) % 2) * 2.0 - 1.0;
     let reach = (radius + stroke_width) * drawable.extrude_scale;
 
-    out.clip = drawable.matrix * vec4<f32>(vec2<f32>(in.circle_pos) + corner * reach, 0.0, 1.0);
+    out.clip = place(vec3<f32>(vec2<f32>(in.circle_pos) + corner * reach, 0.0), drawable.matrix);
     out.extrude = corner;
     out.color = mix_color(in.circle_color, drawable.color_t);
     out.stroke_color = mix_color(in.circle_stroke_color, drawable.stroke_color_t);
@@ -362,8 +398,6 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
 /// of each component is the normal's sign and the rest is the coordinate. The data attribute
 /// carries the extrusion and the line's distance along itself.
 pub const LINE_BODY: &str = r"
-var<push_constant> ubo_index: u32;
-
 struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) color: vec4<f32>,
@@ -390,8 +424,10 @@ fn vertex_main(in: In) -> Out {
     let half = select(width * 0.5, gapwidth * 0.5 + width, gapwidth > 0.0);
     let extrude = vec2<f32>(in.line_data.xy) / 128.0 - 1.0;
 
-    out.clip = drawable.matrix
-        * vec4<f32>(position + extrude * (half + offset) * drawable.ratio, 0.0, 1.0);
+    out.clip = place(
+        vec3<f32>(position + extrude * (half + offset) * drawable.ratio, 0.0),
+        drawable.matrix
+    );
     out.normal = normal;
     out.width = half;
     out.color = mix_color(in.line_color, drawable.color_t);

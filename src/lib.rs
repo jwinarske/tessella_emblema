@@ -21,6 +21,10 @@
 //! naming a different size or format is a different image rather than damage, and regions
 //! accumulate across updates and have to be kept from becoming a whole-texture write by accident.
 //!
+//! [`surface`], which is the other half of a shader module: a family says what a vertex is and a
+//! surface says where it lands, so a module is one (family, surface) pair and the surface supplies
+//! the one function the body places through.
+//!
 //! [`uniforms`], which shadows a layer's consolidated buffer so a frame's scattered slot writes
 //! become the few contiguous ranges §11.7 asks for rather than a whole-buffer rewrite.
 //!
@@ -48,6 +52,7 @@ pub mod residency;
 pub mod shaders;
 pub mod spec;
 mod spirv;
+pub mod surface;
 pub mod textures;
 pub mod uniforms;
 

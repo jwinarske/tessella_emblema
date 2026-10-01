@@ -16,45 +16,66 @@ use tessella_capture_abi::generated::ubo_layouts::{
 use tessella_emblema::shaders::{
     BACKGROUND_BODY, CIRCLE_BODY, FILL_BODY, FILL_OUTLINE_BODY, LINE_BODY, attribute_name, module,
 };
+use tessella_emblema::surface::Surface;
 
-/// Every plane family: its blocks, its attributes, its body.
-fn families() -> Vec<(
-    &'static str,
-    Vec<&'static UboLayout>,
-    &'static [ShaderAttribute],
-    &'static str,
-)> {
+/// A family, and the surfaces the producer can draw it on.
+struct Family {
+    name: &'static str,
+    blocks: Vec<&'static UboLayout>,
+    attributes: &'static [ShaderAttribute],
+    body: &'static str,
+    surfaces: &'static [Surface],
+}
+
+/// Every family a plane module exists for, and which surfaces each one has.
+///
+/// A background has neither of the two surfaces that need a block of their own: it covers the
+/// viewport rather than a tile, so the producer writes it no bend block and never marks it
+/// raised. Everything else has all four.
+fn families() -> Vec<Family> {
+    let all = &[
+        Surface::Plane,
+        Surface::Globe,
+        Surface::GlobeAnchored,
+        Surface::Terrain,
+    ][..];
+    let flat_or_bent = &[Surface::Plane, Surface::Globe][..];
     vec![
-        (
-            "background",
-            vec![&BACKGROUND_DRAWABLE_UBO, &BACKGROUND_PROPS_UBO],
-            &BACKGROUND_SHADER,
-            BACKGROUND_BODY,
-        ),
-        (
-            "fill",
-            vec![&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
-            &FILL_SHADER,
-            FILL_BODY,
-        ),
-        (
-            "fill_outline",
-            vec![&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
-            &FILL_OUTLINE_SHADER,
-            FILL_OUTLINE_BODY,
-        ),
-        (
-            "line",
-            vec![&LINE_DRAWABLE_UBO, &LINE_EVALUATED_PROPS_UBO],
-            &LINE_SHADER,
-            LINE_BODY,
-        ),
-        (
-            "circle",
-            vec![&CIRCLE_DRAWABLE_UBO, &CIRCLE_EVALUATED_PROPS_UBO],
-            &CIRCLE_SHADER,
-            CIRCLE_BODY,
-        ),
+        Family {
+            name: "background",
+            blocks: vec![&BACKGROUND_DRAWABLE_UBO, &BACKGROUND_PROPS_UBO],
+            attributes: &BACKGROUND_SHADER,
+            body: BACKGROUND_BODY,
+            surfaces: flat_or_bent,
+        },
+        Family {
+            name: "fill",
+            blocks: vec![&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
+            attributes: &FILL_SHADER,
+            body: FILL_BODY,
+            surfaces: all,
+        },
+        Family {
+            name: "fill_outline",
+            blocks: vec![&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
+            attributes: &FILL_OUTLINE_SHADER,
+            body: FILL_OUTLINE_BODY,
+            surfaces: all,
+        },
+        Family {
+            name: "line",
+            blocks: vec![&LINE_DRAWABLE_UBO, &LINE_EVALUATED_PROPS_UBO],
+            attributes: &LINE_SHADER,
+            body: LINE_BODY,
+            surfaces: all,
+        },
+        Family {
+            name: "circle",
+            blocks: vec![&CIRCLE_DRAWABLE_UBO, &CIRCLE_EVALUATED_PROPS_UBO],
+            attributes: &CIRCLE_SHADER,
+            body: CIRCLE_BODY,
+            surfaces: all,
+        },
     ]
 }
 
@@ -81,6 +102,7 @@ fn compile(source: &str) -> Vec<u32> {
 
 fn background() -> String {
     module(
+        Surface::Plane,
         &[&BACKGROUND_DRAWABLE_UBO, &BACKGROUND_PROPS_UBO],
         &BACKGROUND_SHADER,
         BACKGROUND_BODY,
@@ -142,6 +164,7 @@ fn the_vertex_input_matches_the_attribute_table() {
 #[test]
 fn a_body_naming_an_undeclared_field_fails() {
     let source = module(
+        Surface::Plane,
         &[&BACKGROUND_DRAWABLE_UBO],
         &BACKGROUND_SHADER,
         r"
@@ -193,16 +216,25 @@ const fn is_identifier(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-/// Every plane family compiles, validates and emits.
+/// Every family on every surface it has compiles, validates and emits.
 #[test]
-fn every_plane_family_compiles() {
-    for (name, blocks, attributes, body) in families() {
-        let source = module(&blocks, attributes, body)
-            .unwrap_or_else(|why| panic!("{name} does not assemble: {why:?}"));
-        let words = compile(&source);
-        assert!(words.len() > 64, "{name} emitted {} words", words.len());
-        assert_eq!(words[0], 0x0723_0203, "{name} is not SPIR-V");
+fn every_family_on_every_surface_compiles() {
+    let mut pairs = 0;
+    for family in families() {
+        for surface in family.surfaces {
+            let what = format!("{}{}", family.name, surface.suffix());
+            let source = module(*surface, &family.blocks, family.attributes, family.body)
+                .unwrap_or_else(|why| panic!("{what} does not assemble: {why:?}"));
+            let words = compile(&source);
+            assert!(words.len() > 64, "{what} emitted {} words", words.len());
+            assert_eq!(words[0], 0x0723_0203, "{what} is not SPIR-V");
+            pairs += 1;
+        }
     }
+    assert_eq!(
+        pairs, 18,
+        "the matrix grew or shrank; look at the new pairs"
+    );
 }
 
 /// Every attribute the producer sends is read by the body that receives it.
@@ -212,13 +244,21 @@ fn every_plane_family_compiles() {
 /// it: an unused input is legal.
 #[test]
 fn every_attribute_is_read() {
-    for (name, blocks, attributes, body) in families() {
-        let source = module(&blocks, attributes, body).expect("assembles");
-        for attribute in attributes {
-            let field = attribute_name(attribute.name);
-            // Once in the generated input, and at least once more in the body that reads it.
-            let uses = identifier_uses(&source, &field);
-            assert!(uses >= 2, "{name} declares {field} and never reads it");
+    for family in families() {
+        for surface in family.surfaces {
+            let source = module(*surface, &family.blocks, family.attributes, family.body)
+                .expect("assembles");
+            for attribute in family.attributes {
+                let field = attribute_name(attribute.name);
+                // Once in the generated input, and at least once more in the body that reads it.
+                let uses = identifier_uses(&source, &field);
+                assert!(
+                    uses >= 2,
+                    "{}{} declares {field} and never reads it",
+                    family.name,
+                    surface.suffix()
+                );
+            }
         }
     }
 }
@@ -230,18 +270,23 @@ fn every_attribute_is_read() {
 /// stopped interpolating rather than like a bug.
 #[test]
 fn every_zoom_factor_is_used() {
-    for (name, blocks, attributes, body) in families() {
-        let source = module(&blocks, attributes, body).expect("assembles");
-        for block in blocks {
-            for field in block.fields {
-                if !field.name.ends_with("_t") {
-                    continue;
+    for family in families() {
+        for surface in family.surfaces {
+            let source = module(*surface, &family.blocks, family.attributes, family.body)
+                .expect("assembles");
+            for block in &family.blocks {
+                for field in block.fields {
+                    if !field.name.ends_with("_t") {
+                        continue;
+                    }
+                    assert!(
+                        identifier_uses(&source, field.name) >= 2,
+                        "{}{} declares {} and never mixes with it",
+                        family.name,
+                        surface.suffix(),
+                        field.name
+                    );
                 }
-                assert!(
-                    identifier_uses(&source, field.name) >= 2,
-                    "{name} declares {} and never mixes with it",
-                    field.name
-                );
             }
         }
     }

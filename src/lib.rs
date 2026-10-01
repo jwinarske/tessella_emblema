@@ -13,6 +13,10 @@
 //! depth-stencil attachment means owning the obligation to *query* what the device supports, and
 //! that obligation is what the module encodes.
 //!
+//! [`residency`], which is the bookkeeping either side of a device allocation: what the device
+//! holds, what it still needs, and what it may let go of. The use-after-free lives there rather
+//! than in the allocation, which is why it is the half that can be tested without a device.
+//!
 //! And [`spec`], which turns a shader's permutation switches back into specialization constants
 //! after naga has resolved them away. That is the whole of what stands between one module per
 //! (family, surface) and one module per permutation — see `tests/naga_overrides.rs` for why it is
@@ -32,6 +36,7 @@
 #![forbid(unsafe_code)]
 
 pub mod device;
+pub mod residency;
 pub mod spec;
 mod spirv;
 

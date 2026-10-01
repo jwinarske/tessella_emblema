@@ -183,12 +183,20 @@ name = "tessella-capture-abi"
 version = "0.0.0"
 
 [[package]]
+name = "tessella-consume"
+version = "0.0.0"
+dependencies = [
+ "tessella-capture-abi",
+]
+
+[[package]]
 name = "tessella-emblema"
 version = "0.0.0"
 dependencies = [
  "ash",
  "naga",
  "tessella-capture-abi",
+ "tessella-consume",
 ]
 
 [[package]]

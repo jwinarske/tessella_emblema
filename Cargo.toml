@@ -14,6 +14,11 @@ description = "The map pass of tessella's capture stream, drawn with Vulkan on e
 # is a dependency from the first commit even where the consuming code is not written yet.
 tessella-capture-abi = { path = "../tessella/crates/tessella-capture-abi" }
 
+# The renderer-agnostic half: reading the ring, joining, collapsing, the stencil partition. Shared
+# with every other consumer rather than written again here, which is what keeps two implementations
+# evidence about the drawing rather than about the arithmetic.
+tessella-consume = { path = "../tessella/crates/tessella-consume" }
+
 # Loaded at run time through `libvulkan`, so no C toolchain at build -- the pure-Rust rule both
 # neighboring trees hold to. Pinned to emblema's own `ash`, so a graph containing both has one.
 ash = "0.38"

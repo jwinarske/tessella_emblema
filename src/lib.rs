@@ -17,6 +17,9 @@
 //! holds, what it still needs, and what it may let go of. The use-after-free lives there rather
 //! than in the allocation, which is why it is the half that can be tested without a device.
 //!
+//! [`uniforms`], which shadows a layer's consolidated buffer so a frame's scattered slot writes
+//! become the few contiguous ranges §11.7 asks for rather than a whole-buffer rewrite.
+//!
 //! And [`spec`], which turns a shader's permutation switches back into specialization constants
 //! after naga has resolved them away. That is the whole of what stands between one module per
 //! (family, surface) and one module per permutation — see `tests/naga_overrides.rs` for why it is
@@ -39,6 +42,7 @@ pub mod device;
 pub mod residency;
 pub mod spec;
 mod spirv;
+pub mod uniforms;
 
 /// The ABI this crate consumes, re-exported so a caller pins one version of it with this crate.
 ///

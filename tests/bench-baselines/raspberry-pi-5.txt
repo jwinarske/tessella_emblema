@@ -1,0 +1,67 @@
+# `draw_cost` on a Raspberry Pi 5, against the same bench on an x86-64 desktop.
+#
+# Pi 5 Model B Rev 1.0, Debian 13 trixie, kernel 6.18.33+rpt-rpi-2712, 4 cores, 8 GB,
+# Mesa V3D 7.1.7.0. Governor `performance`, clock 2400000, 59.8 C,
+# `vcgencmd get_throttled` 0x0, load 0.04 and nothing else running.
+#
+# Desktop column: AMD Ryzen 9 9950X, RADV RAPHAEL_MENDOCINO (integrated), Fedora 44.
+#
+#   T=~/.cache/emb/store/toolchain/arm-gnu-toolchain-15.2.rel1-x86_64-aarch64-none-linux-gnu/root/bin
+#   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$T/aarch64-none-linux-gnu-gcc \
+#     cargo bench --no-run --target aarch64-unknown-linux-gnu
+#   scp target/aarch64-unknown-linux-gnu/release/deps/draw_cost-* pi:/tmp/draw_cost
+#
+# # Why glibc here and not static musl
+#
+# `tests/bench-baselines/raspberry-pi-5.txt` in tessella builds its bench as static musl,
+# for a stated reason: the only aarch64 glibc sysroot on the build host is 2.42 and the
+# board runs 2.41, so a glibc cross-build risks symbol versions the board does not have.
+#
+# This bench cannot do that. `ash` reaches Vulkan through `dlopen`, which a static musl
+# binary has only a failing stub of -- the bench would report "no device to measure on" on
+# every board and the file would be empty.
+#
+# So it is a glibc build, and the risk the other file avoids is answered by measurement
+# rather than by construction: the linked binary references at most `GLIBC_2.35`, checked
+# with `objdump -T | grep -oE 'GLIBC_[0-9.]+' | sort -V -u`. That is under the board's
+# 2.41, so the 2.42 sysroot never comes into it. **Check that floor before trusting this
+# recipe on another board**: a device on glibc 2.31 cannot run this binary at all, and the
+# failure is a loader error rather than a wrong number.
+#
+# Both columns are glibc, so unlike the consumer bench there is no allocator confound --
+# and this bench allocates nothing in its timed region regardless.
+#
+# # What each row is
+#
+# 640 drawables recorded into one command buffer, 60 frames a shape, strictly additive:
+# each row is the one above plus the state named. `record` is the CPU recording the command
+# buffer; `submit` is submit to fence, which is the driver processing it and not shading --
+# the index buffer is zeros, so every triangle is degenerate.
+#
+#                     record p50        per draw         submit p50
+# shape           desktop      pi5    desktop     pi5   desktop   pi5
+# instance          9.3     57.8      0.0146   0.0903     25.9  104.0
+# push             14.5    636.8      0.0227   0.9951     34.5  112.4
+# buffers          26.3    651.9      0.0411   1.0186     59.3  112.5
+# descriptors      29.6    656.1      0.0463   1.0252     58.8  112.3
+#
+# All times in microseconds.
+#
+# # What the numbers say
+#
+# **The merge is still not worth porting.** The dearest shape costs 1.03 us a draw here
+# against the Flutter GPU sibling's ~62 us a draw on its own board, half of which is Dart
+# walking batches. Three orders of magnitude is not a gap another driver closes.
+#
+# **But the push constant is the per-draw cost on V3D, and it is not on RADV.** Adding one
+# `vkCmdPushConstants` a draw takes 0.090 us to 0.995 us -- eleven times the cost of the
+# draw it accompanies -- where the same step on RADV is 1.7x. Binding the geometry and the
+# descriptor set on top then adds almost nothing: 0.995, 1.019, 1.025.
+#
+# So carrying `ubo_index` in `firstInstance` and reading `gl_InstanceIndex`, rather than
+# pushing it, is worth 0.58 ms over a 640-drawable frame on this board and nothing at all
+# on the desktop. A desktop-only measurement would have called it a tidiness question.
+#
+# Ratios, pi5 over desktop: 6.2x on `instance`, 44x on `push`, 25x on `buffers`, 22x on
+# `descriptors`. The spread is the point -- these drivers do not have one ratio, so a
+# single scaling factor from desktop to board does not exist for command recording.

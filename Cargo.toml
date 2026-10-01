@@ -33,5 +33,9 @@ pedantic = { level = "deny", priority = -1 }
 # the API's, not this crate's judgment to second-guess.
 cast_possible_truncation = "allow"
 
+[[bench]]
+name = "draw_cost"
+harness = false
+
 [dev-dependencies]
 naga = { version = "23", features = ["wgsl-in", "spv-out"] }

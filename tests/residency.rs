@@ -57,7 +57,7 @@ fn retiring_does_not_free() {
     held.retired(id(1), 7);
     assert_eq!(held.retiring(), 1);
     assert_eq!(held.resident(), 1, "still held by the device");
-    assert!(held.completed(6).is_empty(), "frame 7 has not completed");
+    assert_eq!(held.completed(6), [], "frame 7 has not completed");
 }
 
 /// It is freed when the frame it was retired in completes, and not before.
@@ -93,8 +93,8 @@ fn completing_twice_does_not_free_twice() {
     held.retired(id(1), 4);
 
     assert_eq!(held.completed(4), [id(1)]);
-    assert!(held.completed(4).is_empty(), "already handed over");
-    assert!(held.completed(99).is_empty());
+    assert_eq!(held.completed(4), [], "already handed over");
+    assert_eq!(held.completed(99), []);
 }
 
 /// Re-announcing something retired cancels the free.
@@ -114,7 +114,7 @@ fn a_re_announcement_cancels_a_pending_free() {
     assert_eq!(held.retiring(), 0, "no longer going away");
 
     held.uploaded(id(1));
-    assert!(held.completed(100).is_empty(), "and never freed for it");
+    assert_eq!(held.completed(100), [], "and never freed for it");
     assert!(held.is_current(id(1)));
 }
 
@@ -151,7 +151,7 @@ fn retiring_what_was_never_uploaded_schedules_nothing() {
     assert_eq!(held.retiring(), 0);
     assert_eq!(held.resident(), 0);
     assert_eq!(held.wanted().count(), 0, "and it is no longer wanted");
-    assert!(held.completed(2).is_empty());
+    assert_eq!(held.completed(2), []);
 }
 
 /// Uploading something nobody asked for is ignored.

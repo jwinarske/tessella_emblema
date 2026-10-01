@@ -163,6 +163,8 @@ pub fn module(
     }
     out.push_str("}\n\n");
 
+    out.push_str(PRELUDE);
+    out.push('\n');
     out.push_str(body);
     Ok(out)
 }
@@ -210,5 +212,199 @@ fn vertex_main(in: In) -> Out {
 fn fragment_main() -> @location(0) vec4<f32> {
     let props = background_props_ubo[0];
     return props.color * props.opacity;
+}
+";
+
+/// Helpers every family's body may use, prepended to the body by [`module`].
+///
+/// A data-driven paint property arrives twice: as a vertex attribute holding the value at two zoom
+/// levels, and as a `_t` field in the drawable block saying how far between them this frame is.
+/// Mixing the two is the same arithmetic in every family, so it is written once.
+///
+/// A color arrives packed: four floats holding two colors, each color's four channels folded into
+/// two floats. Unpacking is mbgl's, and the constant is its own -- 255 per channel, the high
+/// channel scaled by 256.
+pub const PRELUDE: &str = r"
+fn mix_value(packed: vec2<f32>, t: f32) -> f32 {
+    return mix(packed.x, packed.y, t);
+}
+
+fn unpack_color(packed: vec2<f32>) -> vec4<f32> {
+    let lo = vec2<f32>(floor(packed.x / 256.0), packed.x - floor(packed.x / 256.0) * 256.0);
+    let hi = vec2<f32>(floor(packed.y / 256.0), packed.y - floor(packed.y / 256.0) * 256.0);
+    return vec4<f32>(lo, hi) / 255.0;
+}
+
+fn mix_color(packed: vec4<f32>, t: f32) -> vec4<f32> {
+    return mix(unpack_color(packed.xy), unpack_color(packed.zw), t);
+}
+";
+
+/// The fill family's body.
+///
+/// Position in tile units through the drawable's matrix; color and opacity are data-driven, so
+/// each is mixed between its two zoom endpoints by the `_t` the block carries.
+pub const FILL_BODY: &str = r"
+var<push_constant> ubo_index: u32;
+
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) opacity: f32,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    let drawable = fill_drawable_ubo[ubo_index];
+    var out: Out;
+    out.clip = drawable.matrix * vec4<f32>(vec2<f32>(in.fill_pos), 0.0, 1.0);
+    out.color = mix_color(in.fill_color, drawable.color_t);
+    out.opacity = mix_value(in.fill_opacity, drawable.opacity_t);
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    return in.color * in.opacity;
+}
+";
+
+/// The fill-outline family's body.
+///
+/// The same geometry as a fill, drawn as lines with the outline color. `fill_outline_color` is its
+/// own attribute: an outline is not the fill's color at a different opacity.
+pub const FILL_OUTLINE_BODY: &str = r"
+var<push_constant> ubo_index: u32;
+
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) outline_color: vec4<f32>,
+    @location(1) opacity: f32,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    let drawable = fill_drawable_ubo[ubo_index];
+    var out: Out;
+    out.clip = drawable.matrix * vec4<f32>(vec2<f32>(in.fill_pos), 0.0, 1.0);
+    out.outline_color = mix_color(in.fill_outline_color, drawable.color_t);
+    out.opacity = mix_value(in.fill_opacity, drawable.opacity_t);
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    return in.outline_color * in.opacity;
+}
+";
+
+/// The circle family's body.
+///
+/// The position is the circle's center and the data attribute carries the corner it is extruded
+/// to, which is what makes one vertex buffer draw a disc. Six data-driven properties, each with
+/// its own `_t`.
+pub const CIRCLE_BODY: &str = r"
+var<push_constant> ubo_index: u32;
+
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) stroke_color: vec4<f32>,
+    @location(2) extrude: vec2<f32>,
+    @location(3) radius: f32,
+    @location(4) blur: f32,
+    @location(5) opacity: f32,
+    @location(6) stroke_width: f32,
+    @location(7) stroke_opacity: f32,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    let drawable = circle_drawable_ubo[ubo_index];
+    var out: Out;
+
+    let radius = mix_value(in.circle_radius, drawable.radius_t);
+    let stroke_width = mix_value(in.circle_stroke_width, drawable.stroke_width_t);
+    // The low two bits of the position say which corner this vertex is, as mbgl packs it.
+    let corner = vec2<f32>(vec2<i32>(in.circle_pos) % 2) * 2.0 - 1.0;
+    let reach = (radius + stroke_width) * drawable.extrude_scale;
+
+    out.clip = drawable.matrix * vec4<f32>(vec2<f32>(in.circle_pos) + corner * reach, 0.0, 1.0);
+    out.extrude = corner;
+    out.color = mix_color(in.circle_color, drawable.color_t);
+    out.stroke_color = mix_color(in.circle_stroke_color, drawable.stroke_color_t);
+    out.radius = radius;
+    out.blur = mix_value(in.circle_blur, drawable.blur_t);
+    out.opacity = mix_value(in.circle_opacity, drawable.opacity_t);
+    out.stroke_width = stroke_width;
+    out.stroke_opacity = mix_value(in.circle_stroke_opacity, drawable.stroke_opacity_t);
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    let distance = length(in.extrude) * (in.radius + in.stroke_width);
+    let antialias = in.blur + 1.0;
+    let fill = 1.0 - smoothstep(in.radius - antialias, in.radius + antialias, distance);
+    let outer = in.radius + in.stroke_width;
+    let stroke = 1.0 - smoothstep(outer - antialias, outer + antialias, distance);
+    return mix(
+        in.stroke_color * in.stroke_opacity * stroke,
+        in.color * in.opacity,
+        fill
+    );
+}
+";
+
+/// The line family's body.
+///
+/// The position attribute carries the point and its normal together, as mbgl packs it: the low bit
+/// of each component is the normal's sign and the rest is the coordinate. The data attribute
+/// carries the extrusion and the line's distance along itself.
+pub const LINE_BODY: &str = r"
+var<push_constant> ubo_index: u32;
+
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) normal: vec2<f32>,
+    @location(2) width: f32,
+    @location(3) blur: f32,
+    @location(4) opacity: f32,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    let drawable = line_drawable_ubo[ubo_index];
+    var out: Out;
+
+    // The normal is the low bit of each component; the position is what is left.
+    let packed = vec2<i32>(in.line_pos_normal);
+    let normal = vec2<f32>(packed % 2) * 2.0 - 1.0;
+    let position = vec2<f32>(packed / 2);
+
+    let width = mix_value(in.line_width, drawable.width_t);
+    let gapwidth = mix_value(in.line_gap_width, drawable.gapwidth_t);
+    let offset = mix_value(in.line_offset, drawable.offset_t);
+    // A gap splits the line in two, each half the remaining width.
+    let half = select(width * 0.5, gapwidth * 0.5 + width, gapwidth > 0.0);
+    let extrude = vec2<f32>(in.line_data.xy) / 128.0 - 1.0;
+
+    out.clip = drawable.matrix
+        * vec4<f32>(position + extrude * (half + offset) * drawable.ratio, 0.0, 1.0);
+    out.normal = normal;
+    out.width = half;
+    out.color = mix_color(in.line_color, drawable.color_t);
+    out.blur = mix_value(in.line_blur, drawable.blur_t);
+    out.opacity = mix_value(in.line_opacity, drawable.opacity_t);
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    let distance = length(in.normal) * in.width;
+    let antialias = in.blur + 1.0;
+    let coverage = 1.0 - smoothstep(in.width - antialias, in.width + antialias, distance);
+    return in.color * in.opacity * coverage;
 }
 ";

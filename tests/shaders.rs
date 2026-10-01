@@ -4,9 +4,59 @@
 //! being checked is that the two fit: a body naming a field the tables do not declare, or reading
 //! one at the wrong type, fails here rather than at pipeline creation on a board.
 
-use tessella_capture_abi::generated::shader_attributes::BACKGROUND_SHADER;
-use tessella_capture_abi::generated::ubo_layouts::{BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO};
-use tessella_emblema::shaders::{BACKGROUND_BODY, attribute_name, module};
+use tessella_capture_abi::generated::shader_attributes::{
+    BACKGROUND_SHADER, CIRCLE_SHADER, FILL_OUTLINE_SHADER, FILL_SHADER, LINE_SHADER,
+    ShaderAttribute,
+};
+use tessella_capture_abi::generated::ubo_layouts::{
+    BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
+    FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, LINE_DRAWABLE_UBO, LINE_EVALUATED_PROPS_UBO,
+    UboLayout,
+};
+use tessella_emblema::shaders::{
+    BACKGROUND_BODY, CIRCLE_BODY, FILL_BODY, FILL_OUTLINE_BODY, LINE_BODY, attribute_name, module,
+};
+
+/// Every plane family: its blocks, its attributes, its body.
+fn families() -> Vec<(
+    &'static str,
+    Vec<&'static UboLayout>,
+    &'static [ShaderAttribute],
+    &'static str,
+)> {
+    vec![
+        (
+            "background",
+            vec![&BACKGROUND_DRAWABLE_UBO, &BACKGROUND_PROPS_UBO],
+            &BACKGROUND_SHADER,
+            BACKGROUND_BODY,
+        ),
+        (
+            "fill",
+            vec![&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
+            &FILL_SHADER,
+            FILL_BODY,
+        ),
+        (
+            "fill_outline",
+            vec![&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
+            &FILL_OUTLINE_SHADER,
+            FILL_OUTLINE_BODY,
+        ),
+        (
+            "line",
+            vec![&LINE_DRAWABLE_UBO, &LINE_EVALUATED_PROPS_UBO],
+            &LINE_SHADER,
+            LINE_BODY,
+        ),
+        (
+            "circle",
+            vec![&CIRCLE_DRAWABLE_UBO, &CIRCLE_EVALUATED_PROPS_UBO],
+            &CIRCLE_SHADER,
+            CIRCLE_BODY,
+        ),
+    ]
+}
 
 /// Compiles a module to SPIR-V, or says why not.
 fn compile(source: &str) -> Vec<u32> {
@@ -119,4 +169,80 @@ fn the_emitted_module_is_stable() {
     let first = compile(&background());
     let second = compile(&background());
     assert_eq!(first, second, "two compiles of one source disagreed");
+}
+
+/// How many times `name` appears as a whole identifier.
+///
+/// Not a substring count: `opacity_t` is inside `stroke_opacity_t`, so counting substrings lets a
+/// field borrow another's uses and a dropped read goes unnoticed. Found by a mutation that
+/// survived.
+fn identifier_uses(source: &str, name: &str) -> usize {
+    let bytes = source.as_bytes();
+    source
+        .match_indices(name)
+        .filter(|(at, _)| {
+            let before = *at == 0 || !is_identifier(bytes[at - 1]);
+            let after_at = at + name.len();
+            let after = after_at >= bytes.len() || !is_identifier(bytes[after_at]);
+            before && after
+        })
+        .count()
+}
+
+const fn is_identifier(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Every plane family compiles, validates and emits.
+#[test]
+fn every_plane_family_compiles() {
+    for (name, blocks, attributes, body) in families() {
+        let source = module(&blocks, attributes, body)
+            .unwrap_or_else(|why| panic!("{name} does not assemble: {why:?}"));
+        let words = compile(&source);
+        assert!(words.len() > 64, "{name} emitted {} words", words.len());
+        assert_eq!(words[0], 0x0723_0203, "{name} is not SPIR-V");
+    }
+}
+
+/// Every attribute the producer sends is read by the body that receives it.
+///
+/// An attribute declared and never read is a paint property the style asked for and the picture
+/// does not show — which draws, because the rest of the shader is fine. The compiler cannot catch
+/// it: an unused input is legal.
+#[test]
+fn every_attribute_is_read() {
+    for (name, blocks, attributes, body) in families() {
+        let source = module(&blocks, attributes, body).expect("assembles");
+        for attribute in attributes {
+            let field = attribute_name(attribute.name);
+            // Once in the generated input, and at least once more in the body that reads it.
+            let uses = identifier_uses(&source, &field);
+            assert!(uses >= 2, "{name} declares {field} and never reads it");
+        }
+    }
+}
+
+/// Every data-driven property's zoom factor is used where its attribute is.
+///
+/// The `_t` fields exist to mix an attribute between its two zoom endpoints. Reading the attribute
+/// and ignoring the factor draws the lower endpoint at every zoom, which looks like a style that
+/// stopped interpolating rather than like a bug.
+#[test]
+fn every_zoom_factor_is_used() {
+    for (name, blocks, attributes, body) in families() {
+        let source = module(&blocks, attributes, body).expect("assembles");
+        for block in blocks {
+            for field in block.fields {
+                if !field.name.ends_with("_t") {
+                    continue;
+                }
+                assert!(
+                    identifier_uses(&source, field.name) >= 2,
+                    "{name} declares {} and never mixes with it",
+                    field.name
+                );
+            }
+        }
+    }
 }

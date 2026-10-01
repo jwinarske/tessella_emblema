@@ -43,6 +43,7 @@
 #![forbid(unsafe_code)]
 
 pub mod device;
+pub mod preamble;
 pub mod residency;
 pub mod spec;
 mod spirv;

@@ -267,6 +267,12 @@ fn binding_name(type_name: &str) -> String {
 /// The position goes through `place` rather than through a matrix multiply, which is what lets the
 /// same body draw on a plane and on a globe. A background has no surface beyond those two: it
 /// covers the viewport rather than a tile, so the producer neither anchors it nor raises it.
+///
+/// Two components, not three. The ABI recorded this attribute as `Float3` until tessella#326; it
+/// is `Short2`, which is what the producer sends and what mbgl's own shader declares --
+/// `vec4(in_position, 0.0, 1.0)`, supplying the third component itself. This body read three
+/// floats from two 16-bit integers for as long as the table said so, and nothing caught it:
+/// the bench that drew with this pipeline writes its own vertices as three floats.
 pub const BACKGROUND_BODY: &str = r"
 struct Out {
     @builtin(position) clip: vec4<f32>,
@@ -277,7 +283,7 @@ fn vertex_main(in: In) -> Out {
     ubo_index = in.instance_index;
     let drawable = background_drawable_ubo[ubo_index];
     var out: Out;
-    out.clip = place(in.background_pos, drawable.matrix);
+    out.clip = place(vec3<f32>(vec2<f32>(in.background_pos), 0.0), drawable.matrix);
     return out;
 }
 

@@ -65,3 +65,22 @@
 # Ratios, pi5 over desktop: 6.2x on `instance`, 44x on `push`, 25x on `buffers`, 22x on
 # `descriptors`. The spread is the point -- these drivers do not have one ratio, so a
 # single scaling factor from desktop to board does not exist for command recording.
+#
+# # Re-run after the slot moved to `firstInstance`
+#
+# The shader no longer declares a push constant: the slot arrives as the draw's own
+# `firstInstance` and the vertex stage reads `@builtin(instance_index)`. The bench keeps the
+# `push` row, which now prices `vkCmdPushConstants` for a range the shader ignores -- the
+# cost of issuing the command, which is what the row was ever measuring.
+#
+# shape          record p50   per draw   submit p50
+# instance            47.8     0.0747        102.3
+# push               647.1     1.0111        109.3
+# buffers            660.1     1.0315        109.7
+# descriptors        664.6     1.0384        110.4
+#
+# And the slot is checked rather than assumed. The bench draws one triangle with
+# `firstInstance` set to 613, with a zero matrix in slot zero and an identity in slot 613,
+# and reads the center pixel back: `firstInstance reaches the shader as slot 613`. A driver
+# that dropped the base instance would read slot zero for every drawable -- one layer's
+# paint for the whole map, which looks deliberate -- so it is worth a readback.

@@ -144,6 +144,50 @@ fn the_body_reads_what_the_tables_declare() {
     }
 }
 
+/// The drawable's slot arrives as the draw's `firstInstance`, not as a push constant.
+///
+/// Measured, not preferred: one `vkCmdPushConstants` a draw costs 0.9 us on V3D against 0.014 on
+/// RADV -- eleven times the draw it accompanies -- and 0.34 us on Adreno, where `firstInstance` is
+/// a field of a call already being made and costs nothing anywhere. See `tests/bench-baselines/`.
+///
+/// Pinned because the push constant is the obvious way to write this and nothing else would catch
+/// a change back: both spellings compile, validate and draw the same picture.
+#[test]
+fn the_slot_arrives_as_the_instance_index() {
+    for family in families() {
+        for surface in family.surfaces {
+            let source = module(*surface, &family.blocks, family.attributes, family.body)
+                .expect("assembles");
+            let what = format!("{}{}", family.name, surface.suffix());
+            assert!(
+                !source.contains("push_constant"),
+                "{what} still carries a push constant"
+            );
+            assert!(
+                source.contains("@builtin(instance_index) instance_index: u32,"),
+                "{what} does not declare the builtin"
+            );
+            assert!(
+                source.contains("ubo_index = in.instance_index;"),
+                "{what} never takes the slot from the builtin"
+            );
+            // And it is the entry point's first statement, or a block is indexed by whatever the
+            // private variable held -- zero on the first draw and the previous draw's slot after.
+            //
+            // Checked as the first statement rather than as "before the first read": a surface's
+            // `place` reads the slot and is emitted above the body, so textual order across the
+            // module says nothing. Order only means anything inside the one function that does
+            // the assigning, and being first there is the property worth having.
+            assert!(
+                source.contains(
+                    "fn vertex_main(in: In) -> Out {\n    ubo_index = in.instance_index;"
+                ),
+                "{what} does not take the slot as its first statement"
+            );
+        }
+    }
+}
+
 /// A matrix is declared as four columns, and the body cannot treat it as a matrix by accident.
 ///
 /// Adreno's shader compiler asserts on a `mat4x4` read from a storage buffer and fails pipeline

@@ -45,13 +45,27 @@
 # "SLOT NOT DELIVERED" and the honest reading of that was a false accusation against a
 # shipping driver.
 #
-# Two candidates were tried and neither is the cause: a linear color attachment instead of
-# a tiled one (this driver takes LINEAR, and the pixel is unchanged), and bypassing the
-# loader with `TSL_VULKAN_LIB`. The drm-cxx work on this same board has Vulkan drawing and
-# scanning out, and records two Vivante quirks this probe does not yet handle -- clears
-# that stay in tile status until a one-pixel transfer read "kicks" a resolve, and
-# DRM-modifier LINEAR images that are laid out tiled. Adopting that kick is the next thing
-# to try if this board's slot needs proving.
+# What it is not, each ruled out by a run:
+#
+# - **Not the readback, and not a stale tile-status clear.** The pixel read back is exactly
+#   the clear color, so the clear reaches memory and the copy reads it. That also rules out
+#   the resolve kick the drm-cxx work on this board documents: there is nothing stale to
+#   resolve, the draw simply contributed no fragment.
+# - **Not the storage buffer.** With the vertex stage's block read replaced by the raw
+#   attribute -- a constant position, no storage buffer touched -- the target is still the
+#   clear color. This matters well beyond the probe: every block in this crate is read from
+#   a storage buffer indexed per drawable, so an SSBO read that returned zeros here would
+#   be a blocker for the design on this board rather than a fault in a bench. It is not
+#   that.
+# - **Not the image's tiling.** A linear color attachment, which this driver offers, leaves
+#   the pixel unchanged.
+# - **Not the loader.** Opening the ICD directly with `TSL_VULKAN_LIB` changes nothing.
+#
+# So the clear writes, the copy reads, the vertex positions need no memory, and still no
+# fragment is produced. Whatever remains is in this probe's own render setup against this
+# driver -- the render pass, the framebuffer, or the draw -- and not in anything the
+# renderer depends on. The drm-cxx work has Vulkan drawing and scanning out on this exact
+# board, so its example setup is where to compare against next.
 #
 # So: the timing is sound, the compiler fix is confirmed, and `firstInstance` is unverified
 # here and verified on the other three.

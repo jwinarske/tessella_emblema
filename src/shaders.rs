@@ -535,6 +535,99 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
 }
 ";
 
+/// The color-relief family's body.
+///
+/// The one family whose picture *is* the elevation. It reads the DEM per fragment, finds the pair
+/// of style stops that bracket the height there, and mixes their colors -- so unlike every other
+/// raised family it samples the elevation in the fragment stage rather than the vertex stage, for
+/// its own content rather than to place itself.
+///
+/// The stops arrive as two one-dimensional pictures, an elevation table and a color table of the
+/// same width, sampled at texel centers so nearest filtering cannot round to a neighbor.
+///
+/// # Why the search is a bisection
+///
+/// A linear walk is the same answer and costs the whole table on every pixel of every frame. The
+/// bound is the table's own width, which the style fixes.
+pub const COLOR_RELIEF_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let drawable = color_relief_drawable_ubo[ubo_index];
+    let tile = color_relief_tile_props_ubo[ubo_index];
+    var out: Out;
+
+    // Into the tile's own square inside the padded image: the border ring is one texel a side,
+    // so the interior spans `1/stride` to `(dim + 1)/stride`.
+    let epsilon = 1.0 / tile.dimension;
+    let scale = (tile.dimension.x - 2.0) / tile.dimension.x;
+    out.uv = (vec2<f32>(in.color_relief_texture_pos) / 8192.0) * scale + epsilon;
+
+    out.clip = place(vec3<f32>(vec2<f32>(in.color_relief_pos), 0.0), drawable.matrix);
+    return out;
+}
+
+// The stop at `index`, at its texel's center.
+fn elevation_stop(index: i32, stops: i32) -> f32 {
+    let x = (f32(index) + 0.5) / f32(stops);
+    return textureSample(
+        color_relief_elevation_stops,
+        color_relief_elevation_stops_sampler,
+        vec2<f32>(x, 0.5)
+    ).r;
+}
+
+fn color_stop(index: i32, stops: i32) -> vec4<f32> {
+    let x = (f32(index) + 0.5) / f32(stops);
+    return textureSample(
+        color_relief_color_stops,
+        color_relief_color_stops_sampler,
+        vec2<f32>(x, 0.5)
+    );
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    let tile = color_relief_tile_props_ubo[ubo_index];
+    let props = color_relief_evaluated_props_ubo[0];
+    let stops = tile.color_ramp_size;
+
+    // The elevation here, unpacked the way the DEM encodes it: the texel times 255, its alpha
+    // replaced by -1, dotted with the unpack vector.
+    let texel = textureSample(color_relief_image, color_relief_image_sampler, in.uv) * 255.0;
+    let elevation = dot(vec4<f32>(texel.rgb, -1.0), tile.unpack);
+
+    // The pair of stops that bracket it, by halving the range.
+    var right = stops - 1;
+    var left = 0;
+    while right - left > 1 {
+        let middle = (right + left) / 2;
+        if elevation < elevation_stop(middle, stops) {
+            right = middle;
+        } else {
+            left = middle;
+        }
+    }
+
+    let low = elevation_stop(left, stops);
+    let high = elevation_stop(right, stops);
+    // Two stops at one elevation is a ramp with a hard edge in it, and the division that would
+    // find where between them this pixel sits has nothing to divide by.
+    let span = high - low;
+    var t = 0.0;
+    if abs(span) >= 0.0001 {
+        t = clamp((elevation - low) / span, 0.0, 1.0);
+    }
+
+    return props.opacity * mix(color_stop(left, stops), color_stop(right, stops), t);
+}
+";
+
 /// The line family's body.
 ///
 /// The position attribute carries the point and its normal together, as mbgl packs it: the low bit

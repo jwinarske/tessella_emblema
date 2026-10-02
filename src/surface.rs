@@ -9,7 +9,7 @@
 //! one function:
 //!
 //! ```wgsl
-//! fn place(position: vec3<f32>, matrix: mat4x4<f32>) -> vec4<f32>
+//! fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32>
 //! ```
 //!
 //! taking a tile-local position whose `z` is height above the surface in meters, and returning a
@@ -221,8 +221,8 @@ impl Surface {
 /// The matrix reaches clip space, the height rides in `z`, and the layer's depth offset is already
 /// baked into the matrix at this drawable's own sub-layer.
 const PLANE_PLACEMENT: &str = r"
-fn place(position: vec3<f32>, matrix: mat4x4<f32>) -> vec4<f32> {
-    return matrix * vec4<f32>(position, 1.0);
+fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
+    return transform(columns, position);
 }
 ";
 
@@ -249,10 +249,10 @@ fn place(position: vec3<f32>, matrix: mat4x4<f32>) -> vec4<f32> {
 /// anchored bend. The extrusions are the only family that leaves the surface and the producer
 /// anchors them, so nothing drawn here has a height to lift.
 const GLOBE_PLACEMENT: &str = r"
-fn place(position: vec3<f32>, matrix: mat4x4<f32>) -> vec4<f32> {
+fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
     // `merc.z` comes out as the depth offset: the input z is zero, so the only thing reaching it
     // is the matrix's own translation.
-    let merc = matrix * vec4<f32>(position.xy, 0.0, 1.0);
+    let merc = transform(columns, vec3<f32>(position.xy, 0.0));
 
     let longitude = merc.x * 360.0 - 180.0;
     // `camera::latitude_of`. The clamp is `sphere_point_from_mercator`'s: a tile edge running off
@@ -267,7 +267,7 @@ fn place(position: vec3<f32>, matrix: mat4x4<f32>) -> vec4<f32> {
     let lon = radians(longitude);
     let sphere = vec3<f32>(cos(lat) * sin(lon), -sin(lat), cos(lat) * cos(lon));
 
-    var clip = as_matrix(globe_camera_ubo[0].globe_matrix) * vec4<f32>(sphere, 1.0);
+    var clip = transform(globe_camera_ubo[0].globe_matrix, sphere);
     clip.z += merc.z;
     return clip;
 }
@@ -296,7 +296,7 @@ const GLOBE_ANCHORED_PLACEMENT: &str = r"
 // every tile this consumer sees is produced at.
 const TILE_CENTER: f32 = 4096.0;
 
-fn place(position: vec3<f32>, matrix: mat4x4<f32>) -> vec4<f32> {
+fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
     let bend = globe_bend_ubo[ubo_index];
     // Tile units from the center. Both are small, and every coefficient but the anchor is small,
     // so nothing here is a large number waiting to cancel.
@@ -332,7 +332,7 @@ fn place(position: vec3<f32>, matrix: mat4x4<f32>) -> vec4<f32> {
 /// The skirt is not here. Only the ground has one — a layer standing on the ground is a surface on
 /// a surface — and the ground is its own family rather than a surface variant.
 const TERRAIN_PLACEMENT: &str = r"
-fn place(position: vec3<f32>, matrix: mat4x4<f32>) -> vec4<f32> {
+fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
     let terrain = terrain_drawable_ubo[ubo_index];
 
     let uv = position.xy * terrain.params.x + terrain.params.yz;
@@ -342,6 +342,6 @@ fn place(position: vec3<f32>, matrix: mat4x4<f32>) -> vec4<f32> {
     let meters = dot(channels, terrain.unpack.rgb) - terrain.unpack.a;
     let height = (meters - terrain.skirt.y) * terrain.params.w;
 
-    return matrix * vec4<f32>(position.xy, position.z + height, 1.0);
+    return transform(columns, vec3<f32>(position.xy, position.z + height));
 }
 ";

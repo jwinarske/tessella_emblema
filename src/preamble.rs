@@ -96,12 +96,20 @@ const fn wgsl_type(kind: UboFieldKind) -> &'static str {
 /// identically either way and the producer's offsets are untouched. This is a change of spelling,
 /// not of layout.
 ///
+/// # And a matrix is never assembled from them either
+///
+/// Vivante's SPIR-V compiler segfaults on `OpCompositeConstruct` of a matrix --
+/// `VIR_Shader_CompositeConstruct` in `libVSC.so`, reached through `gcSPV_Decode` -- so the first
+/// answer to Adreno's assertion, declaring the columns and rebuilding a `mat4x4` from them, trades
+/// one vendor's crash for another's. The two together leave one form: no matrix type anywhere, and
+/// the multiply written out as the four multiply-adds it is. `shaders::PRELUDE` defines
+/// `transform`, which is how a body applies one.
+///
 /// # Why this is the safer spelling anyway
 ///
 /// An array is not a matrix to WGSL, so a body that multiplies one by a vector does not compile.
 /// The mistake this exists to prevent therefore cannot be made silently: there is no way to write
-/// the code that works on a desktop and dies on the board. A body reaches the matrix through
-/// `as_matrix`, which `shaders::PRELUDE` defines.
+/// the code that works on a desktop and dies on a board.
 pub const MATRIX: &str = "array<vec4<f32>, 4>";
 
 /// Rounds `at` up to a multiple of `align`.

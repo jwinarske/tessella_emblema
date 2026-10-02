@@ -236,7 +236,7 @@ fn a_surface_that_can_lift_a_height_reads_one() {
     for surface in [Surface::Plane, Surface::GlobeAnchored, Surface::Terrain] {
         assert!(
             surface.placement().contains("position.z")
-                || surface.placement().contains("vec4<f32>(position, 1.0)"),
+                || surface.placement().contains("transform(columns, position)"),
             "{surface:?} drops the height it was given"
         );
     }
@@ -300,9 +300,9 @@ fn the_bend_is_measured_from_the_tile_center() {
 fn every_surface_places_through_one_signature() {
     for surface in Surface::ALL {
         assert!(
-            surface
-                .placement()
-                .contains("fn place(position: vec3<f32>, matrix: mat4x4<f32>) -> vec4<f32>"),
+            surface.placement().contains(
+                "fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32>"
+            ),
             "{surface:?} does not declare the signature bodies call"
         );
     }

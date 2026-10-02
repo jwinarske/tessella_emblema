@@ -498,6 +498,7 @@ impl Gpu {
             Surface::Plane,
             &[&BACKGROUND_DRAWABLE_UBO, &BACKGROUND_PROPS_UBO],
             &BACKGROUND_SHADER,
+            &[],
             BACKGROUND_BODY,
         )
         .map_err(|why| format!("the family does not assemble: {why:?}"))?;

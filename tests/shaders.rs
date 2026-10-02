@@ -5,16 +5,18 @@
 //! one at the wrong type, fails here rather than at pipeline creation on a board.
 
 use tessella_capture_abi::generated::shader_attributes::{
-    BACKGROUND_SHADER, CIRCLE_SHADER, FILL_OUTLINE_SHADER, FILL_SHADER, LINE_SHADER,
+    BACKGROUND_SHADER, CIRCLE_SHADER, FILL_OUTLINE_SHADER, FILL_SHADER, LINE_SHADER, RASTER_SHADER,
     ShaderAttribute,
 };
+use tessella_capture_abi::generated::texture_slots::{RASTER_SHADER_TEXTURES, ShaderTexture};
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, LINE_DRAWABLE_UBO, LINE_EVALUATED_PROPS_UBO,
-    UboLayout,
+    RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, UboLayout,
 };
 use tessella_emblema::shaders::{
-    BACKGROUND_BODY, CIRCLE_BODY, FILL_BODY, FILL_OUTLINE_BODY, LINE_BODY, attribute_name, module,
+    BACKGROUND_BODY, CIRCLE_BODY, FILL_BODY, FILL_OUTLINE_BODY, LINE_BODY, RASTER_BODY,
+    attribute_name, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -23,6 +25,7 @@ struct Family {
     name: &'static str,
     blocks: Vec<&'static UboLayout>,
     attributes: &'static [ShaderAttribute],
+    textures: &'static [ShaderTexture],
     body: &'static str,
     surfaces: &'static [Surface],
 }
@@ -45,6 +48,7 @@ fn families() -> Vec<Family> {
             name: "background",
             blocks: vec![&BACKGROUND_DRAWABLE_UBO, &BACKGROUND_PROPS_UBO],
             attributes: &BACKGROUND_SHADER,
+            textures: &[],
             body: BACKGROUND_BODY,
             surfaces: flat_or_bent,
         },
@@ -52,6 +56,7 @@ fn families() -> Vec<Family> {
             name: "fill",
             blocks: vec![&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
             attributes: &FILL_SHADER,
+            textures: &[],
             body: FILL_BODY,
             surfaces: all,
         },
@@ -59,6 +64,7 @@ fn families() -> Vec<Family> {
             name: "fill_outline",
             blocks: vec![&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
             attributes: &FILL_OUTLINE_SHADER,
+            textures: &[],
             body: FILL_OUTLINE_BODY,
             surfaces: all,
         },
@@ -66,13 +72,23 @@ fn families() -> Vec<Family> {
             name: "line",
             blocks: vec![&LINE_DRAWABLE_UBO, &LINE_EVALUATED_PROPS_UBO],
             attributes: &LINE_SHADER,
+            textures: &[],
             body: LINE_BODY,
+            surfaces: all,
+        },
+        Family {
+            name: "raster",
+            blocks: vec![&RASTER_DRAWABLE_UBO, &RASTER_EVALUATED_PROPS_UBO],
+            attributes: &RASTER_SHADER,
+            textures: &RASTER_SHADER_TEXTURES,
+            body: RASTER_BODY,
             surfaces: all,
         },
         Family {
             name: "circle",
             blocks: vec![&CIRCLE_DRAWABLE_UBO, &CIRCLE_EVALUATED_PROPS_UBO],
             attributes: &CIRCLE_SHADER,
+            textures: &[],
             body: CIRCLE_BODY,
             surfaces: all,
         },
@@ -105,6 +121,7 @@ fn background() -> String {
         Surface::Plane,
         &[&BACKGROUND_DRAWABLE_UBO, &BACKGROUND_PROPS_UBO],
         &BACKGROUND_SHADER,
+        &[],
         BACKGROUND_BODY,
     )
     .expect("background declares")
@@ -144,6 +161,78 @@ fn the_body_reads_what_the_tables_declare() {
     }
 }
 
+/// A family's own images bind before the surface's, and every one it declares is sampled.
+///
+/// The order is the contract with the descriptor set the renderer will write. A family's samplers
+/// belong to the shader rather than to what it is drawn on -- a raster tile samples its own
+/// picture and its parent's whether it is flat or raised -- so they keep their place when the
+/// surface changes under them, and the surface's elevation lands after.
+///
+/// The second half is the one a compiler cannot catch: an unused sampler is legal, and a declared
+/// image that nothing reads is a layer drawing from the wrong picture or from none.
+#[test]
+fn a_familys_images_bind_before_the_surfaces() {
+    use tessella_emblema::shaders::texture_name;
+
+    let raster = families()
+        .into_iter()
+        .find(|family| family.name == "raster")
+        .expect("raster is in the matrix");
+    assert_eq!(raster.textures.len(), 2, "a raster samples two pictures");
+
+    // Flat: two blocks, then the family's two images and their samplers, and nothing after.
+    let flat = module(
+        Surface::Plane,
+        &raster.blocks,
+        raster.attributes,
+        raster.textures,
+        raster.body,
+    )
+    .expect("assembles");
+    for (at, texture) in raster.textures.iter().enumerate() {
+        let name = texture_name(texture.name);
+        let binding = 2 + at * 2;
+        assert!(
+            flat.contains(&format!("@binding({binding}) var {name}: texture_2d<f32>;")),
+            "{name} is not at binding {binding}:\n{flat}"
+        );
+        assert!(
+            flat.contains(&format!(
+                "@binding({}) var {name}_sampler: sampler;",
+                binding + 1
+            )),
+            "{name}'s sampler is not beside it"
+        );
+        // And the body reads it, or the picture is declared and never drawn from.
+        assert!(
+            identifier_uses(&flat, &name) >= 2,
+            "{name} is declared and never sampled"
+        );
+    }
+    assert!(
+        !flat.contains("@binding(6)"),
+        "a plane adds nothing after the family's images"
+    );
+
+    // Raised: the surface's block pushes the images on by one binding, and the elevation lands
+    // after them rather than among them.
+    let raised = module(
+        Surface::Terrain,
+        &raster.blocks,
+        raster.attributes,
+        raster.textures,
+        raster.body,
+    )
+    .expect("assembles");
+    assert!(raised.contains("@binding(2) var<storage, read> terrain_drawable_ubo"));
+    assert!(raised.contains("@binding(3) var raster_image0: texture_2d<f32>;"));
+    assert!(raised.contains("@binding(5) var raster_image1: texture_2d<f32>;"));
+    assert!(
+        raised.contains("@binding(7) var elevation: texture_2d<f32>;"),
+        "the surface's image does not come last:\n{raised}"
+    );
+}
+
 /// The drawable's slot arrives as the draw's `firstInstance`, not as a push constant.
 ///
 /// Measured, not preferred: one `vkCmdPushConstants` a draw costs 0.9 us on V3D against 0.014 on
@@ -156,8 +245,14 @@ fn the_body_reads_what_the_tables_declare() {
 fn the_slot_arrives_as_the_instance_index() {
     for family in families() {
         for surface in family.surfaces {
-            let source = module(*surface, &family.blocks, family.attributes, family.body)
-                .expect("assembles");
+            let source = module(
+                *surface,
+                &family.blocks,
+                family.attributes,
+                family.textures,
+                family.body,
+            )
+            .expect("assembles");
             let what = format!("{}{}", family.name, surface.suffix());
             assert!(
                 !source.contains("push_constant"),
@@ -254,8 +349,14 @@ fn a_matrix_is_declared_as_four_columns() {
 fn no_module_names_a_matrix_type() {
     for family in families() {
         for surface in family.surfaces {
-            let source = module(*surface, &family.blocks, family.attributes, family.body)
-                .expect("assembles");
+            let source = module(
+                *surface,
+                &family.blocks,
+                family.attributes,
+                family.textures,
+                family.body,
+            )
+            .expect("assembles");
             assert!(
                 !source.contains("mat4x4"),
                 "{}{} names a matrix type",
@@ -292,6 +393,7 @@ fn a_body_naming_an_undeclared_field_fails() {
         Surface::Plane,
         &[&BACKGROUND_DRAWABLE_UBO],
         &BACKGROUND_SHADER,
+        &[],
         r"
 @fragment
 fn fragment_main() -> @location(0) vec4<f32> {
@@ -348,8 +450,14 @@ fn every_family_on_every_surface_compiles() {
     for family in families() {
         for surface in family.surfaces {
             let what = format!("{}{}", family.name, surface.suffix());
-            let source = module(*surface, &family.blocks, family.attributes, family.body)
-                .unwrap_or_else(|why| panic!("{what} does not assemble: {why:?}"));
+            let source = module(
+                *surface,
+                &family.blocks,
+                family.attributes,
+                family.textures,
+                family.body,
+            )
+            .unwrap_or_else(|why| panic!("{what} does not assemble: {why:?}"));
             let words = compile(&source);
             assert!(words.len() > 64, "{what} emitted {} words", words.len());
             assert_eq!(words[0], 0x0723_0203, "{what} is not SPIR-V");
@@ -357,7 +465,7 @@ fn every_family_on_every_surface_compiles() {
         }
     }
     assert_eq!(
-        pairs, 18,
+        pairs, 22,
         "the matrix grew or shrank; look at the new pairs"
     );
 }
@@ -371,8 +479,14 @@ fn every_family_on_every_surface_compiles() {
 fn every_attribute_is_read() {
     for family in families() {
         for surface in family.surfaces {
-            let source = module(*surface, &family.blocks, family.attributes, family.body)
-                .expect("assembles");
+            let source = module(
+                *surface,
+                &family.blocks,
+                family.attributes,
+                family.textures,
+                family.body,
+            )
+            .expect("assembles");
             for attribute in family.attributes {
                 let field = attribute_name(attribute.name);
                 // Once in the generated input, and at least once more in the body that reads it.
@@ -397,8 +511,14 @@ fn every_attribute_is_read() {
 fn every_zoom_factor_is_used() {
     for family in families() {
         for surface in family.surfaces {
-            let source = module(*surface, &family.blocks, family.attributes, family.body)
-                .expect("assembles");
+            let source = module(
+                *surface,
+                &family.blocks,
+                family.attributes,
+                family.textures,
+                family.body,
+            )
+            .expect("assembles");
             for block in &family.blocks {
                 for field in block.fields {
                     if !field.name.ends_with("_t") {

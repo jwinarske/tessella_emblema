@@ -5,18 +5,21 @@
 //! one at the wrong type, fails here rather than at pipeline creation on a board.
 
 use tessella_capture_abi::generated::shader_attributes::{
-    BACKGROUND_SHADER, CIRCLE_SHADER, FILL_OUTLINE_SHADER, FILL_SHADER, LINE_SHADER, RASTER_SHADER,
-    ShaderAttribute,
+    BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER, FILL_OUTLINE_SHADER, FILL_SHADER,
+    LINE_SHADER, RASTER_SHADER, ShaderAttribute,
 };
-use tessella_capture_abi::generated::texture_slots::{RASTER_SHADER_TEXTURES, ShaderTexture};
+use tessella_capture_abi::generated::texture_slots::{
+    COLOR_RELIEF_SHADER_TEXTURES, RASTER_SHADER_TEXTURES, ShaderTexture,
+};
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
+    COLOR_RELIEF_DRAWABLE_UBO, COLOR_RELIEF_EVALUATED_PROPS_UBO, COLOR_RELIEF_TILE_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, LINE_DRAWABLE_UBO, LINE_EVALUATED_PROPS_UBO,
     RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, UboLayout,
 };
 use tessella_emblema::shaders::{
-    BACKGROUND_BODY, CIRCLE_BODY, FILL_BODY, FILL_OUTLINE_BODY, LINE_BODY, RASTER_BODY,
-    attribute_name, module,
+    BACKGROUND_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY, FILL_OUTLINE_BODY, LINE_BODY,
+    RASTER_BODY, attribute_name, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -43,6 +46,10 @@ fn families() -> Vec<Family> {
         Surface::Terrain,
     ][..];
     let flat_or_bent = &[Surface::Plane, Surface::Globe][..];
+    // No bend block: the producer writes one for the families whose geometry is a tile's, and a
+    // color relief is not among them -- so it has the direct bend and the raise but not the
+    // anchored one.
+    let unanchored = &[Surface::Plane, Surface::Globe, Surface::Terrain][..];
     vec![
         Family {
             name: "background",
@@ -83,6 +90,18 @@ fn families() -> Vec<Family> {
             textures: &RASTER_SHADER_TEXTURES,
             body: RASTER_BODY,
             surfaces: all,
+        },
+        Family {
+            name: "color_relief",
+            blocks: vec![
+                &COLOR_RELIEF_DRAWABLE_UBO,
+                &COLOR_RELIEF_TILE_PROPS_UBO,
+                &COLOR_RELIEF_EVALUATED_PROPS_UBO,
+            ],
+            attributes: &COLOR_RELIEF_SHADER,
+            textures: &COLOR_RELIEF_SHADER_TEXTURES,
+            body: COLOR_RELIEF_BODY,
+            surfaces: unanchored,
         },
         Family {
             name: "circle",
@@ -159,6 +178,47 @@ fn the_body_reads_what_the_tables_declare() {
     ] {
         assert!(source.contains(named), "{named} is missing from:\n{source}");
     }
+}
+
+/// The color relief keeps the two decisions in its arithmetic that are silent when wrong.
+///
+/// Its picture *is* the elevation, so two steps decide what color a height gets and neither fails
+/// loudly:
+///
+/// * the unpack replaces the texel's alpha with `-1`, which is what subtracts the encoding's bias
+///   rather than adding it. Keep the alpha and every height is out by twice the bias -- 20,000 m
+///   for Mapbox -- which saturates the ramp at one end and draws a flat wash.
+/// * the stop tables are sampled at their texels' centers. Sample at the edge and nearest
+///   filtering rounds to the neighbor, so a pixel takes the band next to its own: a plausible
+///   relief, banded wrongly, which reads as a style problem.
+///
+/// Pinned as text because both compile, validate and draw. The arithmetic itself stays unverified
+/// until a device renders it, which is true of every body here.
+#[test]
+fn the_color_relief_keeps_its_unpack_and_its_texel_centers() {
+    let relief = families()
+        .into_iter()
+        .find(|family| family.name == "color_relief")
+        .expect("color relief is in the matrix");
+    let source = module(
+        Surface::Plane,
+        &relief.blocks,
+        relief.attributes,
+        relief.textures,
+        relief.body,
+    )
+    .expect("assembles");
+
+    assert!(
+        source.contains("dot(vec4<f32>(texel.rgb, -1.0), tile.unpack)"),
+        "the unpack does not replace the alpha with -1:\n{source}"
+    );
+    // Both tables, both centered. `+ 0.5` before the divide is the center of texel `index`.
+    assert_eq!(
+        source.matches("(f32(index) + 0.5) / f32(stops)").count(),
+        2,
+        "a stop table is not sampled at its texel's center"
+    );
 }
 
 /// A family's own images bind before the surface's, and every one it declares is sampled.
@@ -465,7 +525,7 @@ fn every_family_on_every_surface_compiles() {
         }
     }
     assert_eq!(
-        pairs, 22,
+        pairs, 25,
         "the matrix grew or shrank; look at the new pairs"
     );
 }

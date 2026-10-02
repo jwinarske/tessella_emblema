@@ -71,3 +71,19 @@
 # 82x/68x/47x/53x for sa8155p over desktop. There is no scaling factor from a desktop
 # measurement to a board one for command recording, which is the whole reason these files
 # exist.
+#
+# # Re-run after the slot moved to `firstInstance`
+#
+# shape          record p50   per draw   submit p50
+# instance            835.5     1.3055       1419.6
+# push               1080.6     1.6885       1505.0
+# buffers            1350.0     2.1094       1474.9
+# descriptors        1724.1     2.6939       1510.4
+#
+# `firstInstance reaches the shader as slot 613` here too, by readback. Adreno has had base
+# instance quirks and the failure mode is silent -- every drawable reading slot zero -- so
+# the bench checks it on every device before it times anything.
+#
+# The spread between `instance` and `descriptors` is 1.39 us a draw, 0.89 ms over a
+# 640-drawable frame, which is why the arena and a shared descriptor set are worth having
+# here. On V3D the same span is 0.96 us and almost all of it is the push constant alone.

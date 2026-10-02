@@ -179,6 +179,9 @@ pub fn module(
     // The vertex input, at the locations the producer binds its buffers to. A body naming a field
     // the family does not declare does not compile, which is the point of generating this.
     out.push_str("struct In {\n");
+    // The drawable's slot, as the draw's own `firstInstance`. A builtin rather than an attribute
+    // because it is one number a draw: bound as a vertex buffer it would be one number a vertex.
+    out.push_str("    @builtin(instance_index) instance_index: u32,\n");
     for attribute in attributes {
         let Some(wgsl) = attribute_type(attribute.declared) else {
             return Err(Error::InvalidAttribute {
@@ -235,6 +238,7 @@ struct Out {
 
 @vertex
 fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
     let drawable = background_drawable_ubo[ubo_index];
     var out: Out;
     out.clip = place(in.background_pos, as_matrix(drawable.matrix));
@@ -250,9 +254,20 @@ fn fragment_main() -> @location(0) vec4<f32> {
 
 /// What every body and every placement may use, prepended to both by [`module`].
 ///
-/// `ubo_index` is the drawable's slot in the consolidated blocks, and it reaches the vertex stage
-/// as a push constant rather than per vertex: it is one number a draw, not one a vertex. Declared
-/// here because a placement reads it too — the bend and the raise are both per drawable.
+/// `ubo_index` is the drawable's slot in the consolidated blocks. It arrives as the draw's
+/// `firstInstance`, which the vertex stage reads as `@builtin(instance_index)` and the entry point
+/// copies here — so a placement and a body both reach it as a plain name and neither has to carry
+/// it through a parameter.
+///
+/// # Why not a push constant
+///
+/// Measured. `vkCmdPushConstants` once a draw costs 0.9 us a draw on V3D against 0.014 on RADV --
+/// eleven times the cost of the draw it accompanies -- and 0.34 us on Adreno. `firstInstance` is a
+/// field of the draw call that is already being made, so it costs nothing on any of the three.
+/// See `tests/bench-baselines/`.
+///
+/// `var<private>` and not a parameter: the surfaces read it too, and threading it through `place`
+/// would put it in a signature every family's body has to repeat.
 ///
 /// A data-driven paint property arrives twice: as a vertex attribute holding the value at two zoom
 /// levels, and as a `_t` field in the drawable block saying how far between them this frame is.
@@ -267,7 +282,7 @@ fn fragment_main() -> @location(0) vec4<f32> {
 /// `as_matrix` is how a body reaches one, and the columns are columns: the producer writes
 /// column-major.
 pub const PRELUDE: &str = r"
-var<push_constant> ubo_index: u32;
+var<private> ubo_index: u32;
 
 fn as_matrix(columns: array<vec4<f32>, 4>) -> mat4x4<f32> {
     return mat4x4<f32>(columns[0], columns[1], columns[2], columns[3]);
@@ -304,6 +319,7 @@ struct Out {
 
 @vertex
 fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
     let drawable = fill_drawable_ubo[ubo_index];
     var out: Out;
     out.clip = place(vec3<f32>(vec2<f32>(in.fill_pos), 0.0), as_matrix(drawable.matrix));
@@ -331,6 +347,7 @@ struct Out {
 
 @vertex
 fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
     let drawable = fill_drawable_ubo[ubo_index];
     var out: Out;
     out.clip = place(vec3<f32>(vec2<f32>(in.fill_pos), 0.0), as_matrix(drawable.matrix));
@@ -365,6 +382,7 @@ struct Out {
 
 @vertex
 fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
     let drawable = circle_drawable_ubo[ubo_index];
     var out: Out;
 
@@ -421,6 +439,7 @@ struct Out {
 
 @vertex
 fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
     let drawable = line_drawable_ubo[ubo_index];
     var out: Out;
 

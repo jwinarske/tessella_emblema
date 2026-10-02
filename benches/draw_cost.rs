@@ -50,8 +50,15 @@ const DRAWABLES: u32 = 640;
 /// Frames recorded per shape.
 const SAMPLES: usize = 60;
 
-/// The offscreen target's side. Nothing reads it; a draw has to have somewhere to go.
+/// The offscreen target's side.
 const SIDE: u32 = 64;
+
+/// The slot the verification puts its identity matrix in, and hands the draw as `firstInstance`.
+///
+/// Not zero, and not one: a driver that ignored the base instance entirely would read slot zero,
+/// and one that truncated it to a byte or confused it with the vertex index would land somewhere
+/// low. 613 is past all of that and inside the block buffer.
+const SLOT: u32 = 613;
 
 fn main() {
     let gpu = match Gpu::open() {
@@ -64,6 +71,20 @@ fn main() {
         }
     };
     println!("device: {}", gpu.name);
+    // Before any timing: does the draw's `firstInstance` actually reach the shader as the slot?
+    //
+    // The whole design indexes its blocks by it, and a driver that dropped it would read slot zero
+    // for every drawable -- one layer's paint for the whole map, a picture that looks deliberate.
+    // Both boards this is run on have had base-instance quirks, so it is checked rather than
+    // assumed, and checked here rather than in a test because it needs a device.
+    match gpu.verify() {
+        Ok(()) => println!("firstInstance reaches the shader as slot {SLOT}"),
+        Err(why) => {
+            println!("SLOT NOT DELIVERED: {why}");
+            println!("the numbers below are still a measurement, but the design is not sound here");
+        }
+    }
+    println!();
     println!("{DRAWABLES} drawables a frame, {SAMPLES} frames a shape\n");
 
     for shape in Shape::ALL {
@@ -150,7 +171,8 @@ struct Gpu {
     view: vk::ImageView,
     image: vk::Image,
     image_memory: vk::DeviceMemory,
-    held: [vk::Buffer; 4],
+    held: [vk::Buffer; 5],
+    offsets: [u64; 5],
     memory: vk::DeviceMemory,
     fence: vk::Fence,
     shader: [vk::ShaderModule; 2],
@@ -242,7 +264,9 @@ impl Gpu {
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                    .usage(
+                        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+                    )
                     .initial_layout(vk::ImageLayout::UNDEFINED),
                 None,
             )
@@ -395,7 +419,7 @@ impl Gpu {
 
         // Four buffers in one allocation: vertices, indexes, and the two blocks the family reads.
         // The contents are zeros; what is being timed is the recording.
-        let (held, memory) = buffers(&device, &memory_properties)?;
+        let (held, offsets, memory) = buffers(&device, &memory_properties)?;
         let drawable = [vk::DescriptorBufferInfo {
             buffer: held[2],
             offset: 0,
@@ -447,10 +471,203 @@ impl Gpu {
             image,
             image_memory,
             held,
+            offsets,
             memory,
             fence,
             shader: [vertex, fragment],
         })
+    }
+
+    /// Draws one triangle with `firstInstance` set to [`SLOT`] and checks the pixel it lands on.
+    ///
+    /// Slot zero holds a zero matrix and slot [`SLOT`] an identity, so the triangle covers the
+    /// target when the shader read the slot it was handed and collapses to a point when it read
+    /// zero instead. A green center pixel is the slot arriving; the clear color is it not.
+    ///
+    /// # Errors
+    ///
+    /// A description of what was read, when it is not what the slot should have drawn.
+    fn verify(&self) -> Result<(), String> {
+        unsafe {
+            let base = self
+                .device
+                .map_memory(self.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .map_err(|why| format!("map: {why}"))?
+                .cast::<u8>();
+
+            // Written as little-endian bytes rather than through an `f32` pointer: the mapping is
+            // page aligned and every offset is a multiple of the allocation's alignment, so a
+            // cast would be sound -- and it is one `unsafe` a reader has to verify for no gain.
+            let put = |offset: u64, values: &[f32]| {
+                let mut bytes = Vec::with_capacity(values.len() * 4);
+                for value in values {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                base.add(offset as usize)
+                    .copy_from_nonoverlapping(bytes.as_ptr(), bytes.len());
+            };
+
+            // A triangle over the whole of clip space, so an identity matrix covers the target.
+            put(
+                self.offsets[0],
+                &[-1.0, -1.0, 0.0, 3.0, -1.0, 0.0, -1.0, 3.0, 0.0],
+            );
+
+            // Slot zero: a zero matrix, which sends every vertex to the origin. Slot SLOT: an
+            // identity. The block is 64 bytes of column-major matrix and nothing else.
+            base.add(self.offsets[2] as usize).write_bytes(0, 64);
+            put(
+                self.offsets[2] + u64::from(SLOT) * 64,
+                &[
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+                ],
+            );
+
+            // The paint: opaque green at `color`, one at `opacity` sixteen bytes in.
+            put(self.offsets[3], &[0.0, 1.0, 0.0, 1.0, 1.0]);
+
+            self.device.unmap_memory(self.memory);
+        }
+
+        self.record_verify();
+        let commands = [self.command];
+        let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
+        unsafe {
+            self.device
+                .reset_fences(&[self.fence])
+                .map_err(|why| format!("fence: {why}"))?;
+            self.device
+                .queue_submit(self.queue, &submit, self.fence)
+                .map_err(|why| format!("submit: {why}"))?;
+            self.device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .map_err(|why| format!("wait: {why}"))?;
+        }
+
+        let center = (SIDE as usize / 2) * SIDE as usize * 4 + (SIDE as usize / 2) * 4;
+        let pixel = unsafe {
+            let base = self
+                .device
+                .map_memory(self.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .map_err(|why| format!("map: {why}"))?
+                .cast::<u8>()
+                .add(self.offsets[4] as usize);
+            let mut pixel = [0u8; 4];
+            base.add(center)
+                .copy_to_nonoverlapping(pixel.as_mut_ptr(), 4);
+            self.device.unmap_memory(self.memory);
+            pixel
+        };
+        if pixel[1] > 200 && pixel[0] < 64 {
+            Ok(())
+        } else {
+            Err(format!(
+                "the center pixel is {pixel:?}, not green -- the shader drew with slot zero's \
+                 matrix, so `firstInstance` did not reach it"
+            ))
+        }
+    }
+
+    /// Records the one draw [`Self::verify`] reads back.
+    fn record_verify(&self) {
+        let clears = [vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        }];
+        let sets = [self.set];
+        let vertices = [self.held[0]];
+        let offsets = [0u64];
+        unsafe {
+            self.device
+                .reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())
+                .expect("reset");
+            self.device
+                .begin_command_buffer(
+                    self.command,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .expect("begin");
+            self.device.cmd_begin_render_pass(
+                self.command,
+                &vk::RenderPassBeginInfo::default()
+                    .render_pass(self.pass)
+                    .framebuffer(self.framebuffer)
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D {
+                            width: SIDE,
+                            height: SIDE,
+                        },
+                    })
+                    .clear_values(&clears),
+                vk::SubpassContents::INLINE,
+            );
+            self.device.cmd_bind_pipeline(
+                self.command,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                self.command,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.layout,
+                0,
+                &sets,
+                &[],
+            );
+            self.device
+                .cmd_bind_vertex_buffers(self.command, 0, &vertices, &offsets);
+            // Three vertices, one instance, and the slot as the base instance.
+            self.device.cmd_draw(self.command, 3, 1, 0, SLOT);
+            self.device.cmd_end_render_pass(self.command);
+
+            // The render pass leaves the image in GENERAL, which a copy may read from; the
+            // barrier is for the write finishing, not for the layout.
+            let barrier = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .image(self.image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })];
+            self.device.cmd_pipeline_barrier(
+                self.command,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barrier,
+            );
+            let region = [vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width: SIDE,
+                    height: SIDE,
+                    depth: 1,
+                })];
+            self.device.cmd_copy_image_to_buffer(
+                self.command,
+                self.image,
+                vk::ImageLayout::GENERAL,
+                self.held[4],
+                &region,
+            );
+            self.device.end_command_buffer(self.command).expect("end");
+        }
     }
 
     /// Records `SAMPLES` frames of one shape, returning record and submit times.
@@ -676,11 +893,15 @@ fn allocate(
     .map_err(|why| format!("allocation: {why}"))
 }
 
-/// Vertices, indexes, and the two blocks, in one allocation.
+/// Vertices, indexes, the two blocks and a readback target, in one allocation.
+///
+/// The offsets come back because the verification writes the blocks through them: slot zero gets a
+/// zero matrix and slot `SLOT` an identity, which is what makes a drawn pixel mean the shader read
+/// the slot it was given.
 fn buffers(
     device: &ash::Device,
     properties: &vk::PhysicalDeviceMemoryProperties,
-) -> Result<([vk::Buffer; 4], vk::DeviceMemory), String> {
+) -> Result<([vk::Buffer; 5], [u64; 5], vk::DeviceMemory), String> {
     let make = |size: u64, usage: vk::BufferUsageFlags| -> Result<vk::Buffer, String> {
         unsafe {
             device.create_buffer(
@@ -698,6 +919,10 @@ fn buffers(
         make(4096, vk::BufferUsageFlags::INDEX_BUFFER)?,
         make(1 << 16, vk::BufferUsageFlags::STORAGE_BUFFER)?,
         make(4096, vk::BufferUsageFlags::STORAGE_BUFFER)?,
+        make(
+            u64::from(SIDE) * u64::from(SIDE) * 4,
+            vk::BufferUsageFlags::TRANSFER_DST,
+        )?,
     ];
 
     let needs: Vec<vk::MemoryRequirements> = held
@@ -717,13 +942,15 @@ fn buffers(
         },
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
+    let mut offsets = [0u64; 5];
     let mut at = 0u64;
-    for (buffer, need) in held.iter().zip(&needs) {
+    for (index, (buffer, need)) in held.iter().zip(&needs).enumerate() {
         unsafe { device.bind_buffer_memory(*buffer, memory, at) }
             .map_err(|why| format!("bind: {why}"))?;
+        offsets[index] = at;
         at += need.size.div_ceil(align) * align;
     }
-    Ok((held, memory))
+    Ok((held, offsets, memory))
 }
 
 /// The pipeline, with the family's own vertex input.

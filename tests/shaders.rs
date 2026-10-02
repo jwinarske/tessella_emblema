@@ -394,7 +394,7 @@ fn a_matrix_is_declared_as_four_columns() {
         "the translation column is not added on its own"
     );
     assert!(
-        source.contains("place(in.background_pos, drawable.matrix)"),
+        source.contains("place(vec3<f32>(vec2<f32>(in.background_pos), 0.0), drawable.matrix)"),
         "the body does not hand the columns straight to the surface"
     );
 }
@@ -436,7 +436,7 @@ fn the_vertex_input_matches_the_attribute_table() {
     assert_eq!(attribute_name(attribute.name), "background_pos");
     assert!(
         source.contains(&format!(
-            "@location({}) background_pos: vec3<f32>",
+            "@location({}) background_pos: vec2<i32>",
             attribute.binding
         )),
         "the input does not match the table:\n{source}"

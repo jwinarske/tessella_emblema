@@ -69,3 +69,17 @@
 #
 # So: the timing is sound, the compiler fix is confirmed, and `firstInstance` is unverified
 # here and verified on the other three.
+#
+# # What one vertex-stage DEM read costs (tessella#324)
+#
+# The one measurement this board does deliver, and it is the interesting one:
+#
+#   control  4343.5 us
+#   sampled  7816.1 us
+#   delta    3472.6 us over 1,048,576 fetches = 3.312 ns a fetch
+#
+# **Twelve times Adreno's 0.262 ns, and the control needs no readback to be trustworthy** --
+# it is a submit-to-fence time, not a pixel. A vertex-stage sampled read is genuinely
+# expensive on this part: a million of them is 3.5 ms. So where terrain's per-vertex fetch
+# is a rounding error on Adreno, on Vivante it is a cost worth designing around, and this
+# is the board where moving the raise off the vertex stage would actually pay.

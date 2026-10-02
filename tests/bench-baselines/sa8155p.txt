@@ -87,3 +87,25 @@
 # The spread between `instance` and `descriptors` is 1.39 us a draw, 0.89 ms over a
 # 640-drawable frame, which is why the arena and a shared descriptor set are worth having
 # here. On V3D the same span is 0.96 us and almost all of it is the push constant alone.
+#
+# # What one vertex-stage DEM read costs (tessella#324)
+#
+# A controlled pair: one draw of 1,048,576 vertices, the vertex stage either reading the
+# elevation or not, everything else held equal -- same buffer, same block, same target, and
+# a placement that puts every vertex outside the clip volume so neither variant rasterizes
+# a fragment. Submit to fence, p50 of 20.
+#
+#   control  1575.8 us
+#   sampled  1850.7 us
+#   delta     274.9 us over 1,048,576 fetches = 0.262 ns a fetch
+#
+# **So the fetch is not what costs 38.9 ms.** Accounting for that figure at this price
+# needs about 148 million reads in a frame, which is 8,500 tiles' worth of terrain mesh at
+# 17,415 vertices a tile. A pitched z14 cover is tens of tiles. Even a generous count of
+# every raised vertex in such a frame lands in the low millions, which is a millisecond or
+# two.
+#
+# The remaining candidates are all about the path to the read rather than the read: whether
+# the image view or descriptor is re-bound per draw where GLES caches it -- terrain scenes
+# bind a texture per tile, which is the merge blocker already recorded for them -- and the
+# backend's own per-draw work.

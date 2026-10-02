@@ -70,7 +70,7 @@ fn main() {
             return;
         }
     };
-    println!("device: {}", gpu.name);
+    println!("device: {} ({} target)", gpu.name, gpu.tiling);
     // Before any timing: does the draw's `firstInstance` actually reach the shader as the slot?
     //
     // The whole design indexes its blocks by it, and a driver that dropped it would read slot zero
@@ -155,6 +155,8 @@ fn micros(d: Duration) -> f64 {
 /// Everything needed to record one frame, held for the length of the run.
 struct Gpu {
     name: String,
+    /// Which tiling the readback target got, which is a property of the driver.
+    tiling: &'static str,
     _entry: ash::Entry,
     instance: ash::Instance,
     device: ash::Device,
@@ -181,13 +183,40 @@ struct Gpu {
 impl Gpu {
     #[allow(clippy::too_many_lines)]
     fn open() -> Result<Self, String> {
-        let entry = unsafe { ash::Entry::load() }.map_err(|why| format!("no loader: {why}"))?;
-        // Vulkan 1.1, not 1.0. naga emits `StorageBuffer` through
-        // `SPV_KHR_storage_buffer_storage_class`, which on a 1.0 device is an extension that has
-        // to be enabled and is core from 1.1. RADV and V3DV accept it either way; Adreno refuses
-        // the pipeline with `VK_ERROR_UNKNOWN` and prints no reason, which is a day to find and
-        // the reason this line carries a comment.
-        let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 1, 0));
+        // `TSL_VULKAN_LIB` names the driver to open instead of going through the loader.
+        //
+        // For an image whose loader and driver disagree about the interface version. On the
+        // i.MX8M Plus the stock loader reports that VeriSilicon's ICD "supports Vulkan 1.3, but
+        // only supports loader interface version 2", then inserts
+        // `VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO` into `vkCreateDevice`'s `pNext` -- which
+        // that driver does not skip. Opening the ICD directly puts nothing in the chain.
+        let entry = match std::env::var("TSL_VULKAN_LIB") {
+            Ok(path) => unsafe { ash::Entry::load_from(&path) }
+                .map_err(|why| format!("no driver at {path}: {why}"))?,
+            Err(_) => unsafe { ash::Entry::load() }.map_err(|why| format!("no loader: {why}"))?,
+        };
+        // Vulkan 1.1 where there is one, and 1.0 where there is not.
+        //
+        // 1.1 is wanted because naga emits `StorageBuffer` through
+        // `SPV_KHR_storage_buffer_storage_class`, which is core from 1.1 and an extension that
+        // has to be enabled before it. But asking for a version the implementation does not have
+        // is not free: the i.MX8M Plus ships a driver the loader reports as "supports Vulkan 1.3,
+        // but only supports loader interface version 2" and does not export
+        // `vkEnumerateInstanceVersion`, which is an implementation that is 1.0 whatever its
+        // manifest claims.
+        //
+        // So it is asked rather than assumed. `None` is the 1.0 answer -- the entry point that
+        // would report a version is the one those implementations lack.
+        let version = unsafe { entry.try_enumerate_instance_version() }
+            .ok()
+            .flatten()
+            .unwrap_or(vk::make_api_version(0, 1, 0, 0));
+        let wanted = if vk::api_version_minor(version) >= 1 {
+            vk::make_api_version(0, 1, 1, 0)
+        } else {
+            vk::make_api_version(0, 1, 0, 0)
+        };
+        let app = vk::ApplicationInfo::default().api_version(wanted);
         let instance = unsafe {
             entry.create_instance(
                 &vk::InstanceCreateInfo::default().application_info(&app),
@@ -249,7 +278,24 @@ impl Gpu {
 
         let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical) };
 
-        // The target. Nothing samples it or reads it back.
+        // The target, linear where the device will take one.
+        //
+        // The verification reads this back, and on Vivante an OPTIMAL (tiled) image keeps the
+        // render pass's clear in tile status where a transfer read does not see it -- the drawn
+        // triangle never appeared and the control read the clear color. A linear color attachment
+        // has no tile status to be stale. Queried rather than assumed, because linear color
+        // attachments are optional: the two desktop-class drivers here decline and keep OPTIMAL,
+        // where their reads are correct anyway.
+        let linear = unsafe {
+            instance.get_physical_device_format_properties(physical, vk::Format::R8G8B8A8_UNORM)
+        }
+        .linear_tiling_features
+        .contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT);
+        let tiling = if linear {
+            vk::ImageTiling::LINEAR
+        } else {
+            vk::ImageTiling::OPTIMAL
+        };
         let image = unsafe {
             device.create_image(
                 &vk::ImageCreateInfo::default()
@@ -263,7 +309,7 @@ impl Gpu {
                     .mip_levels(1)
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .tiling(tiling)
                     .usage(
                         vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
                     )
@@ -454,6 +500,7 @@ impl Gpu {
 
         Ok(Self {
             name,
+            tiling: if linear { "linear" } else { "optimal" },
             _entry: entry,
             instance,
             device,
@@ -484,10 +531,41 @@ impl Gpu {
     /// target when the shader read the slot it was handed and collapses to a point when it read
     /// zero instead. A green center pixel is the slot arriving; the clear color is it not.
     ///
+    /// # The control comes first
+    ///
+    /// A blank target means "did not draw with slot [`SLOT`]'s matrix", and "did not draw at all"
+    /// is one of the ways that happens -- so on its own it does not say the base instance was
+    /// dropped. The same triangle is therefore drawn first with the identity in slot zero and
+    /// `firstInstance` of zero, which differs from the real case in nothing but the mechanism
+    /// under test. Blank there and the probe cannot draw on this device, which is not a finding
+    /// about `firstInstance`.
+    ///
     /// # Errors
     ///
-    /// A description of what was read, when it is not what the slot should have drawn.
+    /// A description of what was read, and which of the two draws read it.
     fn verify(&self) -> Result<(), String> {
+        // The control: identity in slot zero, drawn with slot zero. Green or the probe is broken.
+        self.paint(0)?;
+        if !Self::is_green(self.read_center()?) {
+            return Err(format!(
+                "the control drew nothing -- identity in slot zero, `firstInstance` of zero, and \
+                 the center pixel is {:?}. This probe cannot draw on this device, so it says \
+                 nothing either way about the base instance.",
+                self.read_center()?
+            ));
+        }
+        self.slot_check()
+    }
+
+    /// Whether a pixel is the opaque green the fragment stage writes.
+    fn is_green(pixel: [u8; 4]) -> bool {
+        pixel[1] > 200 && pixel[0] < 64
+    }
+
+    /// Writes the buffers so that `slot` holds the identity, draws with it, and submits.
+    ///
+    /// Every other slot holds a zero matrix, which sends every vertex to the origin.
+    fn paint(&self, slot: u32) -> Result<(), String> {
         unsafe {
             let base = self
                 .device
@@ -513,11 +591,12 @@ impl Gpu {
                 &[-1.0, -1.0, 0.0, 3.0, -1.0, 0.0, -1.0, 3.0, 0.0],
             );
 
-            // Slot zero: a zero matrix, which sends every vertex to the origin. Slot SLOT: an
-            // identity. The block is 64 bytes of column-major matrix and nothing else.
-            base.add(self.offsets[2] as usize).write_bytes(0, 64);
+            // Zeros everywhere, which send every vertex to the origin, and an identity in the
+            // one slot under test. The block is 64 bytes of column-major matrix and nothing else.
+            base.add(self.offsets[2] as usize)
+                .write_bytes(0, (u64::from(SLOT) + 1) as usize * 64);
             put(
-                self.offsets[2] + u64::from(SLOT) * 64,
+                self.offsets[2] + u64::from(slot) * 64,
                 &[
                     1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
                 ],
@@ -529,7 +608,7 @@ impl Gpu {
             self.device.unmap_memory(self.memory);
         }
 
-        self.record_verify();
+        self.record_verify(slot);
         let commands = [self.command];
         let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
         unsafe {
@@ -544,6 +623,15 @@ impl Gpu {
                 .map_err(|why| format!("wait: {why}"))?;
         }
 
+        Ok(())
+    }
+
+    /// The center pixel of the last frame drawn, from the readback buffer.
+    ///
+    /// # Errors
+    ///
+    /// When the memory cannot be mapped.
+    fn read_center(&self) -> Result<[u8; 4], String> {
         let center = (SIDE as usize / 2) * SIDE as usize * 4 + (SIDE as usize / 2) * 4;
         let pixel = unsafe {
             let base = self
@@ -558,18 +646,30 @@ impl Gpu {
             self.device.unmap_memory(self.memory);
             pixel
         };
-        if pixel[1] > 200 && pixel[0] < 64 {
+        Ok(pixel)
+    }
+
+    /// The real case: the identity in [`SLOT`] alone, drawn with [`SLOT`] as the base instance.
+    ///
+    /// # Errors
+    ///
+    /// When the pixel says the shader read some other slot.
+    fn slot_check(&self) -> Result<(), String> {
+        self.paint(SLOT)?;
+        let pixel = self.read_center()?;
+        if Self::is_green(pixel) {
             Ok(())
         } else {
             Err(format!(
-                "the center pixel is {pixel:?}, not green -- the shader drew with slot zero's \
-                 matrix, so `firstInstance` did not reach it"
+                "the center pixel is {pixel:?}, not green. The control drew, so this device \
+                 does not deliver `firstInstance` to `instance_index`: every drawable would \
+                 read slot zero's block."
             ))
         }
     }
 
-    /// Records the one draw [`Self::verify`] reads back.
-    fn record_verify(&self) {
+    /// Records the one draw [`Self::paint`] reads back, with `slot` as the base instance.
+    fn record_verify(&self, slot: u32) {
         let clears = [vk::ClearValue {
             color: vk::ClearColorValue {
                 float32: [0.0, 0.0, 0.0, 1.0],
@@ -620,7 +720,7 @@ impl Gpu {
             self.device
                 .cmd_bind_vertex_buffers(self.command, 0, &vertices, &offsets);
             // Three vertices, one instance, and the slot as the base instance.
-            self.device.cmd_draw(self.command, 3, 1, 0, SLOT);
+            self.device.cmd_draw(self.command, 3, 1, 0, slot);
             self.device.cmd_end_render_pass(self.command);
 
             // The render pass leaves the image in GENERAL, which a copy may read from; the

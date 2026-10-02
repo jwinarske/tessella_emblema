@@ -1,0 +1,57 @@
+# `draw_cost` on an i.MX8M Plus (VeriSilicon GC7000UL).
+#
+# `root@wafer-imx8mp.lan`, NXP Yocto, aarch64, glibc 2.39, 4 cores, idle at load 0.00.
+# Vulkan loader 1.3.275 with NXP's ICD at /etc/vulkan/icd.d/imx_icd.json naming
+# `/usr/lib/libvulkan_VSI.so.1` (driver 6.4.11). The loader warns that it "supports
+# Vulkan 1.3, but only supports loader interface version 2" and lacks
+# `vkEnumerateInstanceVersion`, so it is treated as a 1.0 ICD; the bench asks the entry
+# point for a version rather than assuming one, and gets 1.0 here.
+#
+# # What this board found
+#
+# **Vivante's SPIR-V compiler segfaults on `OpCompositeConstruct` of a matrix.** Before
+# the matrix-free form, the bench died with SIGSEGV and printed nothing; gdb put the fault
+# in `VIR_Shader_CompositeConstruct` in `libVSC.so`, reached through `gcSPV_Decode` in
+# `libSPIRV_viv.so`.
+#
+# That is the other half of Adreno's assertion on a `mat4x4` read from a storage buffer.
+# One vendor refuses the matrix in the block and the other refuses rebuilding one from
+# columns, so the form that satisfies both is to have no matrix type at all and write the
+# multiply as the four multiply-adds it is. See `preamble::MATRIX`.
+#
+#                     record p50               per draw
+# shape          desktop   pi5  sa8155p imx8mp   desktop   pi5 sa8155p imx8mp
+# instance           9.6  49.4    736.1  294.4    0.0150 0.077  1.1502 0.4600
+# push              11.5 363.5*  1080.6  363.5    0.0180 0.568  1.6885 0.5680
+# buffers           24.0 681.2*  1350.0  445.1    0.0375 1.064  2.1094 0.6955
+# descriptors       26.1 681.2   1698.3 1276.9    0.0407 1.064  2.6536 1.9951
+#
+# All times in microseconds. (* the pi5 `push` and `buffers` rows are from the run in
+# raspberry-pi-5.txt; only `instance` and `descriptors` were re-taken here.)
+#
+# Recording is cheaper here than on either other board, which is worth noting against the
+# habit of treating an i.MX8M as the slow one: 0.46 us a draw against the sa8155p's 1.15.
+# The board is also genuinely idle, where the sa8155p sits at load 13.
+#
+# # What is still unknown here
+#
+# **The verification's control does not draw on this device, so the slot is unproven.**
+# The probe draws one triangle over the whole of clip space with an identity matrix in slot
+# zero and `firstInstance` of zero -- the control -- and reads the center pixel back. On
+# the other three devices that is green. Here it is the clear color, which means the probe
+# cannot draw at all on this driver rather than that the base instance was dropped.
+#
+# That distinction is the whole reason the control exists. Without it the run reported
+# "SLOT NOT DELIVERED" and the honest reading of that was a false accusation against a
+# shipping driver.
+#
+# Two candidates were tried and neither is the cause: a linear color attachment instead of
+# a tiled one (this driver takes LINEAR, and the pixel is unchanged), and bypassing the
+# loader with `TSL_VULKAN_LIB`. The drm-cxx work on this same board has Vulkan drawing and
+# scanning out, and records two Vivante quirks this probe does not yet handle -- clears
+# that stay in tile status until a one-pixel transfer read "kicks" a resolve, and
+# DRM-modifier LINEAR images that are laid out tiled. Adopting that kick is the next thing
+# to try if this board's slot needs proving.
+#
+# So: the timing is sound, the compiler fix is confirmed, and `firstInstance` is unverified
+# here and verified on the other three.

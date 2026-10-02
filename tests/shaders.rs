@@ -212,42 +212,56 @@ fn a_matrix_is_declared_as_four_columns() {
         "a block still declares a matrix as a matrix"
     );
     assert!(
-        source.contains("fn as_matrix(columns: array<vec4<f32>, 4>) -> mat4x4<f32>"),
-        "the prelude does not define the way a body reaches one"
+        source.contains("fn transform(columns: array<vec4<f32>, 4>, position: vec3<f32>)"),
+        "the prelude does not define the way a body applies one"
     );
-    // The four columns in order, pinned verbatim. A snapshot of one line is the right shape of
-    // test here: nothing else can catch a repeated or transposed index, because every wrong
-    // assembly is a well-typed `mat4x4` that compiles and validates. What it draws is every
-    // vertex in the wrong place, which reads as a camera fault rather than as a typo. The
-    // producer writes column-major and `mat4x4<f32>(a, b, c, d)` takes columns, so these are
-    // columns.
+    // No matrix is assembled anywhere either. Vivante's SPIR-V compiler segfaults on
+    // `OpCompositeConstruct` of a matrix -- `VIR_Shader_CompositeConstruct` in `libVSC.so` --
+    // so the first answer to Adreno's assertion, columns in the block rebuilt into a `mat4x4`
+    // to multiply, trades one vendor's crash for another's.
     assert!(
-        source.contains("return mat4x4<f32>(columns[0], columns[1], columns[2], columns[3]);"),
-        "the helper does not assemble the four columns in order:\n{source}"
+        !source.contains("mat4x4"),
+        "a matrix type survives somewhere in the module:\n{source}"
+    );
+    // The columns applied in order, pinned verbatim. A snapshot of these lines is the right
+    // shape of test here: nothing else can catch a repeated or transposed index, because every
+    // wrong combination is well-typed, compiles, validates, and draws every vertex in the wrong
+    // place -- which reads as a camera fault rather than as a typo. The producer writes
+    // column-major, so column `n` multiplies component `n`.
+    for (column, component) in [("0", "x"), ("1", "y"), ("2", "z")] {
+        assert!(
+            source.contains(&format!("columns[{column}] * position.{component}")),
+            "column {column} does not multiply {component}"
+        );
+    }
+    assert!(
+        source.contains("+ columns[3];"),
+        "the translation column is not added on its own"
     );
     assert!(
-        source.contains("as_matrix(drawable.matrix)"),
-        "the body does not reach the matrix through the helper"
+        source.contains("place(in.background_pos, drawable.matrix)"),
+        "the body does not hand the columns straight to the surface"
     );
 }
 
-/// Every family's body reaches a block matrix through `as_matrix` rather than directly.
+/// No module anywhere names a matrix type.
+///
+/// Two vendor compilers between them refuse both halves of the obvious spelling: Adreno asserts on
+/// a `mat4x4` read from a storage buffer, and Vivante segfaults on constructing one. So the
+/// property worth checking is not which helper a body uses -- it is that the type does not appear
+/// at all, on any family or any surface.
 #[test]
-fn no_body_uses_a_block_matrix_as_a_matrix() {
+fn no_module_names_a_matrix_type() {
     for family in families() {
         for surface in family.surfaces {
             let source = module(*surface, &family.blocks, family.attributes, family.body)
                 .expect("assembles");
-            // `drawable.matrix` on its own is the mistake; wrapped, it is preceded by the helper.
-            for at in source.match_indices("drawable.matrix").map(|(at, _)| at) {
-                let before = &source[..at];
-                assert!(
-                    before.ends_with("as_matrix("),
-                    "{}{} reads drawable.matrix without as_matrix",
-                    family.name,
-                    surface.suffix()
-                );
-            }
+            assert!(
+                !source.contains("mat4x4"),
+                "{}{} names a matrix type",
+                family.name,
+                surface.suffix()
+            );
         }
     }
 }

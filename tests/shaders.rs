@@ -133,11 +133,78 @@ fn the_body_reads_what_the_tables_declare() {
     for named in [
         "struct BackgroundDrawableUbo",
         "struct BackgroundPropsUbo",
-        "matrix: mat4x4<f32>",
+        // The field, not `place`'s parameter -- the leading indent and trailing comma are what
+        // tell a struct member from a function argument, and without them this assertion passed
+        // on the placement's signature after the declaration changed under it.
+        "    matrix: array<vec4<f32>, 4>,",
         "color: vec4<f32>",
         "opacity: f32",
     ] {
         assert!(source.contains(named), "{named} is missing from:\n{source}");
+    }
+}
+
+/// A matrix is declared as four columns, and the body cannot treat it as a matrix by accident.
+///
+/// Adreno's shader compiler asserts on a `mat4x4` read from a storage buffer and fails pipeline
+/// creation with `VK_ERROR_UNKNOWN`; every block here is read from a storage buffer and every
+/// drawable block carries a matrix, so `mat4x4` builds no pipeline at all on that board. RADV and
+/// V3DV accept it, so nothing on a desktop catches a change back.
+///
+/// The second half is the one that keeps it fixed: an array is not a matrix to WGSL, so a body
+/// that multiplies the field by a vector fails to compile rather than failing on a board.
+#[test]
+fn a_matrix_is_declared_as_four_columns() {
+    use tessella_emblema::preamble::MATRIX;
+
+    assert_eq!(MATRIX, "array<vec4<f32>, 4>");
+    let source = background();
+    assert!(
+        source.contains(&format!("    matrix: {MATRIX},")),
+        "the drawable block does not declare its matrix as columns:\n{source}"
+    );
+    assert!(
+        !source.contains("    matrix: mat4x4<f32>,"),
+        "a block still declares a matrix as a matrix"
+    );
+    assert!(
+        source.contains("fn as_matrix(columns: array<vec4<f32>, 4>) -> mat4x4<f32>"),
+        "the prelude does not define the way a body reaches one"
+    );
+    // The four columns in order, pinned verbatim. A snapshot of one line is the right shape of
+    // test here: nothing else can catch a repeated or transposed index, because every wrong
+    // assembly is a well-typed `mat4x4` that compiles and validates. What it draws is every
+    // vertex in the wrong place, which reads as a camera fault rather than as a typo. The
+    // producer writes column-major and `mat4x4<f32>(a, b, c, d)` takes columns, so these are
+    // columns.
+    assert!(
+        source.contains("return mat4x4<f32>(columns[0], columns[1], columns[2], columns[3]);"),
+        "the helper does not assemble the four columns in order:\n{source}"
+    );
+    assert!(
+        source.contains("as_matrix(drawable.matrix)"),
+        "the body does not reach the matrix through the helper"
+    );
+}
+
+/// Every family's body reaches a block matrix through `as_matrix` rather than directly.
+#[test]
+fn no_body_uses_a_block_matrix_as_a_matrix() {
+    for family in families() {
+        for surface in family.surfaces {
+            let source = module(*surface, &family.blocks, family.attributes, family.body)
+                .expect("assembles");
+            // `drawable.matrix` on its own is the mistake; wrapped, it is preceded by the helper.
+            for at in source.match_indices("drawable.matrix").map(|(at, _)| at) {
+                let before = &source[..at];
+                assert!(
+                    before.ends_with("as_matrix("),
+                    "{}{} reads drawable.matrix without as_matrix",
+                    family.name,
+                    surface.suffix()
+                );
+            }
+        }
     }
 }
 

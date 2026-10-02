@@ -53,6 +53,90 @@ const SAMPLES: usize = 60;
 /// The offscreen target's side.
 const SIDE: u32 = 64;
 
+/// Vertices shaded in the fetch measurement, which is about sixty terrain tiles' worth.
+///
+/// Large on purpose. A vertex-stage cost is per vertex, and the shapes above shade three vertices
+/// a draw -- 1,920 in a frame -- which would put the answer inside the noise of queue submission.
+/// A terrain mesh is 17,415 vertices a tile and a pitched z14 cover is tens of tiles, so this is
+/// the order the question is actually asked at.
+const VERTICES: u32 = 1 << 20;
+
+/// The vertex stage under test, with and without the DEM read, identical in all else.
+///
+/// Issue tessella#324: a terrain style costs the Vulkan backend +38.9 ms a frame and GLES
+/// +2.7 ms, and nothing has attributed the gap. A vertex-stage texture read is not known to be
+/// expensive on Adreno -- only that one backend's path to it is -- and this is the controlled
+/// pair that says which.
+///
+/// Written out here rather than assembled from a family, because the question has one variable
+/// and a family would change three: a real `_terrain` variant also reads a different block and
+/// binds a different set. The arithmetic is the real one -- `terrain_height.glsl`'s unpack
+/// against `Encoding::Mapbox`'s own constants -- and the result feeds the position, so it cannot
+/// be folded away.
+const FETCH_CONTROL: &str = r"
+struct Block {
+    columns: array<vec4<f32>, 4>,
+}
+@group(0) @binding(0) var<storage, read> block: array<Block>;
+
+struct In {
+    @location(0) pos: vec2<f32>,
+}
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    let b = block[0];
+    var out: Out;
+    out.clip = b.columns[0] * in.pos.x + b.columns[1] * in.pos.y + b.columns[3];
+    return out;
+}
+
+@fragment
+fn fragment_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+}
+";
+
+/// See [`FETCH_CONTROL`]. The same, plus one `textureSampleLevel` a vertex.
+const FETCH_SAMPLED: &str = r"
+struct Block {
+    columns: array<vec4<f32>, 4>,
+}
+@group(0) @binding(0) var<storage, read> block: array<Block>;
+@group(0) @binding(1) var elevation: texture_2d<f32>;
+@group(0) @binding(2) var elevation_sampler: sampler;
+
+struct In {
+    @location(0) pos: vec2<f32>,
+}
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    let b = block[0];
+    // `sampling_within`'s pair for a 256-pixel DEM at extent 8192, and the Mapbox unpack.
+    let uv = in.pos * 1.2112e-4 + vec2<f32>(3.876e-3, 3.876e-3);
+    let channels = textureSampleLevel(elevation, elevation_sampler, uv, 0.0).rgb * 255.0;
+    let meters = dot(channels, vec3<f32>(6553.6, 25.6, 0.1)) - 10000.0;
+    var out: Out;
+    out.clip = b.columns[0] * in.pos.x
+        + b.columns[1] * in.pos.y
+        + b.columns[2] * meters
+        + b.columns[3];
+    return out;
+}
+
+@fragment
+fn fragment_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+}
+";
+
 /// The slot the verification puts its identity matrix in, and hands the draw as `firstInstance`.
 ///
 /// Not zero, and not one: a driver that ignored the base instance entirely would read slot zero,
@@ -87,6 +171,28 @@ fn main() {
     println!();
     println!("{DRAWABLES} drawables a frame, {SAMPLES} frames a shape\n");
 
+    measure_shapes(&gpu);
+
+    // tessella#324: what one vertex-stage DEM read costs, with everything else held equal.
+    println!();
+    match fetch_cost(&gpu) {
+        Ok((control, sampled)) => {
+            let delta = sampled.saturating_sub(control);
+            println!(
+                "vertex fetch over {VERTICES} vertices: control {:8.1} us  sampled {:8.1} us  \
+                 delta {:8.1} us  per vertex {:6.3} ns",
+                micros(control),
+                micros(sampled),
+                micros(delta),
+                delta.as_secs_f64() * 1e9 / f64::from(VERTICES),
+            );
+        }
+        Err(why) => println!("vertex fetch not measured: {why}"),
+    }
+}
+
+/// The four recording shapes, in order.
+fn measure_shapes(gpu: &Gpu) {
     for shape in Shape::ALL {
         let (record, submit) = gpu.measure(shape);
         let (r50, r95, rmax) = percentiles(record);
@@ -157,6 +263,8 @@ struct Gpu {
     name: String,
     /// Which tiling the readback target got, which is a property of the driver.
     tiling: &'static str,
+    /// Kept for the fetch measurement, which allocates its own image and buffers.
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
     _entry: ash::Entry,
     instance: ash::Instance,
     device: ash::Device,
@@ -501,6 +609,7 @@ impl Gpu {
         Ok(Self {
             name,
             tiling: if linear { "linear" } else { "optimal" },
+            memory_properties,
             _entry: entry,
             instance,
             device,
@@ -523,6 +632,151 @@ impl Gpu {
             fence,
             shader: [vertex, fragment],
         })
+    }
+
+    /// Compiles one entry point of `source` into a module of its own.
+    ///
+    /// # Errors
+    ///
+    /// From the front end, the validator, the back end, or the driver.
+    fn module(
+        &self,
+        source: &str,
+        stage: naga::ShaderStage,
+        entry: &str,
+    ) -> Result<vk::ShaderModule, String> {
+        let words = compile(source, stage, entry)?;
+        unsafe {
+            self.device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
+        }
+        .map_err(|why| format!("no {entry} module: {why}"))
+    }
+
+    /// Puts `image` into the layout a sampled read needs.
+    ///
+    /// # Errors
+    ///
+    /// From the submission.
+    fn transition(&self, image: vk::Image) -> Result<(), String> {
+        unsafe {
+            self.device
+                .reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())
+                .map_err(|why| format!("reset: {why}"))?;
+            self.device
+                .begin_command_buffer(
+                    self.command,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(|why| format!("begin: {why}"))?;
+            let barrier = [vk::ImageMemoryBarrier::default()
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image(image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })];
+            self.device.cmd_pipeline_barrier(
+                self.command,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::VERTEX_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barrier,
+            );
+            self.device
+                .end_command_buffer(self.command)
+                .map_err(|why| format!("end: {why}"))?;
+        }
+        self.submit_and_wait()
+    }
+
+    /// Records one draw of [`VERTICES`] vertices through `pipeline`.
+    fn record_fetch(
+        &self,
+        pipeline: vk::Pipeline,
+        layout: vk::PipelineLayout,
+        set: vk::DescriptorSet,
+        vertices: vk::Buffer,
+    ) {
+        let clears = [vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        }];
+        let sets = [set];
+        let buffers = [vertices];
+        let offsets = [0u64];
+        unsafe {
+            self.device
+                .reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())
+                .expect("reset");
+            self.device
+                .begin_command_buffer(
+                    self.command,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .expect("begin");
+            self.device.cmd_begin_render_pass(
+                self.command,
+                &vk::RenderPassBeginInfo::default()
+                    .render_pass(self.pass)
+                    .framebuffer(self.framebuffer)
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D {
+                            width: SIDE,
+                            height: SIDE,
+                        },
+                    })
+                    .clear_values(&clears),
+                vk::SubpassContents::INLINE,
+            );
+            self.device
+                .cmd_bind_pipeline(self.command, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                self.command,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &sets,
+                &[],
+            );
+            self.device
+                .cmd_bind_vertex_buffers(self.command, 0, &buffers, &offsets);
+            self.device.cmd_draw(self.command, VERTICES, 1, 0, 0);
+            self.device.cmd_end_render_pass(self.command);
+            self.device.end_command_buffer(self.command).expect("end");
+        }
+    }
+
+    /// Submits the recorded buffer and waits for the fence.
+    ///
+    /// # Errors
+    ///
+    /// From the submission or the wait.
+    fn submit_and_wait(&self) -> Result<(), String> {
+        let commands = [self.command];
+        let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
+        unsafe {
+            self.device
+                .reset_fences(&[self.fence])
+                .map_err(|why| format!("fence: {why}"))?;
+            self.device
+                .queue_submit(self.queue, &submit, self.fence)
+                .map_err(|why| format!("submit: {why}"))?;
+            self.device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .map_err(|why| format!("wait: {why}"))
+        }
     }
 
     /// Draws one triangle with `firstInstance` set to [`SLOT`] and checks the pixel it lands on.
@@ -938,6 +1192,392 @@ impl Drop for Gpu {
             self.instance.destroy_instance(None);
         }
     }
+}
+
+/// Times one draw of [`VERTICES`] vertices with and without a DEM read in the vertex stage.
+///
+/// Returns the two submit-to-fence medians. Everything but the read is held equal: one pipeline a
+/// variant from the pair above, the same vertex buffer, the same block, the same target, and a
+/// placement that puts every vertex outside the clip volume so neither variant rasterizes
+/// anything. The difference is the fetch.
+///
+/// # Errors
+///
+/// Whatever could not be created, which on a driver missing something is the useful answer.
+#[allow(clippy::too_many_lines)]
+fn fetch_cost(gpu: &Gpu) -> Result<(Duration, Duration), String> {
+    let device = &gpu.device;
+
+    // One storage block, one sampled image, one sampler.
+    let stages = vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT;
+    let bindings = [
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(stages),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(stages),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(2)
+            .descriptor_type(vk::DescriptorType::SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(stages),
+    ];
+    let set_layout = unsafe {
+        device.create_descriptor_set_layout(
+            &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+            None,
+        )
+    }
+    .map_err(|why| format!("fetch set layout: {why}"))?;
+    let layouts = [set_layout];
+    let layout = unsafe {
+        device.create_pipeline_layout(
+            &vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts),
+            None,
+        )
+    }
+    .map_err(|why| format!("fetch pipeline layout: {why}"))?;
+
+    let sizes = [
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 1,
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::SAMPLED_IMAGE,
+            descriptor_count: 1,
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::SAMPLER,
+            descriptor_count: 1,
+        },
+    ];
+    let descriptor_pool = unsafe {
+        device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .pool_sizes(&sizes)
+                .max_sets(1),
+            None,
+        )
+    }
+    .map_err(|why| format!("fetch descriptor pool: {why}"))?;
+    let set = unsafe {
+        device.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(descriptor_pool)
+                .set_layouts(&layouts),
+        )
+    }
+    .map_err(|why| format!("fetch descriptor set: {why}"))?[0];
+
+    // The elevation: a DEM's stored size for a 256-pixel tile, which is what the sampling pair
+    // above was computed for. Contents do not matter; its dimensions and format do.
+    let stride = 258u32;
+    let elevation = unsafe {
+        device.create_image(
+            &vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .extent(vk::Extent3D {
+                    width: stride,
+                    height: stride,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::SAMPLED)
+                .initial_layout(vk::ImageLayout::UNDEFINED),
+            None,
+        )
+    }
+    .map_err(|why| format!("elevation image: {why}"))?;
+    let needs = unsafe { device.get_image_memory_requirements(elevation) };
+    let elevation_memory = allocate(
+        device,
+        &gpu.memory_properties,
+        needs,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )?;
+    unsafe { device.bind_image_memory(elevation, elevation_memory, 0) }
+        .map_err(|why| format!("elevation memory: {why}"))?;
+    let elevation_view = unsafe {
+        device.create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(elevation)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }),
+            None,
+        )
+    }
+    .map_err(|why| format!("elevation view: {why}"))?;
+    // Linear, which is what the elevation binds in the renderer.
+    let sampler = unsafe {
+        device.create_sampler(
+            &vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+            None,
+        )
+    }
+    .map_err(|why| format!("sampler: {why}"))?;
+
+    // The vertices, and a block whose placement sends every one of them off screen.
+    let vertex_bytes = u64::from(VERTICES) * 8;
+    let make = |size: u64, usage: vk::BufferUsageFlags| -> Result<vk::Buffer, String> {
+        unsafe {
+            device.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(size)
+                    .usage(usage)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )
+        }
+        .map_err(|why| format!("fetch buffer: {why}"))
+    };
+    let vertices = make(vertex_bytes, vk::BufferUsageFlags::VERTEX_BUFFER)?;
+    let block = make(256, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+    let pair = [vertices, block];
+    let needs: Vec<vk::MemoryRequirements> = pair
+        .iter()
+        .map(|b| unsafe { device.get_buffer_memory_requirements(*b) })
+        .collect();
+    let align = needs.iter().map(|n| n.alignment).max().unwrap_or(256);
+    let total = needs.iter().map(|n| n.size.div_ceil(align) * align).sum();
+    let bits = needs.iter().fold(u32::MAX, |a, n| a & n.memory_type_bits);
+    let memory = allocate(
+        device,
+        &gpu.memory_properties,
+        vk::MemoryRequirements {
+            size: total,
+            alignment: align,
+            memory_type_bits: bits,
+        },
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )?;
+    let mut offsets = [0u64; 2];
+    let mut at = 0u64;
+    for (index, (buffer, need)) in pair.iter().zip(&needs).enumerate() {
+        unsafe { device.bind_buffer_memory(*buffer, memory, at) }
+            .map_err(|why| format!("fetch bind: {why}"))?;
+        offsets[index] = at;
+        at += need.size.div_ceil(align) * align;
+    }
+
+    unsafe {
+        let base = device
+            .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+            .map_err(|why| format!("fetch map: {why}"))?
+            .cast::<u8>();
+        // Positions spread over a tile's coordinate range, so the sampling pair reaches the
+        // whole image and no cache holds the answer.
+        let mut bytes = Vec::with_capacity(vertex_bytes as usize);
+        for index in 0..VERTICES {
+            #[allow(clippy::cast_precision_loss)]
+            let x = (index % 8192) as f32;
+            #[allow(clippy::cast_precision_loss)]
+            let y = ((index / 8192) % 8192) as f32;
+            bytes.extend_from_slice(&x.to_le_bytes());
+            bytes.extend_from_slice(&y.to_le_bytes());
+        }
+        base.add(offsets[0] as usize)
+            .copy_from_nonoverlapping(bytes.as_ptr(), bytes.len());
+
+        // Columns that place every vertex far outside the clip volume, so neither variant
+        // rasterizes a fragment and the difference is the vertex stage alone.
+        let columns: [f32; 16] = [
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 64.0, 64.0, 0.5, 1.0,
+        ];
+        let mut block_bytes = Vec::with_capacity(64);
+        for value in columns {
+            block_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        base.add(offsets[1] as usize)
+            .copy_from_nonoverlapping(block_bytes.as_ptr(), block_bytes.len());
+        device.unmap_memory(memory);
+    }
+
+    let buffer_info = [vk::DescriptorBufferInfo {
+        buffer: block,
+        offset: 0,
+        range: vk::WHOLE_SIZE,
+    }];
+    let image_info = [vk::DescriptorImageInfo {
+        sampler: vk::Sampler::null(),
+        image_view: elevation_view,
+        image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    }];
+    let sampler_info = [vk::DescriptorImageInfo {
+        sampler,
+        image_view: vk::ImageView::null(),
+        image_layout: vk::ImageLayout::UNDEFINED,
+    }];
+    unsafe {
+        device.update_descriptor_sets(
+            &[
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&buffer_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&image_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&sampler_info),
+            ],
+            &[],
+        );
+    }
+
+    // The image has to be readable before it is sampled.
+    gpu.transition(elevation)?;
+
+    let mut built = Vec::new();
+    for source in [FETCH_CONTROL, FETCH_SAMPLED] {
+        let vertex = gpu.module(source, naga::ShaderStage::Vertex, "vertex_main")?;
+        let fragment = gpu.module(source, naga::ShaderStage::Fragment, "fragment_main")?;
+        built.push((
+            fetch_pipeline(device, gpu.pass, layout, vertex, fragment)?,
+            vertex,
+            fragment,
+        ));
+    }
+
+    let mut medians = Vec::new();
+    for (pipeline, _, _) in &built {
+        let mut timed = Vec::with_capacity(FETCH_SAMPLES);
+        for _ in 0..FETCH_SAMPLES {
+            gpu.record_fetch(*pipeline, layout, set, vertices);
+            let at = Instant::now();
+            gpu.submit_and_wait()?;
+            timed.push(at.elapsed());
+        }
+        medians.push(percentiles(timed).0);
+    }
+
+    unsafe {
+        let _ = device.device_wait_idle();
+        for (pipeline, vertex, fragment) in built {
+            device.destroy_pipeline(pipeline, None);
+            device.destroy_shader_module(vertex, None);
+            device.destroy_shader_module(fragment, None);
+        }
+        device.destroy_pipeline_layout(layout, None);
+        device.destroy_descriptor_pool(descriptor_pool, None);
+        device.destroy_descriptor_set_layout(set_layout, None);
+        device.destroy_sampler(sampler, None);
+        device.destroy_image_view(elevation_view, None);
+        device.destroy_image(elevation, None);
+        device.free_memory(elevation_memory, None);
+        device.destroy_buffer(vertices, None);
+        device.destroy_buffer(block, None);
+        device.free_memory(memory, None);
+    }
+    Ok((medians[0], medians[1]))
+}
+
+/// Frames timed per variant in the fetch measurement.
+const FETCH_SAMPLES: usize = 20;
+
+/// A pipeline for the fetch pair: one `float32x2` attribute and nothing else.
+fn fetch_pipeline(
+    device: &ash::Device,
+    pass: vk::RenderPass,
+    layout: vk::PipelineLayout,
+    vertex: vk::ShaderModule,
+    fragment: vk::ShaderModule,
+) -> Result<vk::Pipeline, String> {
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vertex)
+            .name(c"vertex_main"),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(fragment)
+            .name(c"fragment_main"),
+    ];
+    let bindings = [vk::VertexInputBindingDescription {
+        binding: 0,
+        stride: 8,
+        input_rate: vk::VertexInputRate::VERTEX,
+    }];
+    let attributes = [vk::VertexInputAttributeDescription {
+        location: 0,
+        binding: 0,
+        format: vk::Format::R32G32_SFLOAT,
+        offset: 0,
+    }];
+    let input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(&bindings)
+        .vertex_attribute_descriptions(&attributes);
+    let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    #[allow(clippy::cast_precision_loss)]
+    let viewports = [vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: SIDE as f32,
+        height: SIDE as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+    let scissors = [vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: vk::Extent2D {
+            width: SIDE,
+            height: SIDE,
+        },
+    }];
+    let viewport = vk::PipelineViewportStateCreateInfo::default()
+        .viewports(&viewports)
+        .scissors(&scissors);
+    let raster = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0);
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let blends = [vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+    let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blends);
+    let create = [vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&input)
+        .input_assembly_state(&assembly)
+        .viewport_state(&viewport)
+        .rasterization_state(&raster)
+        .multisample_state(&multisample)
+        .color_blend_state(&blend)
+        .layout(layout)
+        .render_pass(pass)
+        .subpass(0)];
+    unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &create, None) }
+        .map(|pipelines| pipelines[0])
+        .map_err(|(_, why)| format!("fetch pipeline: {why}"))
 }
 
 /// Compiles one entry point of the assembled module to SPIR-V words.

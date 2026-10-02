@@ -84,3 +84,11 @@
 # and reads the center pixel back: `firstInstance reaches the shader as slot 613`. A driver
 # that dropped the base instance would read slot zero for every drawable -- one layer's
 # paint for the whole map, which looks deliberate -- so it is worth a readback.
+#
+# # What one vertex-stage DEM read costs (tessella#324)
+#
+#   control  1816.6 us
+#   sampled  1835.7 us
+#   delta      19.1 us over 1,048,576 fetches = 0.018 ns a fetch
+#
+# Free, to the limit of what this measures. The desktop's delta is zero within noise.

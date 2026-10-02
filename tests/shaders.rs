@@ -5,8 +5,8 @@
 //! one at the wrong type, fails here rather than at pipeline creation on a board.
 
 use tessella_capture_abi::generated::shader_attributes::{
-    BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER, FILL_OUTLINE_SHADER, FILL_SHADER,
-    LINE_SHADER, RASTER_SHADER, ShaderAttribute,
+    BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER, FILL_EXTRUSION_SHADER,
+    FILL_OUTLINE_SHADER, FILL_SHADER, LINE_SHADER, RASTER_SHADER, ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
     COLOR_RELIEF_SHADER_TEXTURES, RASTER_SHADER_TEXTURES, ShaderTexture,
@@ -14,12 +14,13 @@ use tessella_capture_abi::generated::texture_slots::{
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
     COLOR_RELIEF_DRAWABLE_UBO, COLOR_RELIEF_EVALUATED_PROPS_UBO, COLOR_RELIEF_TILE_PROPS_UBO,
-    FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, LINE_DRAWABLE_UBO, LINE_EVALUATED_PROPS_UBO,
-    RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, UboLayout,
+    FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
+    FILL_EXTRUSION_PROPS_UBO, LINE_DRAWABLE_UBO, LINE_EVALUATED_PROPS_UBO, RASTER_DRAWABLE_UBO,
+    RASTER_EVALUATED_PROPS_UBO, UboLayout,
 };
 use tessella_emblema::shaders::{
-    BACKGROUND_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY, FILL_OUTLINE_BODY, LINE_BODY,
-    RASTER_BODY, attribute_name, module,
+    BACKGROUND_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY, FILL_EXTRUSION_BODY,
+    FILL_OUTLINE_BODY, LINE_BODY, RASTER_BODY, attribute_name, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -31,6 +32,11 @@ struct Family {
     textures: &'static [ShaderTexture],
     body: &'static str,
     surfaces: &'static [Surface],
+    /// Whether this family hands `place` a height above the surface rather than zero.
+    ///
+    /// Which decides one of its surfaces: the direct bend has no height term, so a family that
+    /// leaves the surface cannot be drawn on it. See `Surface::Globe`'s placement.
+    height: bool,
 }
 
 /// Every family a plane module exists for, and which surfaces each one has.
@@ -58,6 +64,7 @@ fn families() -> Vec<Family> {
             textures: &[],
             body: BACKGROUND_BODY,
             surfaces: flat_or_bent,
+            height: false,
         },
         Family {
             name: "fill",
@@ -66,6 +73,7 @@ fn families() -> Vec<Family> {
             textures: &[],
             body: FILL_BODY,
             surfaces: all,
+            height: false,
         },
         Family {
             name: "fill_outline",
@@ -74,6 +82,7 @@ fn families() -> Vec<Family> {
             textures: &[],
             body: FILL_OUTLINE_BODY,
             surfaces: all,
+            height: false,
         },
         Family {
             name: "line",
@@ -82,6 +91,7 @@ fn families() -> Vec<Family> {
             textures: &[],
             body: LINE_BODY,
             surfaces: all,
+            height: false,
         },
         Family {
             name: "raster",
@@ -90,6 +100,7 @@ fn families() -> Vec<Family> {
             textures: &RASTER_SHADER_TEXTURES,
             body: RASTER_BODY,
             surfaces: all,
+            height: false,
         },
         Family {
             name: "color_relief",
@@ -102,6 +113,17 @@ fn families() -> Vec<Family> {
             textures: &COLOR_RELIEF_SHADER_TEXTURES,
             body: COLOR_RELIEF_BODY,
             surfaces: unanchored,
+            height: false,
+        },
+        Family {
+            name: "fill_extrusion",
+            blocks: vec![&FILL_EXTRUSION_DRAWABLE_UBO, &FILL_EXTRUSION_PROPS_UBO],
+            attributes: &FILL_EXTRUSION_SHADER,
+            textures: &[],
+            body: FILL_EXTRUSION_BODY,
+            // No direct bend: it has no height term, and this is the family with a height.
+            surfaces: &[Surface::Plane, Surface::GlobeAnchored],
+            height: true,
         },
         Family {
             name: "circle",
@@ -110,6 +132,7 @@ fn families() -> Vec<Family> {
             textures: &[],
             body: CIRCLE_BODY,
             surfaces: all,
+            height: false,
         },
     ]
 }
@@ -178,6 +201,87 @@ fn the_body_reads_what_the_tables_declare() {
     ] {
         assert!(source.contains(named), "{named} is missing from:\n{source}");
     }
+}
+
+/// The roof is placed at its building's top, and the footprint keeps its fraction.
+///
+/// Two decisions that compile, validate and draw, and are wrong in ways that read as data rather
+/// than as code:
+///
+/// * `select(base, height, ...)` returns the *third* argument's truth case, so the arms decide
+///   whether a roof sits at the top of its building or on the ground. Swapped, every building in
+///   the frame is flat -- which is the symptom fluorite's own material records having had.
+/// * the packed fraction is added to the footprint. Dropped, a roof parts company with the walls
+///   standing under it, by up to a tile unit, wherever a simplification pass produced fractional
+///   positions.
+///
+/// A mutation found the first: nothing else in the suite noticed the arms swapping.
+#[test]
+fn the_roof_sits_at_the_top_and_keeps_its_fraction() {
+    let extrusion = families()
+        .into_iter()
+        .find(|family| family.name == "fill_extrusion")
+        .expect("fill extrusion is in the matrix");
+    let source = module(
+        Surface::Plane,
+        &extrusion.blocks,
+        extrusion.attributes,
+        extrusion.textures,
+        extrusion.body,
+    )
+    .expect("assembles");
+
+    assert!(
+        source.contains("let z = select(base, height, on_roof > 0.0);"),
+        "the roof is not placed at the height:\n{source}"
+    );
+    assert!(
+        source.contains("place(vec3<f32>(footprint + decimals, z), drawable.matrix)"),
+        "the fraction is not added, or the height is not the third component"
+    );
+}
+
+/// A family with a height is not offered the direct bend, and does get the anchored one.
+///
+/// `Surface::Globe`'s placement reads `position.xy` and leaves `z` alone, because lifting a height
+/// needs the sphere's normal and the coefficient for that -- `d_h` -- belongs to the anchored
+/// bend. So a family that hands `place` a height would have it silently dropped there: every
+/// building flat on the ground, which looks deliberate.
+///
+/// The producer agrees from the other side, which is why this is a rule and not a preference: it
+/// writes a bend block for the extrusions, and that block is what the anchored surface reads.
+#[test]
+fn a_family_with_a_height_skips_the_direct_bend() {
+    let mut with_height = 0;
+    for family in families() {
+        if !family.height {
+            continue;
+        }
+        with_height += 1;
+        assert!(
+            !family.surfaces.contains(&Surface::Globe),
+            "{} has a height and the direct bend would drop it",
+            family.name
+        );
+        assert!(
+            family.surfaces.contains(&Surface::GlobeAnchored),
+            "{} has a height and nothing to lift it with",
+            family.name
+        );
+    }
+    assert!(with_height > 0, "no family exercises the height at all");
+
+    // And the direct bend really does leave `z` alone, which is what makes the rule necessary.
+    assert!(
+        !Surface::Globe.placement().contains("position.z"),
+        "the direct bend grew a height term; this rule may no longer be needed"
+    );
+    assert!(
+        Surface::GlobeAnchored
+            .placement()
+            .contains("bend.d_h * position.z"),
+        "the anchored bend no longer lifts a height"
+    );
 }
 
 /// The color relief keeps the two decisions in its arithmetic that are silent when wrong.
@@ -525,7 +629,7 @@ fn every_family_on_every_surface_compiles() {
         }
     }
     assert_eq!(
-        pairs, 25,
+        pairs, 27,
         "the matrix grew or shrank; look at the new pairs"
     );
 }
@@ -567,8 +671,18 @@ fn every_attribute_is_read() {
 /// The `_t` fields exist to mix an attribute between its two zoom endpoints. Reading the attribute
 /// and ignoring the factor draws the lower endpoint at every zoom, which looks like a style that
 /// stopped interpolating rather than like a bug.
+///
+/// Asked from the attribute's side, not the factor's. A drawable block is shared between a family
+/// and its variants -- `FILL_EXTRUSION_DRAWABLE_UBO` carries `pattern_from_t` for the pattern
+/// shader -- so requiring every factor in a block to be used by every family that reads it
+/// demands the impossible. What is actually wanted is narrower and is the property above: if the
+/// family declares the attribute, it has to mix with the factor.
+///
+/// Paired by name with the underscores removed, because the two spellings differ: the attribute is
+/// `idLineGapWidthVertexAttribute` and the factor is `gapwidth_t`.
 #[test]
 fn every_zoom_factor_is_used() {
+    let mut paired = 0;
     for family in families() {
         for surface in family.surfaces {
             let source = module(
@@ -579,20 +693,29 @@ fn every_zoom_factor_is_used() {
                 family.body,
             )
             .expect("assembles");
-            for block in &family.blocks {
-                for field in block.fields {
-                    if !field.name.ends_with("_t") {
-                        continue;
+            for attribute in family.attributes {
+                let field = attribute_name(attribute.name);
+                let flat = field.replace('_', "");
+                for block in &family.blocks {
+                    for factor in block.fields {
+                        let Some(stem) = factor.name.strip_suffix("_t") else {
+                            continue;
+                        };
+                        if !flat.ends_with(&stem.replace('_', "")) {
+                            continue;
+                        }
+                        paired += 1;
+                        assert!(
+                            identifier_uses(&source, factor.name) >= 2,
+                            "{}{} reads {field} and never mixes it with {}",
+                            family.name,
+                            surface.suffix(),
+                            factor.name
+                        );
                     }
-                    assert!(
-                        identifier_uses(&source, field.name) >= 2,
-                        "{}{} declares {} and never mixes with it",
-                        family.name,
-                        surface.suffix(),
-                        field.name
-                    );
                 }
             }
         }
     }
+    assert!(paired > 0, "no attribute was paired with a factor at all");
 }

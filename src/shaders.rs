@@ -93,17 +93,31 @@ const fn attribute_type(declared: AttributeDataType) -> Option<&'static str> {
     }
 }
 
+/// Drops the `id` prefix and whichever of `suffixes` the name ends with.
+///
+/// Each strip is applied to the result of the last, which is the whole of what this exists for: a
+/// chain of `strip_suffix(..).unwrap_or(declared)` falls back to the *original* string, so a name
+/// that does not end in the suffix loses the prefix strip too. That is how
+/// `idFillExtrusionDecimalsEdAttribute` came out as `id_fill_extrusion_decimals_ed_attribute` --
+/// nine of the ABI's seventy-three attribute ids do not end in `VertexAttribute`, and nothing
+/// read one until the extrusions.
+fn strip_id<'a>(declared: &'a str, suffixes: &[&str]) -> &'a str {
+    let trimmed = declared.strip_prefix("id").unwrap_or(declared);
+    for suffix in suffixes {
+        if let Some(shorter) = trimmed.strip_suffix(suffix) {
+            return shorter;
+        }
+    }
+    trimmed
+}
+
 /// A WGSL name for a texture, from the id the header spells.
 ///
 /// `idRasterImage0Texture` becomes `raster_image0`, and its sampler `raster_image0_sampler`. The
 /// `id` prefix and the `Texture` suffix say nothing a shader needs, as with an attribute's.
 #[must_use]
 pub fn texture_name(declared: &str) -> String {
-    let trimmed = declared
-        .strip_prefix("id")
-        .unwrap_or(declared)
-        .strip_suffix("Texture")
-        .unwrap_or(declared);
+    let trimmed = strip_id(declared, &["Texture"]);
     let mut out = String::with_capacity(trimmed.len() + 4);
     for (at, ch) in trimmed.char_indices() {
         if ch.is_ascii_uppercase() {
@@ -124,11 +138,7 @@ pub fn texture_name(declared: &str) -> String {
 /// `VertexAttribute` suffix say nothing a shader needs, and what is left is the name.
 #[must_use]
 pub fn attribute_name(declared: &str) -> String {
-    let trimmed = declared
-        .strip_prefix("id")
-        .unwrap_or(declared)
-        .strip_suffix("VertexAttribute")
-        .unwrap_or(declared);
+    let trimmed = strip_id(declared, &["VertexAttribute", "Attribute"]);
     let mut out = String::with_capacity(trimmed.len() + 4);
     for (at, ch) in trimmed.char_indices() {
         if ch.is_ascii_uppercase() {
@@ -631,6 +641,91 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
     }
 
     return props.opacity * mix(color_stop(left, stops), color_stop(right, stops), t);
+}
+";
+
+/// The fill-extrusion family's body: a building's roof.
+///
+/// The first family with a height, which is what `place`'s third component has been carrying
+/// unused since the surfaces landed. On a plane the drawable's matrix takes meters in its `z` row
+/// -- `world_to_camera` post-multiplies it by pixels-per-meter -- and on the anchored bend the
+/// height goes along the sphere's normal through `d_h`, the coefficient declared in
+/// `GlobeBendUbo` for exactly this and read by nothing until now.
+///
+/// It has no direct-bend variant, and that is not an omission: the direct bend has no height term
+/// at all, so a family that leaves the surface cannot be drawn on it. The producer agrees -- it
+/// writes extrusions a bend block, which is what the anchored surface needs.
+///
+/// # What this draws, and what it does not
+///
+/// The roof only. mbgl draws the walls as a second, instanced drawable over the same outline, and
+/// that is its own family. The vertical gradient down a wall is therefore not here: it applies
+/// only where the surface normal is horizontal, and every vertex of a roof faces straight up, so
+/// including it would be a branch nothing can take. It belongs with the walls and has to arrive
+/// with them.
+pub const FILL_EXTRUSION_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) shade: vec4<f32>,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let drawable = fill_extrusion_drawable_ubo[ubo_index];
+    let props = fill_extrusion_props_ubo[0];
+    var out: Out;
+
+    let footprint = vec2<f32>(in.fill_extrusion_pos);
+
+    // The fraction the position was packed with, seven bits an axis. Integer tile units leave it
+    // zero, and a simplification pass produces fractional positions -- at which point a roof that
+    // dropped this would part company with the walls standing under it.
+    let packed = floor(f32(in.fill_extrusion_decimals_ed.x) / 2.0);
+    let high = floor(packed / 256.0);
+    let decimals = vec2<f32>(high, packed - high * 256.0) / 128.0;
+
+    let base = max(mix_value(in.fill_extrusion_base, drawable.base_t), 0.0);
+    let height = max(mix_value(in.fill_extrusion_height, drawable.height_t), 0.0);
+    // Every vertex of a roof is at the building's top, so this always takes the height. Written
+    // as mbgl's selection rather than as `height` alone: the base is the other arm of the term it
+    // computes, and a shader that dropped it would agree with the oracle by coincidence of what
+    // this drawable happens to carry rather than by computing the same thing.
+    let on_roof = 1.0;
+    let z = select(base, height, on_roof > 0.0);
+
+    // How bright the surface already is. A pale building takes a narrower range of shading than a
+    // dark one, which is what keeps a light roof from blowing out.
+    var color = mix_color(in.fill_extrusion_color, drawable.color_t);
+    let luminance = color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722;
+    // Slight ambient, so nothing is ever completely black.
+    color += vec4<f32>(0.03, 0.03, 0.03, 1.0);
+
+    // A roof faces straight up, so the directional term is the light's own elevation.
+    let normal = vec3<f32>(0.0, 0.0, 1.0);
+    let facing = clamp(dot(normal, props.light_position), 0.0, 1.0);
+    let least = 1.0 - props.light_intensity;
+    let most = max(1.0 - luminance + props.light_intensity, 1.0);
+    let directional = mix(least, most, facing);
+
+    // Shading is floored at a tint complementary to the light, so a colored light leaves its
+    // opposite in the shadows rather than driving them to black.
+    let floor_light = mix(vec3<f32>(0.0), vec3<f32>(0.3), 1.0 - props.light_color);
+    let lit = clamp(color.rgb * directional * props.light_color, floor_light, vec3<f32>(1.0));
+
+    // Premultiplied: rgb scaled by the opacity and alpha set to it, over a color whose alpha
+    // was one.
+    out.shade = vec4<f32>(lit, 1.0) * props.opacity;
+
+    // The height in meters, which is what `place`'s third component is for: the plane's matrix
+    // takes meters in its `z` row, and the anchored bend lifts along the sphere's normal.
+    out.clip = place(vec3<f32>(footprint + decimals, z), drawable.matrix);
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    return in.shade;
 }
 ";
 

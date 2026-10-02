@@ -1,0 +1,73 @@
+# `draw_cost` on an sa8155p (Adreno 640), against the desktop and the Pi 5.
+#
+# `sa81x5-guest`, Cockpit SDK(IVI) v12.9.0 (Yocto dunfell), kernel 5.4.219, 6 cores,
+# glibc 2.31. Vulkan 1.2.198 through `/usr/lib/libvulkan_adreno.so` -- Qualcomm's own
+# loader, so there is no `icd.d` and no validation layer to debug with.
+#
+# Reached over `adb`, which is the transport only: this is Linux, not Android. Push to
+# /tmp and run.
+#
+# # The board is never idle
+#
+# Load average 13.5 on 6 cores before anything of ours starts -- the vendor stack. So p50
+# over sixty frames is the only figure worth reading and the p95 and max columns are
+# contention, not signal. `taskset -c 5` refused with EINVAL on one run and worked on
+# another, so the numbers below are unpinned.
+#
+# # Building for it
+#
+# glibc 2.31 is older than any sysroot on the build host (the ARM GNU toolchain ships
+# 2.42), and static musl is not available because `ash` reaches Vulkan through `dlopen`.
+# zig supplies stub libs per glibc version, so it links what nothing else here can:
+#
+#   # wrapper: exec ~/.local/zig/zig cc -target aarch64-linux-gnu.2.31 "$@"
+#   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=<wrapper> \
+#     cargo bench --no-run --target aarch64-unknown-linux-gnu
+#   objdump -T <bin> | grep -oE 'GLIBC_[0-9.]+' | sort -V -u   # must stay <= 2.31
+#
+# Cargo does not fingerprint the linker environment variable, so delete the binary before
+# relinking or it keeps the old one and the floor check passes on a stale file.
+#
+# # What it took to get a pipeline at all
+#
+# Two things, both of which RADV and V3DV accept and this driver does not:
+#
+# A `mat4x4<f32>` read from a storage buffer makes the shader compiler assert --
+# `matOpnd->isMatrix()` in its own CodeGenHelper.cpp -- and pipeline creation returns
+# `VK_ERROR_UNKNOWN`. Matrices are declared as four `vec4` columns for this reason; see
+# `preamble::MATRIX`.
+#
+# And one SPIR-V module may carry one entry point. A module holding `vertex_main` and
+# `fragment_main` is refused with no diagnostic whatsoever -- the assertion above only
+# appeared once the modules were split, so the first failure hides the second.
+#
+# # What each row is
+#
+# 640 drawables recorded into one command buffer, 60 frames a shape, strictly additive:
+# each row is the one above plus the state named.
+#
+#                     record p50               per draw              submit p50
+# shape          desktop   pi5   sa8155p  desktop   pi5  sa8155p  desktop  pi5  sa8155p
+# instance           9.3  57.8     769.8   0.0146 0.090   1.203      25.9 104.0  1493.9
+# push              14.5 636.8     985.8   0.0227 0.995   1.540      34.5 112.4  1510.4
+# buffers           26.3 651.9    1234.5   0.0411 1.019   1.929      59.3 112.5  1501.7
+# descriptors       29.6 656.1    1582.7   0.0463 1.025   2.473      58.8 112.3  1547.9
+#
+# All times in microseconds.
+#
+# # What the numbers say
+#
+# **The merge is not worth porting on any of the three.** The dearest shape costs 2.47 us a
+# draw here against the Flutter GPU sibling's ~62 us a draw on its own board, half of which
+# is Dart walking batches.
+#
+# **Per-draw state costs real money here and almost none on V3D.** Going from `descriptors`
+# to `instance` is 2.47 to 1.20 us, about 0.81 ms over a 640-drawable frame. On V3D the
+# same span is 1.025 to 0.090 and nearly all of it is the push constant alone, with buffers
+# and descriptors free on top. So the arena and a shared descriptor set earn their place on
+# Adreno for a reason V3D does not show, and `firstInstance` earns its place on both.
+#
+# The three drivers share no ratio: 6x/44x/25x/22x for pi5 over desktop, and
+# 82x/68x/47x/53x for sa8155p over desktop. There is no scaling factor from a desktop
+# measurement to a board one for command recording, which is the whole reason these files
+# exist.

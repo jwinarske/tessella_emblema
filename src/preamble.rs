@@ -64,6 +64,9 @@ const fn wgsl_align(kind: UboFieldKind) -> u32 {
 }
 
 /// The WGSL type that holds this field.
+///
+/// A `mat4` is declared as four `vec4`s and not as `mat4x4<f32>`, which is the one place this
+/// deviates from the obvious transcription. See [`MATRIX`] for why.
 const fn wgsl_type(kind: UboFieldKind) -> &'static str {
     match kind {
         UboFieldKind::F32 => "f32",
@@ -72,9 +75,34 @@ const fn wgsl_type(kind: UboFieldKind) -> &'static str {
         UboFieldKind::Vec2 => "vec2<f32>",
         UboFieldKind::Vec3 => "vec3<f32>",
         UboFieldKind::Vec4 | UboFieldKind::Color => "vec4<f32>",
-        UboFieldKind::Mat4 => "mat4x4<f32>",
+        UboFieldKind::Mat4 => MATRIX,
     }
 }
+
+/// How a `mat4` is declared: four columns, not a matrix.
+///
+/// # Why not `mat4x4<f32>`
+///
+/// Adreno's shader compiler asserts on a `mat4x4` read from a storage buffer --
+/// `matOpnd->isMatrix()` in its own `CodeGenHelper.cpp` -- and fails pipeline creation with
+/// `VK_ERROR_UNKNOWN`. Every block here is read from a storage buffer indexed by `ubo_index`, and
+/// every family's drawable block carries a matrix, so the obvious declaration builds no pipeline
+/// at all on the sa8155p. RADV and V3DV both accept it, which is why a desktop says nothing.
+///
+/// # Why the layout does not move
+///
+/// WGSL gives `array<vec4<f32>, 4>` an element stride of sixteen, an alignment of sixteen and a
+/// size of sixty-four -- the same three numbers as `mat4x4<f32>`. So [`offsets`] answers
+/// identically either way and the producer's offsets are untouched. This is a change of spelling,
+/// not of layout.
+///
+/// # Why this is the safer spelling anyway
+///
+/// An array is not a matrix to WGSL, so a body that multiplies one by a vector does not compile.
+/// The mistake this exists to prevent therefore cannot be made silently: there is no way to write
+/// the code that works on a desktop and dies on the board. A body reaches the matrix through
+/// `as_matrix`, which `shaders::PRELUDE` defines.
+pub const MATRIX: &str = "array<vec4<f32>, 4>";
 
 /// Rounds `at` up to a multiple of `align`.
 const fn align_to(at: u32, align: u32) -> u32 {

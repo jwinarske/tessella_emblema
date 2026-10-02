@@ -237,7 +237,7 @@ struct Out {
 fn vertex_main(in: In) -> Out {
     let drawable = background_drawable_ubo[ubo_index];
     var out: Out;
-    out.clip = place(in.background_pos, drawable.matrix);
+    out.clip = place(in.background_pos, as_matrix(drawable.matrix));
     return out;
 }
 
@@ -261,8 +261,17 @@ fn fragment_main() -> @location(0) vec4<f32> {
 /// A color arrives packed: four floats holding two colors, each color's four channels folded into
 /// two floats. Unpacking is mbgl's, and the constant is its own -- 255 per channel, the high
 /// channel scaled by 256.
+///
+/// A matrix arrives as four columns rather than as a matrix, because Adreno's shader compiler
+/// asserts on a `mat4x4` read from a storage buffer -- see [`crate::preamble::MATRIX`].
+/// `as_matrix` is how a body reaches one, and the columns are columns: the producer writes
+/// column-major.
 pub const PRELUDE: &str = r"
 var<push_constant> ubo_index: u32;
+
+fn as_matrix(columns: array<vec4<f32>, 4>) -> mat4x4<f32> {
+    return mat4x4<f32>(columns[0], columns[1], columns[2], columns[3]);
+}
 
 fn mix_value(packed: vec2<f32>, t: f32) -> f32 {
     return mix(packed.x, packed.y, t);
@@ -297,7 +306,7 @@ struct Out {
 fn vertex_main(in: In) -> Out {
     let drawable = fill_drawable_ubo[ubo_index];
     var out: Out;
-    out.clip = place(vec3<f32>(vec2<f32>(in.fill_pos), 0.0), drawable.matrix);
+    out.clip = place(vec3<f32>(vec2<f32>(in.fill_pos), 0.0), as_matrix(drawable.matrix));
     out.color = mix_color(in.fill_color, drawable.color_t);
     out.opacity = mix_value(in.fill_opacity, drawable.opacity_t);
     return out;
@@ -324,7 +333,7 @@ struct Out {
 fn vertex_main(in: In) -> Out {
     let drawable = fill_drawable_ubo[ubo_index];
     var out: Out;
-    out.clip = place(vec3<f32>(vec2<f32>(in.fill_pos), 0.0), drawable.matrix);
+    out.clip = place(vec3<f32>(vec2<f32>(in.fill_pos), 0.0), as_matrix(drawable.matrix));
     out.outline_color = mix_color(in.fill_outline_color, drawable.color_t);
     out.opacity = mix_value(in.fill_opacity, drawable.opacity_t);
     return out;
@@ -365,7 +374,10 @@ fn vertex_main(in: In) -> Out {
     let corner = vec2<f32>(vec2<i32>(in.circle_pos) % 2) * 2.0 - 1.0;
     let reach = (radius + stroke_width) * drawable.extrude_scale;
 
-    out.clip = place(vec3<f32>(vec2<f32>(in.circle_pos) + corner * reach, 0.0), drawable.matrix);
+    out.clip = place(
+        vec3<f32>(vec2<f32>(in.circle_pos) + corner * reach, 0.0),
+        as_matrix(drawable.matrix)
+    );
     out.extrude = corner;
     out.color = mix_color(in.circle_color, drawable.color_t);
     out.stroke_color = mix_color(in.circle_stroke_color, drawable.stroke_color_t);
@@ -426,7 +438,7 @@ fn vertex_main(in: In) -> Out {
 
     out.clip = place(
         vec3<f32>(position + extrude * (half + offset) * drawable.ratio, 0.0),
-        drawable.matrix
+        as_matrix(drawable.matrix)
     );
     out.normal = normal;
     out.width = half;

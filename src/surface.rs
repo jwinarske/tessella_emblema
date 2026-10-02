@@ -267,7 +267,7 @@ fn place(position: vec3<f32>, matrix: mat4x4<f32>) -> vec4<f32> {
     let lon = radians(longitude);
     let sphere = vec3<f32>(cos(lat) * sin(lon), -sin(lat), cos(lat) * cos(lon));
 
-    var clip = globe_camera_ubo[0].globe_matrix * vec4<f32>(sphere, 1.0);
+    var clip = as_matrix(globe_camera_ubo[0].globe_matrix) * vec4<f32>(sphere, 1.0);
     clip.z += merc.z;
     return clip;
 }

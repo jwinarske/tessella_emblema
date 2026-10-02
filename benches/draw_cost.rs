@@ -153,14 +153,19 @@ struct Gpu {
     held: [vk::Buffer; 4],
     memory: vk::DeviceMemory,
     fence: vk::Fence,
-    shader: vk::ShaderModule,
+    shader: [vk::ShaderModule; 2],
 }
 
 impl Gpu {
     #[allow(clippy::too_many_lines)]
     fn open() -> Result<Self, String> {
         let entry = unsafe { ash::Entry::load() }.map_err(|why| format!("no loader: {why}"))?;
-        let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 0, 0));
+        // Vulkan 1.1, not 1.0. naga emits `StorageBuffer` through
+        // `SPV_KHR_storage_buffer_storage_class`, which on a 1.0 device is an extension that has
+        // to be enabled and is core from 1.1. RADV and V3DV accept it either way; Adreno refuses
+        // the pipeline with `VK_ERROR_UNKNOWN` and prints no reason, which is a day to find and
+        // the reason this line carries a comment.
+        let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 1, 0));
         let instance = unsafe {
             entry.create_instance(
                 &vk::InstanceCreateInfo::default().application_info(&app),
@@ -318,11 +323,16 @@ impl Gpu {
             BACKGROUND_BODY,
         )
         .map_err(|why| format!("the family does not assemble: {why:?}"))?;
-        let words = compile(&source)?;
-        let shader = unsafe {
-            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
-        }
-        .map_err(|why| format!("no shader module: {why}"))?;
+        let make_module = |stage, entry| -> Result<vk::ShaderModule, String> {
+            let words = compile(&source, stage, entry)?;
+            unsafe {
+                device
+                    .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
+            }
+            .map_err(|why| format!("no {entry} module: {why}"))
+        };
+        let vertex = make_module(naga::ShaderStage::Vertex, "vertex_main")?;
+        let fragment = make_module(naga::ShaderStage::Fragment, "fragment_main")?;
 
         let stages = vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT;
         let bindings = [
@@ -414,7 +424,7 @@ impl Gpu {
             );
         }
 
-        let pipeline = graphics(&device, pass, layout, shader)?;
+        let pipeline = graphics(&device, pass, layout, vertex, fragment)?;
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
             .map_err(|why| format!("no fence: {why}"))?;
 
@@ -439,7 +449,7 @@ impl Gpu {
             held,
             memory,
             fence,
-            shader,
+            shader: [vertex, fragment],
         })
     }
 
@@ -589,7 +599,9 @@ impl Drop for Gpu {
             let _ = self.device.device_wait_idle();
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_pipeline(self.pipeline, None);
-            self.device.destroy_shader_module(self.shader, None);
+            for module in self.shader {
+                self.device.destroy_shader_module(module, None);
+            }
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
@@ -611,8 +623,13 @@ impl Drop for Gpu {
     }
 }
 
-/// Compiles the assembled module to SPIR-V words, as `tests/shaders.rs` does.
-fn compile(source: &str) -> Result<Vec<u32>, String> {
+/// Compiles one entry point of the assembled module to SPIR-V words.
+///
+/// One module an entry point, not one module with both. A single module carrying `vertex_main`
+/// and `fragment_main` is legal Vulkan and is what RADV and V3DV take; Adreno refuses the
+/// pipeline built from it with `VK_ERROR_UNKNOWN` and prints "Pipeline create failed" and no
+/// reason. Splitting them is what `naga`'s `PipelineOptions` is for.
+fn compile(source: &str, stage: naga::ShaderStage, entry: &str) -> Result<Vec<u32>, String> {
     let parsed = naga::front::wgsl::parse_str(source)
         .map_err(|why| format!("wgsl: {}", why.emit_to_string(source)))?;
     let info = naga::valid::Validator::new(
@@ -625,7 +642,11 @@ fn compile(source: &str) -> Result<Vec<u32>, String> {
         flags: naga::back::spv::WriterFlags::empty(),
         ..Default::default()
     };
-    naga::back::spv::write_vec(&parsed, &info, &options, None)
+    let pipeline = naga::back::spv::PipelineOptions {
+        shader_stage: stage,
+        entry_point: entry.to_string(),
+    };
+    naga::back::spv::write_vec(&parsed, &info, &options, Some(&pipeline))
         .map_err(|why| format!("spirv: {why:?}"))
 }
 
@@ -710,16 +731,17 @@ fn graphics(
     device: &ash::Device,
     pass: vk::RenderPass,
     layout: vk::PipelineLayout,
-    shader: vk::ShaderModule,
+    vertex: vk::ShaderModule,
+    fragment: vk::ShaderModule,
 ) -> Result<vk::Pipeline, String> {
     let stages = [
         vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::VERTEX)
-            .module(shader)
+            .module(vertex)
             .name(c"vertex_main"),
         vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(shader)
+            .module(fragment)
             .name(c"fragment_main"),
     ];
     let bindings = [vk::VertexInputBindingDescription {

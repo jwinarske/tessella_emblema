@@ -22,6 +22,7 @@ fn fill(surface: Surface) -> String {
         surface,
         &[&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
         &FILL_SHADER,
+        &[],
         FILL_BODY,
     )
     .expect("a fill assembles on every surface")

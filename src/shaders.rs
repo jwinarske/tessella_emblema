@@ -23,6 +23,7 @@ use std::fmt::Write as _;
 
 use tessella_capture_abi::generated::mbgl_enums::AttributeDataType;
 use tessella_capture_abi::generated::shader_attributes::ShaderAttribute;
+use tessella_capture_abi::generated::texture_slots::ShaderTexture;
 use tessella_capture_abi::generated::ubo_layouts::UboLayout;
 
 use crate::preamble::{Unrepresentable, declare, type_name};
@@ -92,6 +93,31 @@ const fn attribute_type(declared: AttributeDataType) -> Option<&'static str> {
     }
 }
 
+/// A WGSL name for a texture, from the id the header spells.
+///
+/// `idRasterImage0Texture` becomes `raster_image0`, and its sampler `raster_image0_sampler`. The
+/// `id` prefix and the `Texture` suffix say nothing a shader needs, as with an attribute's.
+#[must_use]
+pub fn texture_name(declared: &str) -> String {
+    let trimmed = declared
+        .strip_prefix("id")
+        .unwrap_or(declared)
+        .strip_suffix("Texture")
+        .unwrap_or(declared);
+    let mut out = String::with_capacity(trimmed.len() + 4);
+    for (at, ch) in trimmed.char_indices() {
+        if ch.is_ascii_uppercase() {
+            if at != 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// A WGSL field name for an attribute, from the id the header spells.
 ///
 /// `idBackgroundPosVertexAttribute` becomes `background_pos`: the `id` prefix and the
@@ -131,6 +157,7 @@ pub fn module(
     surface: Surface,
     blocks: &[&UboLayout],
     attributes: &[ShaderAttribute],
+    textures: &[ShaderTexture],
     body: &str,
 ) -> Result<String, Error> {
     let mut out = String::new();
@@ -159,10 +186,19 @@ pub fn module(
     // rather than in a group of their own: a family with no texture then has no gap in its set,
     // and the whole of a draw's state is one descriptor set either way.
     //
-    // Counted rather than computed from the index. One surface samples one image, so an index
-    // formula would be arithmetic no test could distinguish from a wrong one.
+    // Counted rather than computed from the index, because the count differs by family and by
+    // surface and an index formula would be arithmetic no test could distinguish from a wrong one.
+    //
+    // The family's own images first, in the order its table declares, then the surface's. A
+    // family's samplers are a property of the shader rather than of what it is drawn on -- a
+    // raster tile samples its own picture and its parent's whether it is flat or raised -- so they
+    // keep their place when the surface changes under them.
     let mut binding = all.len();
-    for texture in surface.textures() {
+    let named = textures
+        .iter()
+        .map(|texture| texture_name(texture.name))
+        .chain(surface.textures().iter().map(|name| (*name).to_string()));
+    for texture in named {
         let _ = writeln!(
             out,
             "@group(0) @binding({binding}) var {texture}: texture_2d<f32>;"
@@ -422,6 +458,80 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
         in.color * in.opacity,
         fill
     );
+}
+";
+
+/// The raster family's body.
+///
+/// Two pictures and a fade between them: a tile's own and its parent's, which is how a raster
+/// layer stays covered while a finer tile is still arriving. The texture coordinates arrive as
+/// `i16` over the same 8192 extent the positions use, not as normalized floats, which is what
+/// gives a tile enough precision to be sampled at a fraction of a texel.
+///
+/// The color adjustments are mbgl's, in its order -- spin, saturation, contrast, brightness --
+/// and the pair of pictures is un-premultiplied before the mix and premultiplied after, because
+/// they are blended against each other rather than composited.
+pub const RASTER_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec4<f32>,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let drawable = raster_drawable_ubo[ubo_index];
+    let props = raster_evaluated_props_ubo[0];
+    var out: Out;
+
+    let texel = vec2<f32>(in.raster_texture_pos);
+    let own = ((texel / 8192.0) - 0.5) / props.buffer_scale + 0.5;
+    let parent = own * props.scale_parent + props.tl_parent;
+    out.uv = vec4<f32>(own, parent);
+
+    out.clip = place(vec3<f32>(vec2<f32>(in.raster_pos), 0.0), drawable.matrix);
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    let props = raster_evaluated_props_ubo[0];
+
+    // Un-premultiplied before mixing: the two are blended against each other, not composited,
+    // so they have to be in the same space first.
+    var own = textureSample(raster_image0, raster_image0_sampler, in.uv.xy);
+    var parent = textureSample(raster_image1, raster_image1_sampler, in.uv.zw);
+    if own.a > 0.0 {
+        own = vec4<f32>(own.rgb / own.a, own.a);
+    }
+    if parent.a > 0.0 {
+        parent = vec4<f32>(parent.rgb / parent.a, parent.a);
+    }
+    let mixed = mix(own, parent, props.fade_t);
+    let alpha = mixed.a * props.opacity;
+
+    // Spin, as a rotation of the channels against each other.
+    var rgb = vec3<f32>(
+        dot(mixed.rgb, props.spin_weights.xyz),
+        dot(mixed.rgb, props.spin_weights.zxy),
+        dot(mixed.rgb, props.spin_weights.yzx)
+    );
+
+    // Saturation, toward or away from the pixel's own gray.
+    let average = (mixed.r + mixed.g + mixed.b) / 3.0;
+    rgb += (average - rgb) * props.saturation_factor;
+
+    // Contrast, about the middle.
+    rgb = (rgb - 0.5) * props.contrast_factor + 0.5;
+
+    // Brightness, as a mix between the two levels the style names. mbgl passes `low` into the
+    // vector it calls high and vice versa; that is transcribed rather than corrected, because the
+    // two are the ends of a mix and swapping them is what inverts the ramp.
+    let high = vec3<f32>(props.brightness_low);
+    let low = vec3<f32>(props.brightness_high);
+    let adjusted = mix(high, low, rgb);
+
+    return vec4<f32>(adjusted * alpha, alpha);
 }
 ";
 

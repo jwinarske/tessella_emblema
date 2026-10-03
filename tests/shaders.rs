@@ -9,15 +9,16 @@ use std::collections::BTreeSet;
 use tessella_capture_abi::generated::mbgl_enums::AttributeDataType;
 use tessella_capture_abi::generated::shader_attributes::{
     BACKGROUND_PATTERN_SHADER, BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER,
-    FILL_EXTRUSION_SHADER, FILL_OUTLINE_SHADER, FILL_PATTERN_SHADER, FILL_SHADER,
-    HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, LINE_PATTERN_SHADER, LINE_SHADER, RASTER_SHADER,
-    SYMBOL_ICON_SHADER, SYMBOL_SDFSHADER, SYMBOL_TEXT_AND_ICON_SHADER, ShaderAttribute,
+    FILL_EXTRUSION_SHADER, FILL_OUTLINE_SHADER, FILL_PATTERN_SHADER, FILL_SHADER, HEATMAP_SHADER,
+    HEATMAP_TEXTURE_SHADER, HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, LINE_PATTERN_SHADER,
+    LINE_SHADER, RASTER_SHADER, SYMBOL_ICON_SHADER, SYMBOL_SDFSHADER, SYMBOL_TEXT_AND_ICON_SHADER,
+    ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
     BACKGROUND_PATTERN_SHADER_TEXTURES, COLOR_RELIEF_SHADER_TEXTURES, FILL_PATTERN_SHADER_TEXTURES,
-    HILLSHADE_PREPARE_SHADER_TEXTURES, HILLSHADE_SHADER_TEXTURES, LINE_PATTERN_SHADER_TEXTURES,
-    RASTER_SHADER_TEXTURES, SYMBOL_ICON_SHADER_TEXTURES, SYMBOL_SDFSHADER_TEXTURES,
-    SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES, ShaderTexture,
+    HEATMAP_TEXTURE_SHADER_TEXTURES, HILLSHADE_PREPARE_SHADER_TEXTURES, HILLSHADE_SHADER_TEXTURES,
+    LINE_PATTERN_SHADER_TEXTURES, RASTER_SHADER_TEXTURES, SYMBOL_ICON_SHADER_TEXTURES,
+    SYMBOL_SDFSHADER_TEXTURES, SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES, ShaderTexture,
 };
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PATTERN_DRAWABLE_UBO, BACKGROUND_PATTERN_PROPS_UBO,
@@ -25,7 +26,8 @@ use tessella_capture_abi::generated::ubo_layouts::{
     COLOR_RELIEF_DRAWABLE_UBO, COLOR_RELIEF_EVALUATED_PROPS_UBO, COLOR_RELIEF_TILE_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
     FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, FILL_PATTERN_DRAWABLE_UBO,
-    FILL_PATTERN_TILE_PROPS_UBO, GLOBAL_PAINT_PARAMS_UBO, HILLSHADE_DRAWABLE_UBO,
+    FILL_PATTERN_TILE_PROPS_UBO, GLOBAL_PAINT_PARAMS_UBO, HEATMAP_DRAWABLE_UBO,
+    HEATMAP_EVALUATED_PROPS_UBO, HEATMAP_TEXTURE_PROPS_UBO, HILLSHADE_DRAWABLE_UBO,
     HILLSHADE_EVALUATED_PROPS_UBO, HILLSHADE_PREPARE_DRAWABLE_UBO,
     HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO, LINE_DRAWABLE_UBO,
     LINE_EVALUATED_PROPS_UBO, LINE_PATTERN_DRAWABLE_UBO, LINE_PATTERN_TILE_PROPS_UBO,
@@ -34,9 +36,9 @@ use tessella_capture_abi::generated::ubo_layouts::{
 };
 use tessella_emblema::shaders::{
     BACKGROUND_BODY, BACKGROUND_PATTERN_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY,
-    FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY, FILL_PATTERN_BODY, HILLSHADE_BODY,
-    HILLSHADE_PREPARE_BODY, LINE_BODY, LINE_PATTERN_BODY, RASTER_BODY, SYMBOL_ICON_BODY,
-    SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY, attribute_name, module,
+    FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY, FILL_PATTERN_BODY, HEATMAP_BODY, HEATMAP_TEXTURE_BODY,
+    HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_BODY, LINE_PATTERN_BODY, RASTER_BODY,
+    SYMBOL_ICON_BODY, SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY, attribute_name, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -261,6 +263,26 @@ fn families() -> Vec<Family> {
             textures: &LINE_PATTERN_SHADER_TEXTURES,
             body: LINE_PATTERN_BODY,
             surfaces: all,
+            height: false,
+        },
+        Family {
+            name: "heatmap",
+            blocks: vec![&HEATMAP_DRAWABLE_UBO, &HEATMAP_EVALUATED_PROPS_UBO],
+            attributes: &HEATMAP_SHADER,
+            textures: &[],
+            body: HEATMAP_BODY,
+            // Draws into a texture, like `hillshade_prepare`.
+            surfaces: &[Surface::Plane],
+            height: false,
+        },
+        Family {
+            name: "heatmap_texture",
+            blocks: vec![&HEATMAP_TEXTURE_PROPS_UBO, &GLOBAL_PAINT_PARAMS_UBO],
+            attributes: &HEATMAP_TEXTURE_SHADER,
+            textures: &HEATMAP_TEXTURE_SHADER_TEXTURES,
+            body: HEATMAP_TEXTURE_BODY,
+            // Covers the viewport rather than a tile, like the background.
+            surfaces: flat_or_bent,
             height: false,
         },
         Family {
@@ -696,6 +718,77 @@ fn the_line_pattern_keeps_its_sprite_decisions() {
     assert!(
         source.contains("let y_a = 0.5") && source.contains("let y_b = 0.5"),
         "the cross-line coordinate is not centered on the sprite"
+    );
+}
+
+/// The two heatmap passes keep the five decisions that draw a plausible wrong density.
+///
+/// * **The quad's reach and the kernel's width are the same `3.0`.** The vertex solves for where
+///   a Gaussian of three standard deviations falls under `ZERO` and divides by three; the fragment
+///   evaluates `-0.5 * 3 * 3 * dot(extrude, extrude)`. Change one and the kernel is either clipped
+///   at the quad's edge or fades out well inside it, both of which look like a radius setting.
+/// * **The center is the position halved**, the corner sign riding in the low bit as it does for
+///   the circle and the line.
+/// * **Weight and intensity are floored at `ZERO`, not guarded.** Either at zero sends the
+///   logarithm to infinity; the floor gives the smallest quad that still means something, which
+///   is where that limit goes.
+/// * **The density rides in red with ones beside it.** The target is blended additively, so a
+///   zero in the other channels would be summed rather than ignored.
+/// * **The ramp is sampled at its own row's center.** One row, so `0.5`; at `0.0` the lookup sits
+///   on the texel edge and a linear filter mixes it with the clamp.
+#[test]
+fn the_heatmap_keeps_its_kernel_decisions() {
+    let assembled = |name: &str| {
+        let found = families()
+            .into_iter()
+            .find(|family| family.name == name)
+            .unwrap_or_else(|| panic!("{name} is in the matrix"));
+        module(
+            Surface::Plane,
+            &found.blocks,
+            found.attributes,
+            found.textures,
+            found.body,
+        )
+        .expect("assembles")
+    };
+    let density = assembled("heatmap");
+    let colored = assembled("heatmap_texture");
+
+    assert!(
+        density.contains("const GAUSS_COEF: f32 = 0.3989422804014327;")
+            && density.contains("const ZERO: f32 = 1.0 / 255.0 / 16.0;"),
+        "a kernel constant moved:\n{density}"
+    );
+    assert!(
+        density.contains(
+            "-2.0 * log(ZERO / (max(weight, ZERO) * max(props.intensity, ZERO) * GAUSS_COEF))"
+        ) && density.contains(") / 3.0;")
+            && density.contains("let d = -0.5 * 3.0 * 3.0 * dot(in.extrude, in.extrude);"),
+        "the quad's reach and the kernel's width no longer agree"
+    );
+    assert!(
+        density.contains("let center = floor(position * 0.5);")
+            && density.contains("let corner = (position % vec2<f32>(2.0, 2.0)) * 2.0 - 1.0;"),
+        "the center is not the halved position"
+    );
+    assert!(
+        density.contains("let extrude = s * corner;")
+            && density.contains("center + extrude * radius * drawable.extrude_scale"),
+        "the fragment's kernel is not in the units the quad was sized in"
+    );
+    assert!(
+        density.contains("return vec4<f32>(density, 1.0, 1.0, 1.0);"),
+        "the density is not in red with ones beside it"
+    );
+    assert!(
+        colored.contains("heatmap_image_sampler, in.uv).r;")
+            && colored.contains("vec2<f32>(density, 0.5)"),
+        "the second pass reads the wrong channel, or misses the ramp's row center"
+    );
+    assert!(
+        colored.contains("place(vec3<f32>(position * global.world_size, 0.0), props.matrix)"),
+        "the colored quad is not the viewport in pixels"
     );
 }
 
@@ -1327,7 +1420,7 @@ fn every_family_on_every_surface_compiles() {
         }
     }
     assert_eq!(
-        pairs, 54,
+        pairs, 57,
         "the matrix grew or shrank; look at the new pairs"
     );
 }

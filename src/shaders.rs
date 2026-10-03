@@ -1828,6 +1828,128 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
 }
 ";
 
+/// The heatmap family's body: one Gaussian per point, summed into a texture.
+///
+/// The first pass of two. Each point feature draws a quad carrying a Gaussian kernel, the quads
+/// are blended additively into an offscreen texture, and [`HEATMAP_TEXTURE_BODY`] colors the sum
+/// through a ramp. The density has to be accumulated before it is colored -- two points' kernels
+/// add and the result is looked up once -- which is why this cannot be one pass.
+///
+/// # The quad is sized by where the kernel stops mattering
+///
+/// A Gaussian never reaches zero, so the quad is sized to where it falls below one sixteenth of a
+/// color step: below that the blend cannot represent it and the remaining tail is wasted
+/// rasterization. Solving `weight * intensity * GAUSS_COEF * exp(-0.5 * 3^2 * S^2) == ZERO` for
+/// `S` is where the vertex stage's logarithm comes from, and `extrude` is handed to the fragment
+/// in units of that radius so the kernel it evaluates is the one the quad was sized for.
+///
+/// # No surface
+///
+/// Like [`HILLSHADE_PREPARE_BODY`], this draws into a texture and flips `y` itself rather than
+/// calling mbgl's surface transform, so it has the plane alone.
+pub const HEATMAP_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) extrude: vec2<f32>,
+    @location(1) weight: f32,
+}
+
+// The height of a unit Gaussian at its peak, `1 / sqrt(2 * pi)`.
+const GAUSS_COEF: f32 = 0.3989422804014327;
+// A sixteenth of one step of an eight-bit channel: the point below which the accumulated density
+// cannot be told from nothing.
+const ZERO: f32 = 1.0 / 255.0 / 16.0;
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let drawable = heatmap_drawable_ubo[ubo_index];
+    let props = heatmap_evaluated_props_ubo[0];
+    var out: Out;
+
+    let weight = mix_value(in.heatmap_weight, drawable.weight_t);
+    let radius = mix_value(in.heatmap_radius, drawable.radius_t);
+
+    // The corner sign in the low bit of each coordinate, as the circle and the line pack it.
+    let position = vec2<f32>(in.heatmap_pos);
+    let corner = (position % vec2<f32>(2.0, 2.0)) * 2.0 - 1.0;
+    let center = floor(position * 0.5);
+
+    // How far out the kernel has to reach before it falls under `ZERO`. Both factors are floored
+    // at `ZERO` rather than guarded against zero: a weight or an intensity of nothing would send
+    // the logarithm to infinity, and a quad of the smallest size that still means something is
+    // the answer that limit approaches.
+    let s = sqrt(
+        -2.0 * log(ZERO / (max(weight, ZERO) * max(props.intensity, ZERO) * GAUSS_COEF))
+    ) / 3.0;
+
+    // In units of the radius, which is what the fragment stage evaluates the kernel in.
+    let extrude = s * corner;
+    out.extrude = extrude;
+    out.weight = weight;
+    out.clip = place(
+        vec3<f32>(center + extrude * radius * drawable.extrude_scale, 0.0),
+        drawable.matrix
+    );
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    let props = heatmap_evaluated_props_ubo[0];
+
+    // A Gaussian of three standard deviations across the quad.
+    let d = -0.5 * 3.0 * 3.0 * dot(in.extrude, in.extrude);
+    let density = in.weight * props.intensity * GAUSS_COEF * exp(d);
+
+    // Only red carries the density. The other channels are one because the target is blended
+    // additively and a zero there would still be summed.
+    return vec4<f32>(density, 1.0, 1.0, 1.0);
+}
+";
+
+/// The heatmap-texture family's body: the accumulated density, through a ramp.
+///
+/// The second pass. [`HEATMAP_BODY`] summed every point's kernel into a texture; this reads that
+/// sum and looks the color up, so the ramp is applied to the total rather than to each point.
+///
+/// The quad is the viewport in pixels -- `position` is a unit square scaled by the world size --
+/// which is why this family needs no tile geometry and reads the density by its own position.
+pub const HEATMAP_TEXTURE_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let props = heatmap_texture_props_ubo[ubo_index];
+    let global = global_paint_params_ubo[0];
+    var out: Out;
+
+    let position = vec2<f32>(in.heatmap_pos);
+    out.uv = position;
+    out.clip = place(vec3<f32>(position * global.world_size, 0.0), props.matrix);
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    let props = heatmap_texture_props_ubo[ubo_index];
+
+    // Red, which is the channel the first pass accumulated into.
+    let density = textureSample(heatmap_image, heatmap_image_sampler, in.uv).r;
+    // The ramp is one row, so the second coordinate is its own center.
+    let color = textureSample(
+        heatmap_color_ramp,
+        heatmap_color_ramp_sampler,
+        vec2<f32>(density, 0.5)
+    );
+    return color * props.opacity;
+}
+";
+
 /// The line family's body.
 ///
 /// The position attribute carries the point and its normal together, as mbgl packs it: the low bit

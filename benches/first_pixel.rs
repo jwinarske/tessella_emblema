@@ -421,7 +421,17 @@ fn run() -> Result<usize, String> {
         ));
     }
 
-    let cases = cases();
+    // `TSL_ONLY` runs one case by name, which is how a board that dies in its own shader
+    // compiler gets bisected: the probe prints a case's name only after it has drawn, so a
+    // crash says which case but not which part of it.
+    let only = std::env::var("TSL_ONLY").ok();
+    let cases: Vec<Case> = cases()
+        .into_iter()
+        .filter(|case| only.as_deref().is_none_or(|name| case.name == name))
+        .collect();
+    if cases.is_empty() {
+        return Err(format!("no case named {}", only.unwrap_or_default()));
+    }
     for case in &cases {
         let drawn = gpu.run(case)?;
         if drawn != case.expect {

@@ -27,8 +27,8 @@
 use ash::vk;
 use tessella_capture_abi::generated::shader_attributes::{
     BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER, FILL_EXTRUSION_SHADER,
-    FILL_OUTLINE_SHADER, FILL_SHADER, HEATMAP_TEXTURE_SHADER, HILLSHADE_PREPARE_SHADER,
-    HILLSHADE_SHADER, RASTER_SHADER, SYMBOL_SDFSHADER, ShaderAttribute,
+    FILL_OUTLINE_SHADER, FILL_SHADER, HEATMAP_SHADER, HEATMAP_TEXTURE_SHADER,
+    HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, RASTER_SHADER, SYMBOL_SDFSHADER, ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
     COLOR_RELIEF_SHADER_TEXTURES, HEATMAP_TEXTURE_SHADER_TEXTURES,
@@ -40,16 +40,17 @@ use tessella_capture_abi::generated::ubo_layouts::{
     COLOR_RELIEF_DRAWABLE_UBO, COLOR_RELIEF_EVALUATED_PROPS_UBO, COLOR_RELIEF_TILE_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
     FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, GLOBAL_PAINT_PARAMS_UBO,
-    HEATMAP_TEXTURE_PROPS_UBO, HILLSHADE_DRAWABLE_UBO, HILLSHADE_EVALUATED_PROPS_UBO,
-    HILLSHADE_PREPARE_DRAWABLE_UBO, HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO,
-    RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO,
-    SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
+    HEATMAP_DRAWABLE_UBO, HEATMAP_EVALUATED_PROPS_UBO, HEATMAP_TEXTURE_PROPS_UBO,
+    HILLSHADE_DRAWABLE_UBO, HILLSHADE_EVALUATED_PROPS_UBO, HILLSHADE_PREPARE_DRAWABLE_UBO,
+    HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO, RASTER_DRAWABLE_UBO,
+    RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO, SYMBOL_EVALUATED_PROPS_UBO,
+    SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
 use tessella_emblema::device::{preferred, vertex_format};
 use tessella_emblema::shaders::{
     BACKGROUND_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY, FILL_EXTRUSION_BODY,
-    FILL_OUTLINE_BODY, HEATMAP_TEXTURE_BODY, HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, RASTER_BODY,
-    SYMBOL_SDF_BODY, module,
+    FILL_OUTLINE_BODY, HEATMAP_BODY, HEATMAP_TEXTURE_BODY, HILLSHADE_BODY, HILLSHADE_PREPARE_BODY,
+    RASTER_BODY, SYMBOL_SDF_BODY, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -187,18 +188,22 @@ enum At<'a> {
 /// Every case uses it, which keeps each one's expected pixel independent of a projection the probe
 /// would otherwise also have to be right about.
 ///
-/// # The flip is not decoration
+/// # There are two flips, and they cancel
 ///
-/// Vulkan's clip space runs `y` down and so does the framebuffer, but mbgl's shaders end their
-/// vertex stage with `gl_Position.y *= -1.0` -- `applySurfaceTransform()` -- because the matrix
-/// they are handed was built for a `y`-up convention. emblema has no such step: the surface's
-/// `place` is the whole transform, so the flip has to be in the matrix the producer supplies.
+/// mbgl's shaders end their vertex stage with `gl_Position.y *= -1.0`, because the matrix they are
+/// handed was built for a `y`-up convention. emblema has no such step in its bodies -- but naga's
+/// SPIR-V backend emits one, under `WriterFlags::ADJUST_COORDINATE_SPACE`, after the body has run.
+/// See `tests/naga_overrides.rs`.
 ///
-/// Most families cannot tell. `fill_outline` can: its fragment stage compares the position its
-/// vertex stage computed against `FragCoord`, and with an unflipped matrix the two are mirrored
-/// about the target's middle. Read at the center that is a distance of one pixel, which is exactly
-/// the width the feather fades over -- so the pixel came out empty, and looked like a missing
-/// feather rather than a matrix this probe had built wrong.
+/// So this matrix's negation and naga's negation cancel: **the net mapping a case's geometry sees
+/// is `y`-up**, and a position of `+1` lands at the top of the target. Measured, not assumed --
+/// the `heatmap` case samples its kernel off-center and so can tell, and it read 80 where a
+/// `y`-down mapping would have given 75.
+///
+/// Every other case is symmetric in `y` and cannot tell, which is why this went unnoticed through
+/// nine of them. It is left as it is rather than simplified to the identity, because
+/// `fill_outline` reads its own position back and the three signs together are what make its
+/// feather land -- see `SYMBOL_SDF_BODY`'s sibling note in `FILL_OUTLINE_BODY`.
 const CLIP: [f32; 16] = [
     1.0, 0.0, 0.0, 0.0, //
     0.0, -1.0, 0.0, 0.0, //
@@ -294,6 +299,12 @@ fn symbol_streams(tex: u16) -> Vec<Vec<u8>> {
 /// `circle` and `heatmap` sneak the corner sign into the low bit of the position, so a quad's
 /// vertices are `2 * center + (corner + 1) / 2`. Centered at the origin, that is zeros and ones.
 const CORNERED_QUAD: [i16; 12] = [0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1];
+
+/// The same quad, centered at (1, 1) instead.
+///
+/// `2 * center + (corner + 1) / 2`, so a center of one is a two with the corner bit on top. The
+/// heatmap case needs its kernel sampled away from its own peak -- see that case for why.
+const CORNERED_QUAD_AT_ONE: [i16; 12] = [2, 2, 3, 2, 3, 3, 2, 2, 3, 3, 2, 3];
 
 fn main() {
     match run() {
@@ -1052,6 +1063,76 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             expect: [95, 47, 24, 118],
+        },
+        // The heatmap's first pass: one point feature's Gaussian, written into a texture.
+        //
+        // The quad is sized by where the kernel falls under a sixteenth of a color step, which is
+        // what the vertex stage's logarithm solves for:
+        //
+        //   S = sqrt(-2 * ln(ZERO / (2 * 1 * GAUSS_COEF))) / 3  = 1.34065
+        //   radius 20 times an extrude scale of 0.15 = 3, so the corners reach 4.02 in clip
+        //
+        // The quad is centered at (1, 1) and *not* at the origin, which is the whole point of
+        // this case. At the origin the center pixel sits on the kernel's peak, the extrusion
+        // interpolates to nearly nothing, and the `3.0` the vertex stage divides by is the same
+        // `3.0` the fragment squares -- so changing either reads 203 and the coupling is
+        // invisible. Offset, the pixel samples the kernel's flank:
+        //
+        //   extrude     = (-0.32292, -0.32292),  dot = 0.20855
+        //   density     = 2 * 1 * GAUSS_COEF * exp(-0.5 * 9 * 0.20855) = 0.31215  ->  80
+        //
+        // and a fragment that squared a two instead reads 134.
+        //
+        // Both components of the extrusion are equal, which is also this case's own finding: the
+        // first derivation here took `y` to be mirrored, predicted 75, and read 80. `CLIP`'s note
+        // says why -- the matrix negates `y` and naga negates it again.
+        //
+        // # What no covered pixel can see
+        //
+        // `S` itself, and so everything that goes into it: `ZERO`, the division by three, and the
+        // floors on the weight and the intensity. The reason is structural rather than a poor
+        // choice of inputs here. The vertex stage writes
+        //
+        //   clip = center + extrude * radius * extrude_scale
+        //
+        // so a fragment at a given clip position receives `extrude = (clip - center) / reach`,
+        // which has no `S` in it. `S` decides only how far the quad *reaches*; inside it, the
+        // kernel a pixel sees is fixed by where that pixel is. Halving the divisor, coarsening
+        // `ZERO`, or removing the floors all still read 80, and the body's own comment is where
+        // those live. (`GAUSS_COEF` is different -- it is in the fragment too, so it does show,
+        // though a mutation to 0.4 is within half a percent of it and does not; 0.2 reads 40.)
+        //
+        // Red carries the density and the other channels are one, because the target is blended
+        // additively and a zero there would still be summed.
+        Case {
+            name: "heatmap",
+            blocks: vec![&HEATMAP_DRAWABLE_UBO, &HEATMAP_EVALUATED_PROPS_UBO],
+            attributes: &HEATMAP_SHADER,
+            body: HEATMAP_BODY,
+            streams: vec![
+                shorts(&CORNERED_QUAD_AT_ONE),
+                per_vertex(&[2.0, 2.0], 6),
+                per_vertex(&[20.0, 20.0], 6),
+            ],
+            uniforms: vec![
+                block(
+                    &HEATMAP_DRAWABLE_UBO,
+                    &[
+                        ("matrix", At::F(&CLIP)),
+                        ("extrude_scale", At::F(&[0.15])),
+                        ("weight_t", At::F(&[0.0])),
+                        ("radius_t", At::F(&[0.0])),
+                    ],
+                ),
+                block(
+                    &HEATMAP_EVALUATED_PROPS_UBO,
+                    &[("intensity", At::F(&[1.0]))],
+                ),
+            ],
+            textures: &[],
+            images: Vec::new(),
+            vertices: 6,
+            expect: [80, 255, 255, 255],
         },
         // A circle, read at its own center: the extrusion interpolates to zero there, which is
         // inside the fill and nowhere near the stroke. With no stroke width the stroke's own

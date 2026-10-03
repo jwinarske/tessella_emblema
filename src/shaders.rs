@@ -769,6 +769,9 @@ fn vertex_main(in: In) -> Out {
     let tex = vec2<f32>(in.symbol_data.xy);
     let sized = vec2<f32>(in.symbol_data.zw);
     let pixel_offset = vec2<f32>(in.symbol_pixel_offset.xy);
+    // The minimum font scale rides in the spare half, over 256. An icon in a label does not shrink
+    // below it, which is what keeps a shield legible where the text beside it is small.
+    let min_font_scale = vec2<f32>(in.symbol_pixel_offset.zw) / 256.0;
 
     // The layout's own position, and the angle of the segment the label sits on.
     let placed = in.symbol_projected_pos;
@@ -818,7 +821,10 @@ fn vertex_main(in: In) -> Out {
 
     // The anchor in the label plane, with the corner added there rather than in tile units.
     let in_plane = transform(drawable.label_plane_matrix, vec3<f32>(placed.xy, 0.0));
-    let offset = corner / 32.0 * font_scale + pixel_offset;
+    // Sixteenths of a pixel, where the SDF family's same attribute is whole pixels. mbgl's two
+    // shaders differ here; `symbol_icon.vertex.glsl` is what this one follows.
+    let offset = corner / 32.0 * max(min_font_scale, vec2<f32>(font_scale, font_scale))
+        + pixel_offset / 16.0;
     let on_plane = in_plane.xy / in_plane.w + spun * offset;
     out.clip = place(vec3<f32>(on_plane, 0.0), drawable.coord_matrix);
 
@@ -1003,35 +1009,81 @@ struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) normal: vec2<f32>,
-    @location(2) width: f32,
-    @location(3) blur: f32,
-    @location(4) opacity: f32,
+    @location(2) outset: f32,
+    @location(3) inset: f32,
+    @location(4) gamma_scale: f32,
+    @location(5) blur: f32,
+    @location(6) opacity: f32,
 }
 
 @vertex
 fn vertex_main(in: In) -> Out {
     ubo_index = in.instance_index;
     let drawable = line_drawable_ubo[ubo_index];
+    let global = global_paint_params_ubo[0];
     var out: Out;
 
-    // The normal is the low bit of each component; the position is what is left.
-    let packed = vec2<i32>(in.line_pos_normal);
-    let normal = vec2<f32>(packed % 2) * 2.0 - 1.0;
-    let position = vec2<f32>(packed / 2);
+    // The byte pair encodes a unit vector over 63, biased by 128.
+    let extrude_scale = 63.0;
+    // The distance the edge fades out over: half a device pixel each side.
+    let antialiasing = 1.0 / max(global.pixel_ratio, 1e-6) / 2.0;
 
-    let width = mix_value(in.line_width, drawable.width_t);
-    let gapwidth = mix_value(in.line_gap_width, drawable.gapwidth_t);
-    let offset = mix_value(in.line_offset, drawable.offset_t);
-    // A gap splits the line in two, each half the remaining width.
-    let half = select(width * 0.5, gapwidth * 0.5 + width, gapwidth > 0.0);
-    let extrude = vec2<f32>(in.line_data.xy) / 128.0 - 1.0;
+    // The normal is the low bit of each component; the center is what is left.
+    let packed = vec2<f32>(in.line_pos_normal);
+    let center = floor(packed * 0.5);
+    var normal = packed - 2.0 * center;
+    normal.y = normal.y * 2.0 - 1.0;
 
-    out.clip = place(
-        vec3<f32>(position + extrude * (half + offset) * drawable.ratio, 0.0),
-        drawable.matrix
-    );
+    // Four unnormalized bytes. The first two are the extrusion; the low two bits of the third say
+    // which way a round end point's extrude points, and the rest of the third with the fourth is
+    // the distance along the line, which the plain family has no use for.
+    let data = vec4<f32>(in.line_data);
+    let extrude = data.xy - 128.0;
+    let direction = (data.z % 4.0) - 1.0;
+    let along = (floor(data.z / 4.0) + data.w * 64.0) * 2.0;
+
+    let gapwidth = mix_value(in.line_gap_width, drawable.gapwidth_t) * 0.5;
+    let halfwidth = mix_value(in.line_width, drawable.width_t) * 0.5;
+    let line_offset = -1.0 * mix_value(in.line_offset, drawable.offset_t);
+
+    // The quad reaches `outset` from the center and the fill starts at `inset`. With no gap the
+    // inset is zero and the line is solid; with one, both edges are drawn and the middle left
+    // open, which is how a road casing is a casing rather than a slab.
+    let inset = gapwidth + select(0.0, antialiasing, gapwidth > 0.0);
+    let outset = gapwidth
+        + halfwidth * select(1.0, 2.0, gapwidth > 0.0)
+        + select(antialiasing, 0.0, halfwidth == 0.0);
+
+    // The extrusion down to a normal and back up by this vertex's line width.
+    let dist = outset * extrude / extrude_scale;
+
+    // A line drawn to the side of the real one. The vector points along the extrude, rotated
+    // where a round end point's extrude points somewhere else.
+    let u = 0.5 * direction;
+    let t = 1.0 - abs(u);
+    let turn = mat2x2<f32>(t, -u, u, t);
+    let offset2 = line_offset * extrude / extrude_scale * normal.y * turn;
+
+    let ratio = max(drawable.ratio, 1e-6);
+
+    // Placed and extruded separately, because the projected extrusion is what says how much
+    // perspective squashed this edge -- and that length is wanted on its own below. `displace` is
+    // the surface's, since the extrusion is linear on a plane and is not on a sphere.
+    let at = center + offset2 / ratio;
+    let projected_extrude = displace(at, dist / ratio, drawable.matrix);
+    let clip = place(vec3<f32>(at, 0.0), drawable.matrix) + projected_extrude;
+    out.clip = clip;
+
+    // How much the perspective view squashed or stretched the extrusion, which is what keeps the
+    // fade a constant width in pixels. Guarded: a zero-length extrusion would be 0/0 and NaN a
+    // whole line away.
+    let unprojected = length(dist);
+    let projected = length(projected_extrude.xy / clip.w * global.units_to_pixels);
+    out.gamma_scale = unprojected / max(projected, 1e-6);
+
     out.normal = normal;
-    out.width = half;
+    out.outset = outset;
+    out.inset = inset;
     out.color = mix_color(in.line_color, drawable.color_t);
     out.blur = mix_value(in.line_blur, drawable.blur_t);
     out.opacity = mix_value(in.line_opacity, drawable.opacity_t);
@@ -1040,9 +1092,18 @@ fn vertex_main(in: In) -> Out {
 
 @fragment
 fn fragment_main(in: Out) -> @location(0) vec4<f32> {
-    let distance = length(in.normal) * in.width;
-    let antialias = in.blur + 1.0;
-    let coverage = 1.0 - smoothstep(in.width - antialias, in.width + antialias, distance);
-    return in.color * in.opacity * coverage;
+    // How far this pixel is from the center of the line, in pixels.
+    let distance = length(in.normal) * in.outset;
+
+    // The fade: in across the inner edge for a line with a gap, out across the outer one.
+    let blur2 = (in.blur + 1.0 / max(global_paint_params_ubo[0].pixel_ratio, 1e-6))
+        * in.gamma_scale;
+    let alpha = clamp(
+        min(distance - (in.inset - blur2), in.outset - distance) / blur2,
+        0.0,
+        1.0
+    );
+
+    return in.color * (alpha * in.opacity);
 }
 ";

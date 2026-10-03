@@ -4,6 +4,9 @@
 //! being checked is that the two fit: a body naming a field the tables do not declare, or reading
 //! one at the wrong type, fails here rather than at pipeline creation on a board.
 
+use std::collections::BTreeSet;
+
+use tessella_capture_abi::generated::mbgl_enums::AttributeDataType;
 use tessella_capture_abi::generated::shader_attributes::{
     BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER, FILL_EXTRUSION_SHADER,
     FILL_OUTLINE_SHADER, FILL_SHADER, LINE_SHADER, RASTER_SHADER, SYMBOL_ICON_SHADER,
@@ -92,7 +95,11 @@ fn families() -> Vec<Family> {
         },
         Family {
             name: "line",
-            blocks: vec![&LINE_DRAWABLE_UBO, &LINE_EVALUATED_PROPS_UBO],
+            blocks: vec![
+                &LINE_DRAWABLE_UBO,
+                &LINE_EVALUATED_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
             attributes: &LINE_SHADER,
             textures: &[],
             body: LINE_BODY,
@@ -321,6 +328,75 @@ fn the_symbol_icon_keeps_its_placement_decisions() {
         source.contains("var change = -global.symbol_fade_change;")
             && source.contains("change = global.symbol_fade_change;"),
         "the fade's direction is not taken from its low bit"
+    );
+    assert!(
+        source.contains("max(min_font_scale, vec2<f32>(font_scale, font_scale))"),
+        "the icon can shrink below its minimum font scale"
+    );
+    assert!(
+        source.contains("+ pixel_offset / 16.0;"),
+        "the icon's pixel offset is not in sixteenths"
+    );
+}
+
+/// The line keeps the five decisions that draw a line of the wrong size or shape.
+///
+/// Ported from `line.vertex.glsl` and `line.fragment.glsl`, with fluorite's `line.mat` as the
+/// working reference. Each of these draws a line, which is why none of them is caught by the
+/// compile, and four of the five were wrong before this test existed.
+///
+/// * **The extrusion is over 63, not 128.** mbgl's `scale` is `0.015873016`; the byte pair is a
+///   unit vector at length 63. Over 128 a road is half the width the style asked for.
+/// * **The width ratio divides.** `dist / u_ratio`, not times: the drawable's ratio is tile units
+///   per pixel, so multiplying scales the wrong way with zoom.
+/// * **The offset is negated**, which is what puts a side line on the side the style named.
+/// * **`inset` and `outset` are separate.** One number cannot draw a casing: with a gap the
+///   fragment fades in across the inner edge and out across the outer one, and collapsing them
+///   fills the middle a gap exists to leave open.
+/// * **The gamma scale is the ratio of the unprojected extrusion to the projected one**, which is
+///   what holds the edge feather at a constant pixel width under pitch.
+#[test]
+fn the_line_keeps_its_extrusion_decisions() {
+    let line = families()
+        .into_iter()
+        .find(|family| family.name == "line")
+        .expect("line is in the matrix");
+    let source = module(
+        Surface::Plane,
+        &line.blocks,
+        line.attributes,
+        line.textures,
+        line.body,
+    )
+    .expect("assembles");
+
+    assert!(
+        source.contains("let extrude_scale = 63.0;")
+            && source.contains("let extrude = data.xy - 128.0;"),
+        "the extrusion's scale or its bias moved:\n{source}"
+    );
+    assert!(
+        source.contains("let dist = outset * extrude / extrude_scale;")
+            && source.contains("displace(at, dist / ratio, drawable.matrix)"),
+        "the extrusion does not divide by the width ratio"
+    );
+    assert!(
+        source.contains("let line_offset = -1.0 * mix_value(in.line_offset, drawable.offset_t);"),
+        "the side offset is not negated"
+    );
+    assert!(
+        source.contains("let inset = gapwidth + select(0.0, antialiasing, gapwidth > 0.0);")
+            && source.contains("min(distance - (in.inset - blur2), in.outset - distance)"),
+        "the inner and outer edges are not both faded"
+    );
+    assert!(
+        source.contains("out.gamma_scale = unprojected / max(projected, 1e-6);"),
+        "the feather is not corrected for perspective"
+    );
+    assert!(
+        source.contains("let direction = (data.z % 4.0) - 1.0;")
+            && source.contains("let turn = mat2x2<f32>(t, -u, u, t);"),
+        "a round end point's extrude is not rotated"
     );
 }
 
@@ -800,6 +876,157 @@ fn every_attribute_is_read() {
             }
         }
     }
+}
+
+/// Each surface displaces a vertex its own way, because three of the four are not linear maps.
+///
+/// A line is a strip of quads that carries its own sideways extrusion, and the extrusion has to be
+/// applied where the surface is, not where the tile is. The plane and the raise are linear, so the
+/// matrix's first two columns are the whole answer. The direct bend is trig and has no linear part
+/// at all, so it is evaluated twice and differenced. The anchored bend is a quadratic, so its
+/// Jacobian at the vertex is exact -- and taken *at the vertex*, not at the anchor, because at low
+/// zoom a tile is wide enough that the bend turns across it.
+///
+/// Giving any of them the plane's displacement compiles and draws lines with a believable width in
+/// the wrong direction, which is why this is pinned rather than left to review.
+#[test]
+fn each_surface_displaces_its_own_way() {
+    let linear = "return columns[0] * delta.x + columns[1] * delta.y;";
+    for surface in Surface::ALL {
+        let placement = surface.placement();
+        assert!(
+            placement.contains("fn displace("),
+            "{} has no displacement",
+            surface.suffix()
+        );
+        match surface {
+            Surface::Plane | Surface::Terrain => assert!(
+                placement.contains(linear),
+                "{} does not extrude along the matrix's columns",
+                surface.suffix()
+            ),
+            Surface::Globe => assert!(
+                placement.contains(
+                    "return place(vec3<f32>(at + delta, 0.0), columns) \
+                     - place(vec3<f32>(at, 0.0), columns);"
+                ) && !placement.contains(linear),
+                "the direct bend is not evaluated twice and differenced"
+            ),
+            Surface::GlobeAnchored => assert!(
+                placement.contains("let j_u = bend.d_u + bend.d_uu * d.x + bend.d_uv * d.y;")
+                    && placement
+                        .contains("let j_v = bend.d_v + bend.d_vv * d.y + bend.d_uv * d.x;")
+                    && !placement.contains(linear),
+                "the anchored bend does not extrude along its Jacobian at the vertex"
+            ),
+        }
+    }
+}
+
+/// Components a family declares and correctly does not read, as `(family, attribute, components)`.
+///
+/// Each one is checked against the shader mbgl generates for that family, not reasoned about: an
+/// attribute is shared between a family and its variants, and a component only one variant needs
+/// arrives for both.
+const UNREAD_COMPONENTS: &[(&str, &str, &str)] = &[
+    // `a_decimals_ed.y` is the edge distance, which only `fill_extrusion_pattern.vertex.glsl`
+    // reads. The plain family declares the pair and uses the first of it.
+    ("fill_extrusion", "fill_extrusion_decimals_ed", "y"),
+    // `a_pixeloffset.zw` is the minimum font scale, which `symbol_icon.vertex.glsl` reads and
+    // `symbol_sdf.vertex.glsl` does not -- the SDF family takes `a_pxoffset` from `xy` and stops.
+    ("symbol_sdf", "symbol_pixel_offset", "zw"),
+];
+
+/// Every component of every attribute is read, not just the identifier.
+///
+/// [`every_attribute_is_read`] asks whether the name appears, which a body reading half a packed
+/// `vec4` satisfies. Two things ride in the spare half of a symbol's pixel offset -- the offset in
+/// `xy` and the minimum font scale in `zw` -- and a body that reads `xy` and stops passes that
+/// test, compiles, validates and draws type at the wrong size. This asks per component.
+///
+/// A use with no swizzle counts as the whole thing, which is how a `vec4` handed to `unpack_color`
+/// or a `vec3` handed to `place` is covered.
+#[test]
+fn every_component_of_an_attribute_is_read() {
+    let mut short = Vec::new();
+    for family in families() {
+        let source = module(
+            Surface::Plane,
+            &family.blocks,
+            family.attributes,
+            family.textures,
+            family.body,
+        )
+        .expect("assembles");
+        for attribute in family.attributes {
+            let field = attribute_name(attribute.name);
+            let width = components(attribute.declared);
+            if width < 2 {
+                continue;
+            }
+            let mut read = components_read(&source, &field);
+            for (family_name, attribute_field, sanctioned) in UNREAD_COMPONENTS {
+                if *family_name == family.name && *attribute_field == field {
+                    read.extend(sanctioned.chars());
+                }
+            }
+            if read.len() < width {
+                short.push(format!(
+                    "{} reads {}/{width} of {field}: {read:?}",
+                    family.name,
+                    read.len()
+                ));
+            }
+        }
+    }
+    assert!(short.is_empty(), "components left unread: {short:#?}");
+}
+
+/// How many components an attribute's declared type has.
+fn components(declared: AttributeDataType) -> usize {
+    let name = format!("{declared:?}");
+    match name.chars().last() {
+        Some(digit @ '2'..='9') => digit.to_digit(10).expect("a digit") as usize,
+        _ => 1,
+    }
+}
+
+/// Which of `xyzw` the body takes from `in.<field>`, as the characters it names.
+///
+/// A bare use -- `in.field` with no `.` after it -- is the whole thing, so it answers `xyzw`.
+fn components_read(source: &str, field: &str) -> BTreeSet<char> {
+    let mut read = BTreeSet::new();
+    let needle = format!("in.{field}");
+    for (at, _) in source.match_indices(&needle) {
+        let after = &source[at + needle.len()..];
+        // `in.symbol_data` is a prefix of nothing else today, but a longer field with the same
+        // start would be counted here if one ever arrives.
+        if after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        let Some(swizzle) = after.strip_prefix('.') else {
+            read.extend(['x', 'y', 'z', 'w']);
+            continue;
+        };
+        let named: Vec<char> = swizzle
+            .chars()
+            .take_while(|c| matches!(c, 'x' | 'y' | 'z' | 'w' | 'r' | 'g' | 'b' | 'a'))
+            .collect();
+        if named.is_empty() {
+            read.extend(['x', 'y', 'z', 'w']);
+            continue;
+        }
+        for c in named {
+            read.insert(match c {
+                'r' => 'x',
+                'g' => 'y',
+                'b' => 'z',
+                'a' => 'w',
+                other => other,
+            });
+        }
+    }
+    read
 }
 
 /// Attribute and factor pairs whose names do not match, as `(attribute field, factor)`.

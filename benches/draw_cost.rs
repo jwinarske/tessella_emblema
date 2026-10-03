@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 use ash::vk;
 use tessella_capture_abi::generated::shader_attributes::BACKGROUND_SHADER;
 use tessella_capture_abi::generated::ubo_layouts::{BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO};
+use tessella_emblema::device::preferred;
 use tessella_emblema::shaders::{BACKGROUND_BODY, module};
 use tessella_emblema::surface::Surface;
 
@@ -333,9 +334,17 @@ impl Gpu {
         }
         .map_err(|why| format!("no instance: {why}"))?;
 
-        let physical = *unsafe { instance.enumerate_physical_devices() }
-            .map_err(|why| format!("no devices: {why}"))?
-            .first()
+        // External, then internal, then software. A software implementation draws the map
+        // correctly and far too slowly to measure anything on, and it is also what a
+        // misconfigured system falls back to without saying so.
+        let devices = unsafe { instance.enumerate_physical_devices() }
+            .map_err(|why| format!("no devices: {why}"))?;
+        let classes: Vec<vk::PhysicalDeviceType> = devices
+            .iter()
+            .map(|device| unsafe { instance.get_physical_device_properties(*device) }.device_type)
+            .collect();
+        let physical = preferred(&classes)
+            .map(|index| devices[index])
             .ok_or_else(|| "no physical device".to_string())?;
         let properties = unsafe { instance.get_physical_device_properties(physical) };
         let name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }

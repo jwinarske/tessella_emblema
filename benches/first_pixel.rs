@@ -27,16 +27,19 @@
 use ash::vk;
 use tessella_capture_abi::generated::shader_attributes::{
     BACKGROUND_SHADER, CIRCLE_SHADER, FILL_EXTRUSION_SHADER, FILL_OUTLINE_SHADER, FILL_SHADER,
-    ShaderAttribute,
+    RASTER_SHADER, ShaderAttribute,
 };
+use tessella_capture_abi::generated::texture_slots::{RASTER_SHADER_TEXTURES, ShaderTexture};
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
-    FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, GLOBAL_PAINT_PARAMS_UBO, UboLayout,
+    FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, GLOBAL_PAINT_PARAMS_UBO,
+    RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, UboLayout,
 };
 use tessella_emblema::device::{preferred, vertex_format};
 use tessella_emblema::shaders::{
-    BACKGROUND_BODY, CIRCLE_BODY, FILL_BODY, FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY, module,
+    BACKGROUND_BODY, CIRCLE_BODY, FILL_BODY, FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY, RASTER_BODY,
+    module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -53,8 +56,34 @@ struct Case {
     streams: Vec<Vec<u8>>,
     /// One block per entry in `blocks`, in the same order.
     uniforms: Vec<Vec<u8>>,
+    /// The family's texture table, which is what names the bindings in the module.
+    textures: &'static [ShaderTexture],
+    /// One image per entry in `textures`, in the same order.
+    images: Vec<Image>,
     vertices: u32,
     expect: [u8; 4],
+}
+
+/// A square RGBA image the probe samples.
+///
+/// Square and small, with every texel distinct where a case needs to tell which one was read.
+struct Image {
+    side: u32,
+    /// `side * side` texels, four bytes each.
+    texels: Vec<u8>,
+}
+
+impl Image {
+    /// An image whose texel `(x, y)` is `paint(x, y)`.
+    fn new(side: u32, paint: impl Fn(u32, u32) -> [u8; 4]) -> Self {
+        let mut texels = Vec::with_capacity((side * side * 4) as usize);
+        for y in 0..side {
+            for x in 0..side {
+                texels.extend_from_slice(&paint(x, y));
+            }
+        }
+        Self { side, texels }
+    }
 }
 
 /// A value written into a block at a named field.
@@ -167,6 +196,8 @@ fn cases() -> Vec<Case> {
                 ),
                 block(&FILL_EVALUATED_PROPS_UBO, &[]),
             ],
+            textures: &[],
+            images: Vec::new(),
             vertices: 3,
             expect: [0, 0, 255, 255],
         },
@@ -189,6 +220,8 @@ fn cases() -> Vec<Case> {
                     ],
                 ),
             ],
+            textures: &[],
+            images: Vec::new(),
             vertices: 3,
             expect: [0, 0, 255, 255],
         },
@@ -237,6 +270,8 @@ fn cases() -> Vec<Case> {
                     )],
                 ),
             ],
+            textures: &[],
+            images: Vec::new(),
             vertices: 3,
             expect: [255, 255, 255, 255],
         },
@@ -293,6 +328,8 @@ fn cases() -> Vec<Case> {
                     ],
                 ),
             ],
+            textures: &[],
+            images: Vec::new(),
             vertices: 3,
             expect: [255, 115, 12, 255],
         },
@@ -341,8 +378,140 @@ fn cases() -> Vec<Case> {
                     ],
                 ),
             ],
+            textures: &[],
+            images: Vec::new(),
             vertices: 3,
             expect: [125, 125, 125, 255],
+        },
+        // A raster tile, which is the first case to sample anything.
+        //
+        // The texture is four texels square and every one is distinct, so the pixel says which
+        // was read rather than only that something was. The coordinate is a position of 819 under
+        // a buffer scale of two:
+        //
+        //   uv = ((819 / 8192) - 0.5) / 2 + 0.5 = 0.29999  ->  texel 1 of 4, which is
+        //                                                       (64, 32, 128, 128)
+        //
+        // A buffer scale of two is what puts that formula under test. At one the recentering
+        // cancels and `((t / 8192) - 0.5) / 1 + 0.5` is just `t / 8192`, so a body that dropped
+        // it would read the same texel; at two, dropping it gives 0.04999 and texel 0.
+        //
+        // Every color adjustment is set to its identity -- the spin a permutation that is no
+        // permutation, no saturation shift, unit contrast, brightness from nothing to one -- and
+        // `fade_t` of zero takes the near tile alone. So what this case checks is the sampling
+        // and the chain's neutrality rather than its arithmetic.
+        //
+        // The texel is half transparent and the opacity is a half, which is what puts the
+        // un-premultiply under test. An opaque texel hides it: dividing the color by its alpha
+        // and multiplying it back by the same alpha is the identity, and the case reads the texel
+        // either way. With the two alphas different the division shows --
+        //
+        //   unpremultiplied = (0.5, 0.25, 1.0),  alpha = 0.50196 * 0.5 = 0.25098
+        //   out             = (0.12549, 0.06275, 0.25098, 0.25098)  ->  32, 16, 64, 64
+        //
+        // -- and a body that skipped it reads (16, 8, 32, 64).
+        Case {
+            name: "raster",
+            blocks: vec![&RASTER_DRAWABLE_UBO, &RASTER_EVALUATED_PROPS_UBO],
+            attributes: &RASTER_SHADER,
+            body: RASTER_BODY,
+            streams: vec![shorts(&COVERING), shorts(&[819, 819, 819, 819, 819, 819])],
+            uniforms: vec![
+                block(&RASTER_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
+                block(
+                    &RASTER_EVALUATED_PROPS_UBO,
+                    &[
+                        // `dot(rgb, spin.xyz)`, `dot(rgb, spin.zxy)`, `dot(rgb, spin.yzx)`, which
+                        // leaves every channel alone exactly when the weights are (1, 0, 0).
+                        ("spin_weights", At::F(&[1.0, 0.0, 0.0, 0.0])),
+                        ("buffer_scale", At::F(&[2.0])),
+                        ("scale_parent", At::F(&[1.0])),
+                        ("tl_parent", At::F(&[0.0, 0.0])),
+                        ("fade_t", At::F(&[0.0])),
+                        ("opacity", At::F(&[0.5])),
+                        ("brightness_low", At::F(&[0.0])),
+                        ("brightness_high", At::F(&[1.0])),
+                        ("saturation_factor", At::F(&[0.0])),
+                        ("contrast_factor", At::F(&[1.0])),
+                    ],
+                ),
+            ],
+            textures: &RASTER_SHADER_TEXTURES,
+            images: vec![
+                // Every channel a different function of the texel, so no two are equal: with
+                // `r` and `g` alike, rotating one of the spin's three rows draws the same pixel
+                // and that mutation survives.
+                Image::new(4, |x, y| {
+                    [
+                        u8::try_from(x * 64).unwrap_or(255),
+                        u8::try_from(y * 32).unwrap_or(255),
+                        128,
+                        128,
+                    ]
+                }),
+                // The parent tile, which `fade_t` of zero mixes none of. Bound because the shader
+                // declares it and a pipeline with an unbound sampler is undefined, not because
+                // anything reads it -- so it is painted differently, and a case that mixed the
+                // two would say so.
+                Image::new(4, |_, _| [255, 0, 255, 255]),
+            ],
+            vertices: 3,
+            expect: [32, 16, 64, 64],
+        },
+        // The same texel through adjustments that are not identities, which is where the chain's
+        // arithmetic shows rather than only its neutrality. Derived from `raster.hpp` by hand:
+        //
+        //   texel      = (0.25098, 0.12549, 0.50196),  average = 0.29281
+        //   saturation = rgb + (average - rgb) * 0.5  = (0.27190, 0.20915, 0.39739)
+        //   contrast   = (rgb - 0.5) * 1.5 + 0.5      = (0.15784, 0.06373, 0.34608)
+        //   brightness = mix(0.1, 0.8, rgb)           = (0.21049, 0.14461, 0.34225)  ->  54, 37, 87
+        //
+        // The brightness ends are deliberately the wrong way round, and that is mbgl's: it names
+        // its vectors `u_high_vec` from `brightness_low` and `u_low_vec` from `brightness_high`.
+        // `RASTER_BODY` transcribes the swap rather than correcting it, because the two are the
+        // ends of a `mix` and exchanging them is what inverts the ramp -- so this expectation is
+        // computed with the swap in place, and a body that "fixed" it would read (34, 27, 68).
+        //
+        // Dropping the saturation reads (48, 14, 115) and dropping the contrast (74, 63, 96), so
+        // the two cannot be confused with each other or with the neutral case above.
+        Case {
+            name: "raster_adjusted",
+            blocks: vec![&RASTER_DRAWABLE_UBO, &RASTER_EVALUATED_PROPS_UBO],
+            attributes: &RASTER_SHADER,
+            body: RASTER_BODY,
+            streams: vec![shorts(&COVERING), shorts(&[819, 819, 819, 819, 819, 819])],
+            uniforms: vec![
+                block(&RASTER_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
+                block(
+                    &RASTER_EVALUATED_PROPS_UBO,
+                    &[
+                        ("spin_weights", At::F(&[1.0, 0.0, 0.0, 0.0])),
+                        ("buffer_scale", At::F(&[2.0])),
+                        ("scale_parent", At::F(&[1.0])),
+                        ("tl_parent", At::F(&[0.0, 0.0])),
+                        ("fade_t", At::F(&[0.0])),
+                        ("opacity", At::F(&[1.0])),
+                        ("brightness_low", At::F(&[0.1])),
+                        ("brightness_high", At::F(&[0.8])),
+                        ("saturation_factor", At::F(&[0.5])),
+                        ("contrast_factor", At::F(&[1.5])),
+                    ],
+                ),
+            ],
+            textures: &RASTER_SHADER_TEXTURES,
+            images: vec![
+                Image::new(4, |x, y| {
+                    [
+                        u8::try_from(x * 64).unwrap_or(255),
+                        u8::try_from(y * 32).unwrap_or(255),
+                        128,
+                        255,
+                    ]
+                }),
+                Image::new(4, |_, _| [255, 0, 255, 255]),
+            ],
+            vertices: 3,
+            expect: [54, 37, 87, 255],
         },
         // A circle, read at its own center: the extrusion interpolates to zero there, which is
         // inside the fill and nowhere near the stroke. With no stroke width the stroke's own
@@ -392,6 +561,8 @@ fn cases() -> Vec<Case> {
                     ],
                 ),
             ],
+            textures: &[],
+            images: Vec::new(),
             vertices: 6,
             expect: [0, 255, 0, 255],
         },
@@ -741,7 +912,7 @@ impl Gpu {
             Surface::Plane,
             &case.blocks,
             case.attributes,
-            &[],
+            case.textures,
             case.body,
         )
         .map_err(|why| format!("{} does not assemble: {why:?}", case.name))?;
@@ -766,6 +937,43 @@ impl Gpu {
                 .begin_command_buffer(self.command, &vk::CommandBufferBeginInfo::default())
         }
         .map_err(|why| format!("not recording: {why}"))?;
+
+        // The sampled images go from `UNDEFINED` to `GENERAL` before the pass reads them. Written
+        // through a map, so there is nothing to wait on but the host write itself.
+        if let Some((_, _, held)) = draw {
+            let barriers: Vec<vk::ImageMemoryBarrier<'_>> = held
+                .images
+                .iter()
+                .map(|image| {
+                    vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .image(*image)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .level_count(1)
+                                .layer_count(1),
+                        )
+                })
+                .collect();
+            if !barriers.is_empty() {
+                unsafe {
+                    self.device.cmd_pipeline_barrier(
+                        self.command,
+                        vk::PipelineStageFlags::HOST,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER
+                            | vk::PipelineStageFlags::VERTEX_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &barriers,
+                    );
+                }
+            }
+        }
 
         let clears = [vk::ClearValue {
             color: vk::ClearColorValue {
@@ -988,6 +1196,10 @@ struct Held<'a> {
     descriptor_pool: vk::DescriptorPool,
     descriptors: vk::DescriptorSet,
     pipeline_layout: vk::PipelineLayout,
+    images: Vec<vk::Image>,
+    image_memory: Vec<vk::DeviceMemory>,
+    views: Vec<vk::ImageView>,
+    samplers: Vec<vk::Sampler>,
 }
 
 impl<'a> Held<'a> {
@@ -1070,9 +1282,16 @@ impl<'a> Held<'a> {
         }
         unsafe { gpu.device.unmap_memory(memory) };
 
-        // One storage binding per block, from zero, which is how `module` numbers them.
+        // The images the family samples, each a linear host-visible one so the texels are a
+        // memory write rather than a staging buffer and a copy this probe would also have to get
+        // right. Sampling a linear image needs `SAMPLED_IMAGE` in the format's
+        // `linearTilingFeatures`, which every target here reports for `R8G8B8A8_UNORM`.
+        let (images, image_memory, views, samplers) = Self::images(gpu, case)?;
+
+        // One storage binding per block, from zero, then two per texture -- the image and its
+        // sampler, in that order, which is how `module` numbers them.
         let count = u32::try_from(case.uniforms.len()).map_err(|_| "absurd block count")?;
-        let bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = (0..count)
+        let mut bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = (0..count)
             .map(|slot| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(slot)
@@ -1081,6 +1300,24 @@ impl<'a> Held<'a> {
                     .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             })
             .collect();
+        for index in 0..u32::try_from(views.len()).map_err(|_| "absurd image count")? {
+            for (step, kind) in [
+                vk::DescriptorType::SAMPLED_IMAGE,
+                vk::DescriptorType::SAMPLER,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let step = u32::try_from(step).unwrap_or_default();
+                bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(count + index * 2 + step)
+                        .descriptor_type(kind)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+                );
+            }
+        }
         let descriptor_layout = unsafe {
             gpu.device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
@@ -1088,9 +1325,24 @@ impl<'a> Held<'a> {
             )
         }
         .map_err(|why| format!("no descriptor layout: {why}"))?;
-        let sizes = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(count)];
+        let images_count = u32::try_from(views.len()).map_err(|_| "absurd image count")?;
+        let mut sizes = vec![
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(count.max(1)),
+        ];
+        if images_count > 0 {
+            sizes.push(
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                    .descriptor_count(images_count),
+            );
+            sizes.push(
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::SAMPLER)
+                    .descriptor_count(images_count),
+            );
+        }
         let descriptor_pool = unsafe {
             gpu.device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -1137,6 +1389,34 @@ impl<'a> Held<'a> {
                     .buffer_info(std::slice::from_ref(info))
             })
             .collect();
+        let image_infos: Vec<vk::DescriptorImageInfo> = views
+            .iter()
+            .zip(&samplers)
+            .flat_map(|(view, sampler)| {
+                [
+                    vk::DescriptorImageInfo::default()
+                        .image_view(*view)
+                        .image_layout(vk::ImageLayout::GENERAL),
+                    vk::DescriptorImageInfo::default().sampler(*sampler),
+                ]
+            })
+            .collect();
+        let mut updates = updates;
+        for (step, info) in image_infos.iter().enumerate() {
+            let step = u32::try_from(step).unwrap_or_default();
+            let kind = if step % 2 == 0 {
+                vk::DescriptorType::SAMPLED_IMAGE
+            } else {
+                vk::DescriptorType::SAMPLER
+            };
+            updates.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptors)
+                    .dst_binding(count + step)
+                    .descriptor_type(kind)
+                    .image_info(std::slice::from_ref(info)),
+            );
+        }
         unsafe { gpu.device.update_descriptor_sets(&updates, &[]) };
 
         Ok(Self {
@@ -1148,7 +1428,141 @@ impl<'a> Held<'a> {
             descriptor_pool,
             descriptors,
             pipeline_layout,
+            images,
+            image_memory,
+            views,
+            samplers,
         })
+    }
+
+    /// The case's images, uploaded and left in `GENERAL` so a sampler can read them.
+    ///
+    /// Linear tiling and host-visible memory: the texels are written through the map, a row at a
+    /// time because the row pitch the device reports is its own and not the image's width. A
+    /// `NEAREST` sampler with `CLAMP_TO_EDGE`, so a case that wants to know which texel was read
+    /// gets one answer rather than a blend of four.
+    // Vulkan setup, which is a sequence rather than a composition.
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
+    fn images(
+        gpu: &Gpu,
+        case: &Case,
+    ) -> Result<
+        (
+            Vec<vk::Image>,
+            Vec<vk::DeviceMemory>,
+            Vec<vk::ImageView>,
+            Vec<vk::Sampler>,
+        ),
+        String,
+    > {
+        let mut images = Vec::new();
+        let mut memories = Vec::new();
+        let mut views = Vec::new();
+        let mut samplers = Vec::new();
+        for (index, source) in case.images.iter().enumerate() {
+            let image = unsafe {
+                gpu.device.create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(vk::Format::R8G8B8A8_UNORM)
+                        .extent(vk::Extent3D {
+                            width: source.side,
+                            height: source.side,
+                            depth: 1,
+                        })
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::LINEAR)
+                        .usage(vk::ImageUsageFlags::SAMPLED)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    None,
+                )
+            }
+            .map_err(|why| format!("no image {index} for {}: {why}", case.name))?;
+            let needs = unsafe { gpu.device.get_image_memory_requirements(image) };
+            let properties = unsafe {
+                gpu.instance
+                    .get_physical_device_memory_properties(gpu.physical)
+            };
+            let host = pick(
+                &properties,
+                needs.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+            .ok_or_else(|| "no host-visible memory for a sampled image".to_string())?;
+            let memory = unsafe {
+                gpu.device.allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(needs.size)
+                        .memory_type_index(host),
+                    None,
+                )
+            }
+            .map_err(|why| format!("no memory for image {index}: {why}"))?;
+            unsafe { gpu.device.bind_image_memory(image, memory, 0) }
+                .map_err(|why| format!("image {index} not bound: {why}"))?;
+
+            let layout = unsafe {
+                gpu.device.get_image_subresource_layout(
+                    image,
+                    vk::ImageSubresource::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .array_layer(0),
+                )
+            };
+            let mapped = unsafe {
+                gpu.device
+                    .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+            }
+            .map_err(|why| format!("image {index} not mapped: {why}"))?
+            .cast::<u8>();
+            let stride = (source.side * 4) as usize;
+            for row in 0..source.side as usize {
+                let from = &source.texels[row * stride..(row + 1) * stride];
+                let at = layout.offset as usize + row * layout.row_pitch as usize;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(from.as_ptr(), mapped.add(at), stride);
+                }
+            }
+            unsafe { gpu.device.unmap_memory(memory) };
+
+            let view = unsafe {
+                gpu.device.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(vk::Format::R8G8B8A8_UNORM)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .level_count(1)
+                                .layer_count(1),
+                        ),
+                    None,
+                )
+            }
+            .map_err(|why| format!("no view for image {index}: {why}"))?;
+            let sampler = unsafe {
+                gpu.device.create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .mag_filter(vk::Filter::NEAREST)
+                        .min_filter(vk::Filter::NEAREST)
+                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                    None,
+                )
+            }
+            .map_err(|why| format!("no sampler for image {index}: {why}"))?;
+
+            images.push(image);
+            memories.push(memory);
+            views.push(view);
+            samplers.push(sampler);
+        }
+        Ok((images, memories, views, samplers))
     }
 
     fn streams(&self) -> Vec<vk::Buffer> {
@@ -1168,6 +1582,18 @@ impl Drop for Held<'_> {
                 device.destroy_buffer(*buffer, None);
             }
             device.free_memory(self.memory, None);
+            for sampler in &self.samplers {
+                device.destroy_sampler(*sampler, None);
+            }
+            for view in &self.views {
+                device.destroy_image_view(*view, None);
+            }
+            for image in &self.images {
+                device.destroy_image(*image, None);
+            }
+            for memory in &self.image_memory {
+                device.free_memory(*memory, None);
+            }
         }
     }
 }

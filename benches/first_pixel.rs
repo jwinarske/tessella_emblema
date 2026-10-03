@@ -28,13 +28,13 @@ use ash::vk;
 use tessella_capture_abi::generated::shader_attributes::{
     BACKGROUND_PATTERN_SHADER, BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER,
     FILL_EXTRUSION_SHADER, FILL_OUTLINE_SHADER, FILL_PATTERN_SHADER, FILL_SHADER, HEATMAP_SHADER,
-    HEATMAP_TEXTURE_SHADER, HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, RASTER_SHADER,
-    SYMBOL_SDFSHADER, ShaderAttribute,
+    HEATMAP_TEXTURE_SHADER, HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, LINE_PATTERN_SHADER,
+    RASTER_SHADER, SYMBOL_SDFSHADER, ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
     BACKGROUND_PATTERN_SHADER_TEXTURES, COLOR_RELIEF_SHADER_TEXTURES, FILL_PATTERN_SHADER_TEXTURES,
     HEATMAP_TEXTURE_SHADER_TEXTURES, HILLSHADE_PREPARE_SHADER_TEXTURES, HILLSHADE_SHADER_TEXTURES,
-    RASTER_SHADER_TEXTURES, SYMBOL_SDFSHADER_TEXTURES, ShaderTexture,
+    LINE_PATTERN_SHADER_TEXTURES, RASTER_SHADER_TEXTURES, SYMBOL_SDFSHADER_TEXTURES, ShaderTexture,
 };
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PATTERN_DRAWABLE_UBO, BACKGROUND_PATTERN_PROPS_UBO,
@@ -45,7 +45,8 @@ use tessella_capture_abi::generated::ubo_layouts::{
     FILL_PATTERN_TILE_PROPS_UBO, GLOBAL_PAINT_PARAMS_UBO, HEATMAP_DRAWABLE_UBO,
     HEATMAP_EVALUATED_PROPS_UBO, HEATMAP_TEXTURE_PROPS_UBO, HILLSHADE_DRAWABLE_UBO,
     HILLSHADE_EVALUATED_PROPS_UBO, HILLSHADE_PREPARE_DRAWABLE_UBO,
-    HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO, RASTER_DRAWABLE_UBO,
+    HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO, LINE_EVALUATED_PROPS_UBO,
+    LINE_PATTERN_DRAWABLE_UBO, LINE_PATTERN_TILE_PROPS_UBO, RASTER_DRAWABLE_UBO,
     RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO, SYMBOL_EVALUATED_PROPS_UBO,
     SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
@@ -53,7 +54,8 @@ use tessella_emblema::device::{preferred, vertex_format};
 use tessella_emblema::shaders::{
     BACKGROUND_BODY, BACKGROUND_PATTERN_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY,
     FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY, FILL_PATTERN_BODY, HEATMAP_BODY, HEATMAP_TEXTURE_BODY,
-    HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, RASTER_BODY, SYMBOL_SDF_BODY, module,
+    HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_PATTERN_BODY, RASTER_BODY, SYMBOL_SDF_BODY,
+    module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -1304,6 +1306,122 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             expect: [48, 24, 64, 64],
+        },
+        // A sprite running along a line, which is the last family a pixel can reach.
+        //
+        // The geometry is a line quad: the line runs along `x` with its center at plus and minus
+        // four, and each vertex carries the extrusion that pushes it off the centerline. The
+        // normal is the low bit of the position, so one side of the quad is -1 and the other +1
+        // and the fragment reads the interpolation between them.
+        //
+        //   width 5 and no gap, so outset = 2.5 + 0.5 = 3 and inset = 0
+        //   the extrusion is 3 * (-128 .. 127) / 63, so the quad spans y [-6.0952, 6.0476]
+        //   the center pixel is at 0.03125, which is a normal of 0.009069 across that span
+        //   distance = 0.009069 * 3 = 0.027206, and blur2 = (0 + 1) * 1 = 1
+        //   alpha    = clamp(min(0.027206 + 1, 3 - 0.027206) / 1)  =  1, exactly
+        //
+        // An outset of 3 against a blur of 1 is what makes the coverage *exactly* one rather than
+        // a fraction, and that is deliberate: at an outset of 1 the sample sits at the line's own
+        // edge, the coverage is 0.98057, and the pixel comes out at 23.5 -- an expectation about
+        // rounding rather than about the shader.
+        //
+        // Then the sprite. A line's pattern is not square to the tile: its length runs along the
+        // line and divides by the tile's zoom ratio, its width runs across and does not.
+        //
+        //   display  = (8 - 0) / a pixel ratio of 2                      = 4
+        //   size     = (4 * a from-scale of 4.5 / a zoom ratio of 2, 4)  = (9, 4)
+        //   along    = (floor(9 / 4) + 5 * 64) * 2 = 644, so x = 644 / 9 wrapped  = 0.55556
+        //   across   = 0.5 + 0.009069 * clamp(3, 0, 3) / 4                        = 0.50680
+        //   uv       = mix((0, 0) / 16, (8, 8) / 16, (0.55556, 0.50680))  ->  texel (4, 4)
+        //   that texel is (64, 32, 128, 128), times a half opacity  ->  (32, 16, 64, 64)
+        //
+        // A zoom ratio of 2 rather than 1 is what puts that division under test: at 1 it is the
+        // identity and a body that dropped it reads the same texel. And a from-scale of 4.5
+        // rather than 2.5 was found by searching -- with a size of 5 the distance along the line
+        // and a distance whose high byte was scaled by 256 instead of 64 both wrap to 0.8, because
+        // they differ by a multiple of the size. Nine is the smallest size here where they do not.
+        //
+        // Not under test, and not reachable in one pixel: the clamp on the width, and whether the
+        // sprite's two axes are scaled alike. Both only move the *across* coordinate, which the
+        // sample's normal of 0.009 barely shifts -- and making that normal large enough to matter
+        // puts the sample at the line's edge, where the coverage stops being exactly one and the
+        // expectation becomes a statement about rounding. The textual pins in `tests/shaders.rs`
+        // cover both.
+        Case {
+            name: "line_pattern",
+            blocks: vec![
+                &LINE_PATTERN_DRAWABLE_UBO,
+                &LINE_PATTERN_TILE_PROPS_UBO,
+                &LINE_EVALUATED_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
+            attributes: &LINE_PATTERN_SHADER,
+            body: LINE_PATTERN_BODY,
+            streams: vec![
+                // Two triangles: the centerline at -4 and +4, the normal bit low.
+                shorts(&[-8, 0, 8, 0, 8, 1, -8, 0, 8, 1, -8, 1]),
+                // The extrusion biased by 128, then the distance along the line: the third byte's
+                // low two bits are the cap direction and the rest of it with the fourth is the
+                // distance, which is why the fourth is multiplied by 64.
+                vec![
+                    128, 0, 9, 5, 128, 0, 9, 5, 128, 255, 9, 5, //
+                    128, 0, 9, 5, 128, 255, 9, 5, 128, 255, 9, 5,
+                ],
+                per_vertex(&[0.0, 0.0], 6),
+                per_vertex(&[0.0, 0.5], 6),
+                per_vertex(&[0.0, 0.0], 6),
+                per_vertex(&[0.0, 0.0], 6),
+                per_vertex(&[5.0, 5.0], 6),
+                ushorts(&[
+                    0, 0, 8, 8, 0, 0, 8, 8, 0, 0, 8, 8, //
+                    0, 0, 8, 8, 0, 0, 8, 8, 0, 0, 8, 8,
+                ]),
+                ushorts(&[
+                    8, 8, 16, 16, 8, 8, 16, 16, 8, 8, 16, 16, //
+                    8, 8, 16, 16, 8, 8, 16, 16, 8, 8, 16, 16,
+                ]),
+            ],
+            uniforms: vec![
+                block(
+                    &LINE_PATTERN_DRAWABLE_UBO,
+                    &[
+                        ("matrix", At::F(&CLIP)),
+                        ("ratio", At::F(&[1.0])),
+                        ("opacity_t", At::F(&[1.0])),
+                    ],
+                ),
+                block(
+                    &LINE_PATTERN_TILE_PROPS_UBO,
+                    &[
+                        // The device pixel ratio, the tile's zoom ratio, and the two scales, in
+                        // one slot.
+                        ("scale", At::F(&[2.0, 2.0, 4.5, 4.5])),
+                        ("texsize", At::F(&[16.0, 16.0])),
+                        ("fade", At::F(&[0.0])),
+                    ],
+                ),
+                block(&LINE_EVALUATED_PROPS_UBO, &[]),
+                block(
+                    &GLOBAL_PAINT_PARAMS_UBO,
+                    &[
+                        // One to one, so the perspective correction on the feather is exactly one
+                        // and the coverage above is the whole of it.
+                        ("units_to_pixels", At::F(&[1.0, 1.0])),
+                        ("pixel_ratio", At::F(&[1.0])),
+                    ],
+                ),
+            ],
+            textures: &LINE_PATTERN_SHADER_TEXTURES,
+            images: vec![Image::new(16, |x, y| {
+                [
+                    u8::try_from(x * 16).unwrap_or(255),
+                    u8::try_from(y * 8).unwrap_or(255),
+                    128,
+                    128,
+                ]
+            })],
+            vertices: 6,
+            expect: [32, 16, 64, 64],
         },
         // A circle, read at its own center: the extrusion interpolates to zero there, which is
         // inside the fill and nowhere near the stroke. With no stroke width the stroke's own

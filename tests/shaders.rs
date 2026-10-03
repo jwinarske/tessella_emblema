@@ -10,14 +10,14 @@ use tessella_capture_abi::generated::mbgl_enums::AttributeDataType;
 use tessella_capture_abi::generated::shader_attributes::{
     BACKGROUND_PATTERN_SHADER, BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER,
     FILL_EXTRUSION_SHADER, FILL_OUTLINE_SHADER, FILL_PATTERN_SHADER, FILL_SHADER,
-    HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, LINE_SHADER, RASTER_SHADER, SYMBOL_ICON_SHADER,
-    SYMBOL_SDFSHADER, SYMBOL_TEXT_AND_ICON_SHADER, ShaderAttribute,
+    HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, LINE_PATTERN_SHADER, LINE_SHADER, RASTER_SHADER,
+    SYMBOL_ICON_SHADER, SYMBOL_SDFSHADER, SYMBOL_TEXT_AND_ICON_SHADER, ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
     BACKGROUND_PATTERN_SHADER_TEXTURES, COLOR_RELIEF_SHADER_TEXTURES, FILL_PATTERN_SHADER_TEXTURES,
-    HILLSHADE_PREPARE_SHADER_TEXTURES, HILLSHADE_SHADER_TEXTURES, RASTER_SHADER_TEXTURES,
-    SYMBOL_ICON_SHADER_TEXTURES, SYMBOL_SDFSHADER_TEXTURES, SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES,
-    ShaderTexture,
+    HILLSHADE_PREPARE_SHADER_TEXTURES, HILLSHADE_SHADER_TEXTURES, LINE_PATTERN_SHADER_TEXTURES,
+    RASTER_SHADER_TEXTURES, SYMBOL_ICON_SHADER_TEXTURES, SYMBOL_SDFSHADER_TEXTURES,
+    SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES, ShaderTexture,
 };
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PATTERN_DRAWABLE_UBO, BACKGROUND_PATTERN_PROPS_UBO,
@@ -28,14 +28,15 @@ use tessella_capture_abi::generated::ubo_layouts::{
     FILL_PATTERN_TILE_PROPS_UBO, GLOBAL_PAINT_PARAMS_UBO, HILLSHADE_DRAWABLE_UBO,
     HILLSHADE_EVALUATED_PROPS_UBO, HILLSHADE_PREPARE_DRAWABLE_UBO,
     HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO, LINE_DRAWABLE_UBO,
-    LINE_EVALUATED_PROPS_UBO, RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO,
+    LINE_EVALUATED_PROPS_UBO, LINE_PATTERN_DRAWABLE_UBO, LINE_PATTERN_TILE_PROPS_UBO,
+    RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO,
     SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
 use tessella_emblema::shaders::{
     BACKGROUND_BODY, BACKGROUND_PATTERN_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY,
     FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY, FILL_PATTERN_BODY, HILLSHADE_BODY,
-    HILLSHADE_PREPARE_BODY, LINE_BODY, RASTER_BODY, SYMBOL_ICON_BODY, SYMBOL_SDF_BODY,
-    SYMBOL_TEXT_AND_ICON_BODY, attribute_name, module,
+    HILLSHADE_PREPARE_BODY, LINE_BODY, LINE_PATTERN_BODY, RASTER_BODY, SYMBOL_ICON_BODY,
+    SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY, attribute_name, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -245,6 +246,20 @@ fn families() -> Vec<Family> {
             attributes: &FILL_PATTERN_SHADER,
             textures: &FILL_PATTERN_SHADER_TEXTURES,
             body: FILL_PATTERN_BODY,
+            surfaces: all,
+            height: false,
+        },
+        Family {
+            name: "line_pattern",
+            blocks: vec![
+                &LINE_PATTERN_DRAWABLE_UBO,
+                &LINE_PATTERN_TILE_PROPS_UBO,
+                &LINE_EVALUATED_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
+            attributes: &LINE_PATTERN_SHADER,
+            textures: &LINE_PATTERN_SHADER_TEXTURES,
+            body: LINE_PATTERN_BODY,
             surfaces: all,
             height: false,
         },
@@ -627,6 +642,60 @@ fn the_patterns_keep_their_tiling_decisions() {
             && !fill.contains("drawable.pattern_from_t")
             && !fill.contains("drawable.pattern_to_t"),
         "the fill pattern interpolates a sprite name"
+    );
+}
+
+/// The line pattern keeps the four decisions that run a sprite along a line wrongly.
+///
+/// * **The distance along the line is fourteen bits across two bytes.** The fourth byte is the
+///   high half, which is why it is multiplied by 64, and the whole thing is in tile units doubled.
+///   A wrong factor runs the pattern at a plausible wrong rate.
+/// * **The pattern's two axes scale differently.** Its length runs along the line in tile units
+///   and divides by the tile's zoom ratio; its width runs across the line in display pixels and
+///   does not. Scaling both alike stretches the sprite with zoom.
+/// * **The width is clamped to half the sprite plus two**, which is the padding the atlas leaves
+///   between sprites. A line wider than its own sprite reads into its neighbor on the sheet.
+/// * **The cross-line coordinate is centered.** The normal runs -1 to 1 edge to edge, so the half
+///   puts the centerline at the sprite's middle rather than at its top.
+#[test]
+fn the_line_pattern_keeps_its_sprite_decisions() {
+    let pattern = families()
+        .into_iter()
+        .find(|family| family.name == "line_pattern")
+        .expect("line pattern is in the matrix");
+    let source = module(
+        Surface::Plane,
+        &pattern.blocks,
+        pattern.attributes,
+        pattern.textures,
+        pattern.body,
+    )
+    .expect("assembles");
+
+    assert!(
+        source.contains("out.along = (floor(data.z / 4.0) + data.w * 64.0) * 2.0;"),
+        "the distance along the line is not read across both bytes:\n{source}"
+    );
+    assert!(
+        source.contains(
+            "let size_a = vec2<f32>(display_a.x * tile.scale.z / tile_zoom_ratio, display_a.y);"
+        ) && source.contains(
+            "let size_b = vec2<f32>(display_b.x * tile.scale.w / tile_zoom_ratio, display_b.y);"
+        ),
+        "the pattern's length and width do not scale differently"
+    );
+    assert_eq!(
+        source.matches("clamp(in.outset, 0.0, (size_").count(),
+        2,
+        "a line wider than its sprite can read past it"
+    );
+    assert!(
+        source.contains("(size_a.y + 2.0) / 2.0") && source.contains("(size_b.y + 2.0) / 2.0"),
+        "the clamp is not to half the sprite plus the atlas padding"
+    );
+    assert!(
+        source.contains("let y_a = 0.5") && source.contains("let y_b = 0.5"),
+        "the cross-line coordinate is not centered on the sprite"
     );
 }
 
@@ -1258,7 +1327,7 @@ fn every_family_on_every_surface_compiles() {
         }
     }
     assert_eq!(
-        pairs, 50,
+        pairs, 54,
         "the matrix grew or shrank; look at the new pairs"
     );
 }
@@ -1352,6 +1421,11 @@ const UNREAD_COMPONENTS: &[(&str, &str, &str)] = &[
     // `a_pixeloffset.zw` is the minimum font scale, which `symbol_icon.vertex.glsl` reads and
     // `symbol_sdf.vertex.glsl` does not -- the SDF family takes `a_pxoffset` from `xy` and stops.
     ("symbol_sdf", "symbol_pixel_offset", "zw"),
+    // `in_data.w` with the top of `.z` is the distance along the line, which only the patterned
+    // variants read -- `line_pattern.hpp` samples the sprite along it. The Vulkan plain line
+    // shader reads `.xy` and `.z` and stops; the GL one computes a `v_linesofar` its own fragment
+    // stage then ignores.
+    ("line", "line_data", "w"),
 ];
 
 /// Every component of every attribute is read, not just the identifier.
@@ -1363,6 +1437,10 @@ const UNREAD_COMPONENTS: &[(&str, &str, &str)] = &[
 ///
 /// A use with no swizzle counts as the whole thing, which is how a `vec4` handed to `unpack_color`
 /// or a `vec3` handed to `place` is covered.
+///
+/// [`UNREAD_COMPONENTS`] has to be exact, not merely sufficient: a sanction naming a component the
+/// body does read is rejected here, so widening an entry to quiet this test cannot also hide the
+/// component beside it.
 #[test]
 fn every_component_of_an_attribute_is_read() {
     let mut short = Vec::new();
@@ -1383,9 +1461,19 @@ fn every_component_of_an_attribute_is_read() {
             }
             let mut read = components_read(&source, &field);
             for (family_name, attribute_field, sanctioned) in UNREAD_COMPONENTS {
-                if *family_name == family.name && *attribute_field == field {
-                    read.extend(sanctioned.chars());
+                if *family_name != family.name || *attribute_field != field {
+                    continue;
                 }
+                // A sanction that covers a component the body does read claims more than it
+                // needs, and would go on excusing that component after an edit dropped it.
+                for component in sanctioned.chars() {
+                    assert!(
+                        !read.contains(&component),
+                        "{} sanctions {field}.{component} and reads it",
+                        family.name
+                    );
+                }
+                read.extend(sanctioned.chars());
             }
             if read.len() < width {
                 short.push(format!(
@@ -1412,35 +1500,65 @@ fn components(declared: AttributeDataType) -> usize {
 ///
 /// A bare use -- `in.field` with no `.` after it -- is the whole thing, so it answers `xyzw`.
 fn components_read(source: &str, field: &str) -> BTreeSet<char> {
+    swizzles_of(source, &format!("in.{field}"), 0)
+}
+
+/// Which of `xyzw` the source takes from `name`, following one level of local binding.
+///
+/// A bare `in.line_data` would answer `xyzw` on its own, and a body that binds it to a local and
+/// then reads `data.xy` would be excused for every component. So a bare use inside a `let` is
+/// followed to that local's own swizzles instead. One level, because that is the pattern these
+/// bodies use; `depth` stops a self-referential binding looping.
+fn swizzles_of(source: &str, name: &str, depth: u32) -> BTreeSet<char> {
     let mut read = BTreeSet::new();
-    let needle = format!("in.{field}");
-    for (at, _) in source.match_indices(&needle) {
-        let after = &source[at + needle.len()..];
-        // `in.symbol_data` is a prefix of nothing else today, but a longer field with the same
-        // start would be counted here if one ever arrives.
+    for (at, _) in source.match_indices(name) {
+        // A longer identifier that merely starts with this one is a different thing.
+        let before = source[..at].chars().next_back();
+        if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+            continue;
+        }
+        let after = &source[at + name.len()..];
         if after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
             continue;
         }
-        let Some(swizzle) = after.strip_prefix('.') else {
-            read.extend(['x', 'y', 'z', 'w']);
-            continue;
-        };
-        let named: Vec<char> = swizzle
-            .chars()
-            .take_while(|c| matches!(c, 'x' | 'y' | 'z' | 'w' | 'r' | 'g' | 'b' | 'a'))
-            .collect();
-        if named.is_empty() {
-            read.extend(['x', 'y', 'z', 'w']);
+        let line_start = source[..at].rfind('\n').map_or(0, |nl| nl + 1);
+        // The left side of the binding that introduced this name is not a use of it.
+        if source[line_start..at].trim_end().ends_with("let") {
             continue;
         }
-        for c in named {
-            read.insert(match c {
-                'r' => 'x',
-                'g' => 'y',
-                'b' => 'z',
-                'a' => 'w',
-                other => other,
+        let named: Vec<char> = after
+            .strip_prefix('.')
+            .map(|swizzle| {
+                swizzle
+                    .chars()
+                    .take_while(|c| matches!(c, 'x' | 'y' | 'z' | 'w' | 'r' | 'g' | 'b' | 'a'))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !named.is_empty() {
+            for component in named {
+                read.insert(match component {
+                    'r' => 'x',
+                    'g' => 'y',
+                    'b' => 'z',
+                    'a' => 'w',
+                    other => other,
+                });
+            }
+            continue;
+        }
+        // Bare. If this use is the right-hand side of a `let`, the local stands in for it.
+        let bound = source[line_start..at]
+            .trim_start()
+            .strip_prefix("let ")
+            .and_then(|rest| rest.split_once('='))
+            .map(|(binding, _)| binding.trim())
+            .filter(|binding| {
+                !binding.is_empty() && binding.chars().all(|c| c.is_alphanumeric() || c == '_')
             });
+        match bound {
+            Some(local) if depth == 0 => read.extend(swizzles_of(source, local, depth + 1)),
+            _ => read.extend(['x', 'y', 'z', 'w']),
         }
     }
     read
@@ -1457,6 +1575,8 @@ const UNUSED_FACTORS: &[(&str, &str)] = &[
     // the two sampled colors through `fade` instead.
     ("fill_pattern", "pattern_from_t"),
     ("fill_pattern", "pattern_to_t"),
+    ("line_pattern", "pattern_from_t"),
+    ("line_pattern", "pattern_to_t"),
 ];
 
 /// Attribute and factor pairs whose names do not match, as `(attribute field, factor)`.

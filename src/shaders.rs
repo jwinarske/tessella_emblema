@@ -462,6 +462,154 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
 }
 ";
 
+/// The line-pattern family's body: a line, with a sprite running along it.
+///
+/// [`LINE_BODY`]'s vertex stage without the color and with two additions: the sprite's corners,
+/// and the distance along the line. That distance is what the pattern repeats against, and it is
+/// the `a_data` component the plain family sanctions as unread -- the top six bits of the third
+/// byte with the whole fourth, which is why the fourth is multiplied by 64.
+///
+/// # The pattern's size is computed in the fragment stage
+///
+/// [`FILL_PATTERN_BODY`] computes it in the vertex stage; this one does not, because a line's
+/// pattern is not square to the tile. Its width runs across the line and its length along it, so
+/// the two axes are scaled differently -- the length by the tile's zoom ratio and the width not at
+/// all -- and the fragment is where the normal that distinguishes them is available.
+///
+/// # The width is clamped to the sprite plus its padding
+///
+/// A line wider than its sprite would read past the sprite's own rectangle and into whatever sits
+/// beside it on the sheet. The clamp is to half the pattern's height plus two, which is the
+/// padding the atlas leaves between sprites.
+pub const LINE_PATTERN_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) normal: vec2<f32>,
+    @location(1) outset: f32,
+    @location(2) inset: f32,
+    @location(3) gamma_scale: f32,
+    @location(4) blur: f32,
+    @location(5) opacity: f32,
+    @location(6) along: f32,
+    @location(7) pattern_from: vec4<f32>,
+    @location(8) pattern_to: vec4<f32>,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let drawable = line_pattern_drawable_ubo[ubo_index];
+    let global = global_paint_params_ubo[0];
+    var out: Out;
+
+    let extrude_scale = 63.0;
+    let antialiasing = 1.0 / max(global.pixel_ratio, 1e-6) / 2.0;
+
+    let packed = vec2<f32>(in.line_pos_normal);
+    let center = floor(packed * 0.5);
+    var normal = packed - 2.0 * center;
+    normal.y = normal.y * 2.0 - 1.0;
+
+    let data = vec4<f32>(in.line_data);
+    let extrude = data.xy - 128.0;
+    let direction = (data.z % 4.0) - 1.0;
+    // The distance along the line, in tile units doubled. The fourth byte is the high half of a
+    // fourteen-bit number whose low six bits are the top of the third.
+    out.along = (floor(data.z / 4.0) + data.w * 64.0) * 2.0;
+
+    let gapwidth = mix_value(in.line_gap_width, drawable.gapwidth_t) * 0.5;
+    let halfwidth = mix_value(in.line_width, drawable.width_t) * 0.5;
+    let line_offset = -1.0 * mix_value(in.line_offset, drawable.offset_t);
+
+    let inset = gapwidth + select(0.0, antialiasing, gapwidth > 0.0);
+    let outset = gapwidth
+        + halfwidth * select(1.0, 2.0, gapwidth > 0.0)
+        + select(antialiasing, 0.0, halfwidth == 0.0);
+
+    let dist = outset * extrude / extrude_scale;
+    let u = 0.5 * direction;
+    let t = 1.0 - abs(u);
+    let turn = mat2x2<f32>(t, -u, u, t);
+    let offset2 = line_offset * extrude / extrude_scale * normal.y * turn;
+
+    let ratio = max(drawable.ratio, 1e-6);
+    let at = center + offset2 / ratio;
+    let projected_extrude = displace(at, dist / ratio, drawable.matrix);
+    let clip = place(vec3<f32>(at, 0.0), drawable.matrix) + projected_extrude;
+    out.clip = clip;
+
+    let unprojected = length(dist);
+    let projected = length(projected_extrude.xy / clip.w * global.units_to_pixels);
+    out.gamma_scale = unprojected / max(projected, 1e-6);
+
+    out.normal = normal;
+    out.outset = outset;
+    out.inset = inset;
+    out.blur = mix_value(in.line_blur, drawable.blur_t);
+    out.opacity = mix_value(in.line_opacity, drawable.opacity_t);
+    // Straight through: a sprite name is not a number. See `FILL_PATTERN_BODY`.
+    out.pattern_from = vec4<f32>(in.line_pattern_from);
+    out.pattern_to = vec4<f32>(in.line_pattern_to);
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    let tile = line_pattern_tile_props_ubo[ubo_index];
+    let global = global_paint_params_ubo[0];
+
+    // Four numbers in one slot: the device pixel ratio, the tile's zoom ratio, and the two
+    // sprites' scales.
+    let pixel_ratio = max(tile.scale.x, 1e-6);
+    let tile_zoom_ratio = max(tile.scale.y, 1e-6);
+
+    let display_a = (in.pattern_from.zw - in.pattern_from.xy) / pixel_ratio;
+    let display_b = (in.pattern_to.zw - in.pattern_to.xy) / pixel_ratio;
+    // The length is scaled by the tile's zoom ratio and the width is not: one runs along the line
+    // in tile units and the other across it in display pixels.
+    let size_a = vec2<f32>(display_a.x * tile.scale.z / tile_zoom_ratio, display_a.y);
+    let size_b = vec2<f32>(display_b.x * tile.scale.w / tile_zoom_ratio, display_b.y);
+
+    // The line's own coverage, exactly as the plain family computes it.
+    let distance = length(in.normal) * in.outset;
+    let blur2 = (in.blur + 1.0 / max(global.pixel_ratio, 1e-6)) * in.gamma_scale;
+    let alpha = clamp(
+        min(distance - (in.inset - blur2), in.outset - distance) / blur2,
+        0.0,
+        1.0
+    );
+
+    // Along the line, wrapped into one repeat of the sprite.
+    let x_a = wrap(vec2<f32>(in.along / size_a.x, 0.0), vec2<f32>(1.0, 1.0)).x;
+    let x_b = wrap(vec2<f32>(in.along / size_b.x, 0.0), vec2<f32>(1.0, 1.0)).x;
+
+    // Across it. The normal runs -1 to 1 edge to edge, so the half centers it, and the clamp stops
+    // a line wider than its sprite reading into the sprite beside it on the sheet.
+    let y_a = 0.5
+        + in.normal.y * clamp(in.outset, 0.0, (size_a.y + 2.0) / 2.0) / max(size_a.y, 1e-6);
+    let y_b = 0.5
+        + in.normal.y * clamp(in.outset, 0.0, (size_b.y + 2.0) / 2.0) / max(size_b.y, 1e-6);
+
+    let pos_a = mix(
+        in.pattern_from.xy / tile.texsize,
+        in.pattern_from.zw / tile.texsize,
+        vec2<f32>(x_a, y_a)
+    );
+    let pos_b = mix(
+        in.pattern_to.xy / tile.texsize,
+        in.pattern_to.zw / tile.texsize,
+        vec2<f32>(x_b, y_b)
+    );
+
+    let color = mix(
+        textureSample(line_image, line_image_sampler, pos_a),
+        textureSample(line_image, line_image_sampler, pos_b),
+        tile.fade
+    );
+    return color * (alpha * in.opacity);
+}
+";
+
 /// The circle family's body.
 ///
 /// The position is the circle's center and the data attribute carries the corner it is extruded
@@ -1715,13 +1863,13 @@ fn vertex_main(in: In) -> Out {
     var normal = packed - 2.0 * center;
     normal.y = normal.y * 2.0 - 1.0;
 
-    // Four unnormalized bytes. The first two are the extrusion; the low two bits of the third say
-    // which way a round end point's extrude points, and the rest of the third with the fourth is
-    // the distance along the line, which the plain family has no use for.
+    // Four unnormalized bytes. The first two are the extrusion and the low two bits of the third
+    // say which way a round end point's extrude points. The rest of the third with the fourth is
+    // the distance along the line, which only the patterned variants read -- see
+    // `LINE_PATTERN_BODY`.
     let data = vec4<f32>(in.line_data);
     let extrude = data.xy - 128.0;
     let direction = (data.z % 4.0) - 1.0;
-    let along = (floor(data.z / 4.0) + data.w * 64.0) * 2.0;
 
     let gapwidth = mix_value(in.line_gap_width, drawable.gapwidth_t) * 0.5;
     let halfwidth = mix_value(in.line_width, drawable.width_t) * 0.5;

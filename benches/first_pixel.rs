@@ -26,17 +26,19 @@
 
 use ash::vk;
 use tessella_capture_abi::generated::shader_attributes::{
-    BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER, FILL_EXTRUSION_SHADER,
-    FILL_OUTLINE_SHADER, FILL_SHADER, HEATMAP_SHADER, HEATMAP_TEXTURE_SHADER,
-    HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, RASTER_SHADER, SYMBOL_SDFSHADER, ShaderAttribute,
+    BACKGROUND_PATTERN_SHADER, BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER,
+    FILL_EXTRUSION_SHADER, FILL_OUTLINE_SHADER, FILL_SHADER, HEATMAP_SHADER,
+    HEATMAP_TEXTURE_SHADER, HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, RASTER_SHADER,
+    SYMBOL_SDFSHADER, ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
-    COLOR_RELIEF_SHADER_TEXTURES, HEATMAP_TEXTURE_SHADER_TEXTURES,
-    HILLSHADE_PREPARE_SHADER_TEXTURES, HILLSHADE_SHADER_TEXTURES, RASTER_SHADER_TEXTURES,
-    SYMBOL_SDFSHADER_TEXTURES, ShaderTexture,
+    BACKGROUND_PATTERN_SHADER_TEXTURES, COLOR_RELIEF_SHADER_TEXTURES,
+    HEATMAP_TEXTURE_SHADER_TEXTURES, HILLSHADE_PREPARE_SHADER_TEXTURES, HILLSHADE_SHADER_TEXTURES,
+    RASTER_SHADER_TEXTURES, SYMBOL_SDFSHADER_TEXTURES, ShaderTexture,
 };
 use tessella_capture_abi::generated::ubo_layouts::{
-    BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
+    BACKGROUND_DRAWABLE_UBO, BACKGROUND_PATTERN_DRAWABLE_UBO, BACKGROUND_PATTERN_PROPS_UBO,
+    BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
     COLOR_RELIEF_DRAWABLE_UBO, COLOR_RELIEF_EVALUATED_PROPS_UBO, COLOR_RELIEF_TILE_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
     FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, GLOBAL_PAINT_PARAMS_UBO,
@@ -48,9 +50,9 @@ use tessella_capture_abi::generated::ubo_layouts::{
 };
 use tessella_emblema::device::{preferred, vertex_format};
 use tessella_emblema::shaders::{
-    BACKGROUND_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY, FILL_EXTRUSION_BODY,
-    FILL_OUTLINE_BODY, HEATMAP_BODY, HEATMAP_TEXTURE_BODY, HILLSHADE_BODY, HILLSHADE_PREPARE_BODY,
-    RASTER_BODY, SYMBOL_SDF_BODY, module,
+    BACKGROUND_BODY, BACKGROUND_PATTERN_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY,
+    FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY, HEATMAP_BODY, HEATMAP_TEXTURE_BODY, HILLSHADE_BODY,
+    HILLSHADE_PREPARE_BODY, RASTER_BODY, SYMBOL_SDF_BODY, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -339,7 +341,7 @@ fn run() -> Result<usize, String> {
                 case.name, case.expect
             ));
         }
-        println!("  {:<15} {drawn:?}", case.name);
+        println!("  {:<18} {drawn:?}", case.name);
     }
     Ok(cases.len())
 }
@@ -1133,6 +1135,97 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 6,
             expect: [80, 255, 255, 255],
+        },
+        // A tiled background, which is the case for `pattern_pos` -- the one piece of the
+        // prelude no pixel had reached.
+        //
+        // A pattern is anchored to the *world*, so a repeating fill does not restart at every
+        // tile edge, and the anchor is a pixel coordinate too large for an `f32` at the precision
+        // a pattern needs. It arrives split, and `pattern_pos` brings it down a byte at a time
+        // through three nested wraps. The numbers here are what make that nesting observable
+        // rather than decorative:
+        //
+        //   upper 1001, lower 7, pattern size 10
+        //   nested:     wrap(1001, 10) = 1  ->  *256, wrap = 6  ->  *256 + 7, wrap = 3
+        //   exact:      (1001 * 65536 + 7) mod 10                              = 3
+        //   collapsed:  wrap(f32(1001 * 65536 + 7), 10)                        = 4
+        //
+        // The collapsed form is wrong because the sum is 65,601,543, which needs 26 bits and so
+        // rounds in an `f32` -- to 65,601,544, whose remainder is 4. That one unit moves the
+        // pattern coordinate by a tenth and the atlas texel from 6 to 7, so the pixel reads
+        // (56, 28, 64, 64) instead. A pattern built the collapsed way would tile *almost* right
+        // and drift as the camera moved.
+        //
+        //   pattern pos = (500 * 0.03125 + 3) / 10 = 1.8625,  wrapped to 0.8625
+        //   uv          = mix(0 / 16, 8 / 16, 0.8625) = 0.43125  ->  atlas texel 6
+        //   that texel is (96, 48, 128, 128), times a half opacity  ->  (48, 24, 64, 64)
+        //
+        // Three of the four numbers above exist to separate mutations, and each collided first:
+        //
+        //   * **A tile-to-pixel factor of 500.** It was chosen by searching: at 10 the position
+        //     term lands in the same texel as the offset alone, at 100 the pattern position stays
+        //     under one so the repeat wrap is the identity, and at 400 dropping the size divide
+        //     reads the right texel by coincidence. 500 is the first value where all six
+        //     mutations below read a different texel from the correct one.
+        //   * **A size of 5 with a scale of 2, not a size of 10 with a scale of 1.** The product
+        //     is what the arithmetic uses, so with a scale of one dropping it changes nothing. As
+        //     a 5 doubled, dropping the scale wraps over 5 and reads texel 1.
+        //   * **An atlas alpha of 128, not 255.** The half opacity then divides it exactly; at 255
+        //     the answer is 127.5 and the expectation becomes a claim about rounding.
+        //
+        // The second pattern's sprite is a different corner of the same sheet, so a `mix` taken
+        // the other way reads texel 14.
+        Case {
+            name: "background_pattern",
+            blocks: vec![
+                &BACKGROUND_PATTERN_DRAWABLE_UBO,
+                &BACKGROUND_PATTERN_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
+            attributes: &BACKGROUND_PATTERN_SHADER,
+            body: BACKGROUND_PATTERN_BODY,
+            streams: vec![shorts(&COVERING)],
+            uniforms: vec![
+                block(
+                    &BACKGROUND_PATTERN_DRAWABLE_UBO,
+                    &[
+                        ("matrix", At::F(&CLIP)),
+                        ("pixel_coord_upper", At::F(&[1001.0, 1001.0])),
+                        ("pixel_coord_lower", At::F(&[7.0, 7.0])),
+                        ("tile_units_to_pixels", At::F(&[500.0])),
+                    ],
+                ),
+                block(
+                    &BACKGROUND_PATTERN_PROPS_UBO,
+                    &[
+                        ("pattern_tl_a", At::F(&[0.0, 0.0])),
+                        ("pattern_br_a", At::F(&[8.0, 8.0])),
+                        ("pattern_tl_b", At::F(&[8.0, 8.0])),
+                        ("pattern_br_b", At::F(&[16.0, 16.0])),
+                        ("pattern_size_a", At::F(&[5.0, 5.0])),
+                        ("pattern_size_b", At::F(&[5.0, 5.0])),
+                        ("scale_a", At::F(&[2.0])),
+                        ("scale_b", At::F(&[2.0])),
+                        ("mix", At::F(&[0.0])),
+                        ("opacity", At::F(&[0.5])),
+                    ],
+                ),
+                block(
+                    &GLOBAL_PAINT_PARAMS_UBO,
+                    &[("pattern_atlas_texsize", At::F(&[16.0, 16.0]))],
+                ),
+            ],
+            textures: &BACKGROUND_PATTERN_SHADER_TEXTURES,
+            images: vec![Image::new(16, |x, y| {
+                [
+                    u8::try_from(x * 16).unwrap_or(255),
+                    u8::try_from(y * 8).unwrap_or(255),
+                    128,
+                    128,
+                ]
+            })],
+            vertices: 3,
+            expect: [48, 24, 64, 64],
         },
         // A circle, read at its own center: the extrusion interpolates to zero there, which is
         // inside the fill and nowhere near the stroke. With no stroke width the stroke's own

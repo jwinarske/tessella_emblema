@@ -115,6 +115,48 @@ pub fn check_vertex_formats(
         .map_or(Ok(()), |format| Err(Unsupported::VertexFormat(format)))
 }
 
+/// How much this crate wants to run on a device of each class, lowest first.
+///
+/// A software implementation renders the map correctly and far too slowly to be a target, and it
+/// is also what a misconfigured system silently falls back to. Picking it only when nothing else
+/// exists means a wrong answer on a board shows up as a wrong *picture* rather than as a frame
+/// time nobody can explain.
+///
+/// `Other` sits above `Cpu` and below the rest because it is the class an implementation reports
+/// when it will not say: unknown hardware is still more likely to be hardware than the one class
+/// that is definitionally not.
+const fn rank(class: vk::PhysicalDeviceType) -> u8 {
+    match class {
+        // External.
+        vk::PhysicalDeviceType::DISCRETE_GPU => 0,
+        // Internal.
+        vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+        // A paravirtualized device, which is hardware on the other side of the hypervisor.
+        vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+        // Software.
+        vk::PhysicalDeviceType::CPU => 4,
+        // Anything that will not say, including a class added after this was written.
+        _ => 3,
+    }
+}
+
+/// Which of the enumerated devices to open: external, then internal, then software.
+///
+/// Returns an index into `classes`, which the caller zips back against its own enumeration. Ties
+/// go to the earlier device, so the order the implementation reported is preserved among equals
+/// and two discrete GPUs do not swap between runs.
+///
+/// Takes the classes rather than an `ash::Instance` for the same reason the rest of this module
+/// does: the decision is the part worth testing, and it needs no device to make.
+#[must_use]
+pub fn preferred(classes: &[vk::PhysicalDeviceType]) -> Option<usize> {
+    classes
+        .iter()
+        .enumerate()
+        .min_by_key(|(index, class)| (rank(**class), *index))
+        .map(|(index, _)| index)
+}
+
 /// The Vulkan vertex format for a type a shader declares.
 ///
 /// The declared type decides this and the supplied type does not: the producer's buffer may hold
@@ -177,6 +219,7 @@ pub const fn vertex_format(declared: AttributeDataType) -> Option<vk::Format> {
 mod tests {
     use super::{
         Attachment, DEPTH_STENCIL, Unsupported, check_vertex_formats, depth_stencil_format,
+        preferred,
     };
     use ash::vk;
 
@@ -304,5 +347,86 @@ mod tests {
             check_vertex_formats(&[vk::Format::R16G16_SINT, missing], all_but_one),
             Err(Unsupported::VertexFormat(missing))
         );
+    }
+
+    /// External before internal before software, which is the order asked for.
+    #[test]
+    fn a_discrete_device_wins_over_an_integrated_one_and_both_over_software() {
+        let all = [
+            vk::PhysicalDeviceType::CPU,
+            vk::PhysicalDeviceType::INTEGRATED_GPU,
+            vk::PhysicalDeviceType::DISCRETE_GPU,
+        ];
+        assert_eq!(preferred(&all), Some(2));
+        assert_eq!(preferred(&all[..2]), Some(1));
+        assert_eq!(preferred(&all[..1]), Some(0));
+    }
+
+    /// The machine this was written on: an integrated GPU and a software implementation.
+    ///
+    /// The software one enumerates second here and first elsewhere, which is why the choice cannot
+    /// be left to the enumeration order.
+    #[test]
+    fn software_is_taken_only_when_it_is_alone() {
+        let listed = [
+            vk::PhysicalDeviceType::INTEGRATED_GPU,
+            vk::PhysicalDeviceType::CPU,
+        ];
+        assert_eq!(preferred(&listed), Some(0));
+        let reversed = [
+            vk::PhysicalDeviceType::CPU,
+            vk::PhysicalDeviceType::INTEGRATED_GPU,
+        ];
+        assert_eq!(preferred(&reversed), Some(1));
+        assert_eq!(preferred(&[vk::PhysicalDeviceType::CPU]), Some(0));
+    }
+
+    /// A paravirtualized device is hardware, and ranks above software.
+    #[test]
+    fn a_virtual_device_beats_software() {
+        let listed = [
+            vk::PhysicalDeviceType::CPU,
+            vk::PhysicalDeviceType::VIRTUAL_GPU,
+        ];
+        assert_eq!(preferred(&listed), Some(1));
+    }
+
+    /// A class this crate does not know still beats software.
+    ///
+    /// `OTHER` is what an implementation reports when it will not say, and so is any class added
+    /// to Vulkan after this was written. Either is more likely to be hardware than the one class
+    /// that is definitionally not, and ranking them below software would pick llvmpipe on the
+    /// first board that reports something new.
+    #[test]
+    fn an_unknown_class_beats_software() {
+        let listed = [
+            vk::PhysicalDeviceType::CPU,
+            vk::PhysicalDeviceType::OTHER,
+            vk::PhysicalDeviceType::from_raw(99),
+        ];
+        assert_eq!(preferred(&listed), Some(1));
+        assert_eq!(
+            preferred(&[
+                vk::PhysicalDeviceType::CPU,
+                vk::PhysicalDeviceType::from_raw(99)
+            ]),
+            Some(1)
+        );
+    }
+
+    /// Among equals the enumeration order stands, so a two-GPU machine does not alternate.
+    #[test]
+    fn a_tie_goes_to_the_earlier_device() {
+        let two = [
+            vk::PhysicalDeviceType::DISCRETE_GPU,
+            vk::PhysicalDeviceType::DISCRETE_GPU,
+        ];
+        assert_eq!(preferred(&two), Some(0));
+    }
+
+    /// No devices is not a choice, and is the caller's to report.
+    #[test]
+    fn nothing_enumerated_is_no_answer() {
+        assert_eq!(preferred(&[]), None);
     }
 }

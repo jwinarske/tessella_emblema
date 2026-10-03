@@ -1088,6 +1088,157 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
 }
 ";
 
+/// The symbol text-and-icon family's body: one draw whose vertices are glyphs or sprites.
+///
+/// A label can carry an inline image -- a shield, a transit badge -- and placing it as a separate
+/// drawable would let the two fall out of step. So the producer puts both in one bucket and marks
+/// each vertex, and the fragment stage branches: a sprite is sampled from a second atlas and a
+/// glyph goes through [`SYMBOL_SDF_BODY`]'s arithmetic unchanged.
+///
+/// # The mark is the low bit of the first size byte
+///
+/// `in_data.z` carries the size doubled with the flag added, the same packing the fade opacity
+/// uses. So `floor(z * 0.5)` is the size and what is left is whether this vertex is a glyph.
+/// Nothing else distinguishes them, and getting it backwards samples each atlas with the other's
+/// coordinates -- which draws, in pieces of the wrong sheet.
+///
+/// # The font scale has no text branch here
+///
+/// `symbol_icon` and `symbol_sdf` both compute `is_text_prop ? size / 24.0 : size`; this family
+/// divides unconditionally. Every vertex it draws belongs to a text label -- the icon is *in* the
+/// label -- so the branch has one answer and mbgl writes it that way.
+pub const SYMBOL_TEXT_AND_ICON_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) tex: vec2<f32>,
+    @location(1) @interpolate(flat) is_icon: u32,
+    @location(2) fade: f32,
+    @location(3) font_scale: f32,
+    @location(4) gamma_scale: f32,
+    @location(5) fill_color: vec4<f32>,
+    @location(6) halo_color: vec4<f32>,
+    @location(7) opacity: f32,
+    @location(8) halo_width: f32,
+    @location(9) halo_blur: f32,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let drawable = symbol_drawable_ubo[ubo_index];
+    let global = global_paint_params_ubo[0];
+    var out: Out;
+
+    let anchor = vec2<f32>(in.symbol_pos_offset.xy);
+    let corner = vec2<f32>(in.symbol_pos_offset.zw);
+    let tex = vec2<f32>(in.symbol_data.xy);
+    let sized = vec2<f32>(in.symbol_data.zw);
+    let placed = in.symbol_projected_pos;
+    let segment_angle = -placed.z;
+
+    // The size doubled with the glyph-or-sprite flag in the low bit.
+    let smallest = floor(sized.x * 0.5);
+    let is_sdf = sized.x - 2.0 * smallest;
+
+    var size = drawable.size;
+    if drawable.is_size_zoom_constant == 0 && drawable.is_size_feature_constant == 0 {
+        size = mix(smallest, sized.y, drawable.size_t) / 128.0;
+    } else if drawable.is_size_zoom_constant != 0 && drawable.is_size_feature_constant == 0 {
+        size = smallest / 128.0;
+    }
+
+    let anchor_point = transform(drawable.matrix, vec3<f32>(anchor, 0.0));
+    let to_anchor = anchor_point.w;
+    var ratio = global.camera_to_center_distance / to_anchor;
+    if drawable.pitch_with_map != 0 {
+        ratio = to_anchor / global.camera_to_center_distance;
+    }
+    let perspective = clamp(0.5 + 0.5 * ratio, 0.0, 4.0);
+    if drawable.is_offset == 0 {
+        size *= perspective;
+    }
+    // Unconditional, unlike the other two symbol families: see this body's own note.
+    let font_scale = size / 24.0;
+
+    var rotation = 0.0;
+    if drawable.rotate_symbol != 0 {
+        let along = transform(drawable.matrix, vec3<f32>(anchor + vec2<f32>(1.0, 0.0), 0.0));
+        let here = anchor_point.xy / anchor_point.w;
+        let there = along.xy / along.w;
+        rotation = atan2((there.y - here.y) / global.aspect_ratio, there.x - here.x);
+    }
+    let turn = segment_angle + rotation;
+    let spun = mat2x2<f32>(cos(turn), -sin(turn), sin(turn), cos(turn));
+
+    // No pixel offset: this family declares none, which is the other attribute it does without.
+    let in_plane = transform(drawable.label_plane_matrix, vec3<f32>(placed.xy, 0.0));
+    let on_plane = in_plane.xy / in_plane.w + spun * (corner / 32.0 * font_scale);
+    let clip = place(vec3<f32>(on_plane, 0.0), drawable.coord_matrix);
+    out.clip = clip;
+
+    let is_icon = is_sdf == 0.0;
+    out.is_icon = u32(is_icon);
+    // The sheet this vertex came from decides which size divides its coordinates, so one draw
+    // reads two atlases of different dimensions.
+    out.tex = tex / select(drawable.texsize, drawable.texsize_icon, is_icon);
+
+    let whole = floor(in.symbol_fade_opacity / 2.0);
+    let rising = in.symbol_fade_opacity - whole * 2.0;
+    var change = -global.symbol_fade_change;
+    if rising > 0.5 {
+        change = global.symbol_fade_change;
+    }
+    out.fade = clamp(whole / 127.0 + change, 0.0, 1.0);
+
+    out.font_scale = font_scale;
+    out.gamma_scale = clip.w;
+    out.fill_color = mix_color(in.symbol_color, drawable.fill_color_t);
+    out.halo_color = mix_color(in.symbol_halo_color, drawable.halo_color_t);
+    out.opacity = mix_value(in.symbol_opacity, drawable.opacity_t);
+    out.halo_width = mix_value(in.symbol_halo_width, drawable.halo_width_t);
+    out.halo_blur = mix_value(in.symbol_halo_blur, drawable.halo_blur_t);
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    let tile = symbol_tile_props_ubo[ubo_index];
+    let global = global_paint_params_ubo[0];
+
+    if in.is_icon != 0u {
+        // A sprite, premultiplied, with no color of its own and no halo.
+        let sprite = textureSample(symbol_image_icon, symbol_image_icon_sampler, in.tex);
+        return sprite * (in.opacity * in.fade);
+    }
+
+    let sdf_px = 8.0;
+    let edge_gamma = 0.105 / max(global.pixel_ratio, 1e-6);
+    let font_gamma = in.font_scale * tile.gamma_scale;
+    let fill_gamma = edge_gamma / font_gamma;
+    let halo_gamma = (in.halo_blur * 1.19 / sdf_px + edge_gamma) / font_gamma;
+
+    let is_halo = tile.is_halo != 0;
+    let gamma_scaled = select(fill_gamma, halo_gamma, is_halo) * in.gamma_scale;
+    let color = select(in.fill_color, in.halo_color, is_halo);
+
+    let fill_edge = (256.0 - 64.0) / 256.0;
+    let inner = select(fill_edge, fill_edge + halo_gamma * in.gamma_scale, is_halo);
+
+    // `.r`, where mbgl reads `.a`: see `SYMBOL_SDF_BODY` for which of the two the view decides.
+    let distance = textureSample(symbol_image, symbol_image_sampler, in.tex).r;
+    var alpha = smoothstep(inner - gamma_scaled, inner + gamma_scaled, distance);
+    if is_halo {
+        let halo_edge = (6.0 - in.halo_width / in.font_scale) / sdf_px;
+        alpha = min(
+            smoothstep(halo_edge - gamma_scaled, halo_edge + gamma_scaled, distance),
+            1.0 - alpha
+        );
+    }
+
+    return color * (alpha * in.opacity * in.fade);
+}
+";
+
 /// The line family's body.
 ///
 /// The position attribute carries the point and its normal together, as mbgl packs it: the low bit

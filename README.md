@@ -63,14 +63,32 @@ explosion.
 
 ## Status
 
-Scaffolding. What is here is the repository, its pins, and the device-side decisions that can be
-made and tested without a GPU, a stream, or the layout hand-off — chiefly format selection,
-which is an
-obligation this crate inherits directly by owning its own depth-stencil attachment.
+The shader half is done; the frame half is not started.
 
-Not here yet, in dependency order: `tessella-consume` (the reader, draw list and stencil partition,
-living once in the tessella workspace), the geometry and uniform stores, the shader modules, and
-the hand-off that waits on `assume_layout`.
+What is here: eighteen shader families, transcribed from `include/mbgl/shaders/vulkan/*.hpp` —
+the Vulkan backend's text, which is what the ABI's tables are generated from and which differs
+from the GL shaders in places that matter. Each is assembled against one of four surfaces, giving
+57 modules that compile to SPIR-V. Plus the uniform-block declarations generated from the same
+tables, the permutation mechanism, and the device-side decisions that can be made without a GPU.
+
+How that is checked, in two ways, because reading a shader cannot catch what reading cannot see:
+
+- `tests/shaders.rs` assembles all 57 pairs, compiles each, and pins the decisions that are
+  silent when wrong — a wrong one of those still draws, which is why they are pinned.
+- `benches/first_pixel.rs` runs them. Twenty-one cases pick inputs that make one pixel
+  predictable, derive it from mbgl's arithmetic by hand, draw, and read it back. A bench rather
+  than a test because it needs a GPU and CI has none. It picks a device external first, then
+  internal, then software.
+
+Every family has at least one pixel behind it. The readback has caught defects the pins could
+not, including an outline's feather mirrored by a coordinate flip naga applies *after* a body
+runs, and it has corrected several comments that were confidently wrong.
+
+Not here yet, in dependency order: `tessella-consume` (the reader, draw list and stencil
+partition, living once in the tessella workspace), the geometry and uniform stores, the pipelines
+those modules become, and the hand-off that waits on `assume_layout`. Nothing in the library
+touches a GPU — `#![forbid(unsafe_code)]` is still at the top of `lib.rs`, so every `ash` call is
+in a bench.
 
 ## Targets
 

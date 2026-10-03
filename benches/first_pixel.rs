@@ -29,12 +29,14 @@ use tessella_capture_abi::generated::shader_attributes::{
     BACKGROUND_PATTERN_SHADER, BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER,
     FILL_EXTRUSION_SHADER, FILL_OUTLINE_SHADER, FILL_PATTERN_SHADER, FILL_SHADER, HEATMAP_SHADER,
     HEATMAP_TEXTURE_SHADER, HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, LINE_PATTERN_SHADER,
-    RASTER_SHADER, SYMBOL_SDFSHADER, ShaderAttribute,
+    RASTER_SHADER, SYMBOL_ICON_SHADER, SYMBOL_SDFSHADER, SYMBOL_TEXT_AND_ICON_SHADER,
+    ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
     BACKGROUND_PATTERN_SHADER_TEXTURES, COLOR_RELIEF_SHADER_TEXTURES, FILL_PATTERN_SHADER_TEXTURES,
     HEATMAP_TEXTURE_SHADER_TEXTURES, HILLSHADE_PREPARE_SHADER_TEXTURES, HILLSHADE_SHADER_TEXTURES,
-    LINE_PATTERN_SHADER_TEXTURES, RASTER_SHADER_TEXTURES, SYMBOL_SDFSHADER_TEXTURES, ShaderTexture,
+    LINE_PATTERN_SHADER_TEXTURES, RASTER_SHADER_TEXTURES, SYMBOL_ICON_SHADER_TEXTURES,
+    SYMBOL_SDFSHADER_TEXTURES, SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES, ShaderTexture,
 };
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PATTERN_DRAWABLE_UBO, BACKGROUND_PATTERN_PROPS_UBO,
@@ -54,8 +56,8 @@ use tessella_emblema::device::{preferred, vertex_format};
 use tessella_emblema::shaders::{
     BACKGROUND_BODY, BACKGROUND_PATTERN_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY,
     FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY, FILL_PATTERN_BODY, HEATMAP_BODY, HEATMAP_TEXTURE_BODY,
-    HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_PATTERN_BODY, RASTER_BODY, SYMBOL_SDF_BODY,
-    module,
+    HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_PATTERN_BODY, RASTER_BODY, SYMBOL_ICON_BODY,
+    SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -259,14 +261,23 @@ fn glyph_atlas() -> Image {
 /// block's own and the perspective term is skipped -- the placement this leaves is
 /// `corner / 32 * font_scale`, and a font scale of 32 makes that the corner itself.
 fn symbol_drawable() -> Vec<u8> {
+    symbol_drawable_sized(32.0, 16.0, 16.0)
+}
+
+/// The same, with the size and the two atlas sizes chosen.
+///
+/// `symbol_text_and_icon` needs both: its font scale is `size / 24` unconditionally where the
+/// other two branch on `is_text_prop`, so reaching a font scale of 32 takes a size of 768; and its
+/// two atlases are different sizes, which is how a case can tell which one was read.
+fn symbol_drawable_sized(size: f32, texsize: f32, texsize_icon: f32) -> Vec<u8> {
     block(
         &SYMBOL_DRAWABLE_UBO,
         &[
             ("matrix", At::F(&CLIP)),
             ("label_plane_matrix", At::F(&CLIP)),
             ("coord_matrix", At::F(&CLIP)),
-            ("texsize", At::F(&[16.0, 16.0])),
-            ("texsize_icon", At::F(&[16.0, 16.0])),
+            ("texsize", At::F(&[texsize, texsize])),
+            ("texsize_icon", At::F(&[texsize_icon, texsize_icon])),
             // Not a text property, so the font scale is the size rather than the size over 24.
             ("is_text_prop", At::I(&[0])),
             ("rotate_symbol", At::I(&[0])),
@@ -274,9 +285,71 @@ fn symbol_drawable() -> Vec<u8> {
             ("is_size_zoom_constant", At::I(&[1])),
             ("is_size_feature_constant", At::I(&[1])),
             ("is_offset", At::I(&[1])),
-            ("size", At::F(&[32.0])),
+            ("size", At::F(&[size])),
+            // One, so a case giving its opacity two different endpoints lands on the second and
+            // the factor is under test rather than a no-op.
+            ("opacity_t", At::F(&[1.0])),
         ],
     )
+}
+
+/// The nine streams a text-and-icon vertex needs, with the glyph-or-sprite mark chosen.
+///
+/// `sized.x` carries the size doubled with the mark in its low bit, so an even value is a sprite
+/// and an odd one a glyph. There is no pixel offset: this family declares none.
+fn text_and_icon_streams(tex: u16, sized_x: u16) -> Vec<Vec<u8>> {
+    vec![
+        shorts(&[0, 0, -1, -1, 0, 0, 3, -1, 0, 0, -1, 3]),
+        ushorts(&[
+            tex, tex, sized_x, 0, tex, tex, sized_x, 0, tex, tex, sized_x, 0,
+        ]),
+        per_vertex(&[0.0, 0.0, 0.0], 3),
+        per_vertex(&[254.0], 3),
+        per_vertex(&packed_color([200, 100, 50, 128]), 3),
+        per_vertex(&packed_color([255, 0, 255, 255]), 3),
+        per_vertex(&[0.0, 0.5], 3),
+        per_vertex(&[0.0, 0.0], 3),
+        per_vertex(&[0.0, 0.0], 3),
+    ]
+}
+
+/// The four blocks every symbol case binds, with the drawable and the gamma chosen.
+fn symbol_blocks(drawable: Vec<u8>) -> Vec<Vec<u8>> {
+    vec![
+        drawable,
+        block(
+            &SYMBOL_TILE_PROPS_UBO,
+            &[
+                ("is_text", At::I(&[0])),
+                ("is_halo", At::I(&[0])),
+                ("gamma_scale", At::F(&[0.1])),
+            ],
+        ),
+        block(&SYMBOL_EVALUATED_PROPS_UBO, &[]),
+        block(
+            &GLOBAL_PAINT_PARAMS_UBO,
+            &[
+                ("camera_to_center_distance", At::F(&[1.0])),
+                ("symbol_fade_change", At::F(&[0.0])),
+                ("aspect_ratio", At::F(&[1.0])),
+                ("pixel_ratio", At::F(&[1.0])),
+            ],
+        ),
+    ]
+}
+
+/// A sprite sheet, whose texels differ in every channel and whose alpha is even.
+///
+/// Even, so a half opacity divides it exactly rather than landing on a half step.
+fn sprite_sheet(side: u32) -> Image {
+    Image::new(side, |x, y| {
+        [
+            u8::try_from(x * 16).unwrap_or(255),
+            u8::try_from(y * 8).unwrap_or(255),
+            128,
+            128,
+        ]
+    })
 }
 
 /// The ten streams a symbol-SDF vertex needs, with the corner and the glyph's texel chosen.
@@ -874,27 +947,7 @@ fn cases() -> Vec<Case> {
             attributes: &SYMBOL_SDFSHADER,
             body: SYMBOL_SDF_BODY,
             streams: symbol_streams(5),
-            uniforms: vec![
-                symbol_drawable(),
-                block(
-                    &SYMBOL_TILE_PROPS_UBO,
-                    &[
-                        ("is_text", At::I(&[0])),
-                        ("is_halo", At::I(&[0])),
-                        ("gamma_scale", At::F(&[0.1])),
-                    ],
-                ),
-                block(&SYMBOL_EVALUATED_PROPS_UBO, &[]),
-                block(
-                    &GLOBAL_PAINT_PARAMS_UBO,
-                    &[
-                        ("camera_to_center_distance", At::F(&[1.0])),
-                        ("symbol_fade_change", At::F(&[0.0])),
-                        ("aspect_ratio", At::F(&[1.0])),
-                        ("pixel_ratio", At::F(&[1.0])),
-                    ],
-                ),
-            ],
+            uniforms: symbol_blocks(symbol_drawable()),
             textures: &SYMBOL_SDFSHADER_TEXTURES,
             images: vec![glyph_atlas()],
             vertices: 3,
@@ -922,27 +975,7 @@ fn cases() -> Vec<Case> {
             attributes: &SYMBOL_SDFSHADER,
             body: SYMBOL_SDF_BODY,
             streams: symbol_streams(6),
-            uniforms: vec![
-                symbol_drawable(),
-                block(
-                    &SYMBOL_TILE_PROPS_UBO,
-                    &[
-                        ("is_text", At::I(&[0])),
-                        ("is_halo", At::I(&[0])),
-                        ("gamma_scale", At::F(&[0.1])),
-                    ],
-                ),
-                block(&SYMBOL_EVALUATED_PROPS_UBO, &[]),
-                block(
-                    &GLOBAL_PAINT_PARAMS_UBO,
-                    &[
-                        ("camera_to_center_distance", At::F(&[1.0])),
-                        ("symbol_fade_change", At::F(&[0.0])),
-                        ("aspect_ratio", At::F(&[1.0])),
-                        ("pixel_ratio", At::F(&[1.0])),
-                    ],
-                ),
-            ],
+            uniforms: symbol_blocks(symbol_drawable()),
             textures: &SYMBOL_SDFSHADER_TEXTURES,
             images: vec![glyph_atlas()],
             vertices: 3,
@@ -1422,6 +1455,108 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 6,
             expect: [32, 16, 64, 64],
+        },
+        // A symbol's icon: a sprite from a sheet, with no color of its own and no halo.
+        //
+        // The placement is the one the two SDF cases above already check, so what is new is the
+        // fragment: a premultiplied sprite scaled by the opacity and the fade. The coordinate is
+        // `tex / texsize` with no further arithmetic, which at 5 over 16 is texel 5 exactly.
+        //
+        //   sheet texel (5, 5) = (80, 40, 128, 128), times a half opacity and a fade of one
+        //   ->  (40, 20, 64, 64)
+        //
+        // Two of this family's own decisions are *not* reachable from this pixel, and both were
+        // real fixes: the minimum font scale in the spare half of the pixel offset, and that same
+        // offset's division by 16. Each moves the quad rather than the coordinate it samples, so
+        // a center pixel inside the quad reads the same texel either way. #15 pins both textually.
+        Case {
+            name: "symbol_icon",
+            blocks: vec![
+                &SYMBOL_DRAWABLE_UBO,
+                &SYMBOL_TILE_PROPS_UBO,
+                &SYMBOL_EVALUATED_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
+            attributes: &SYMBOL_ICON_SHADER,
+            body: SYMBOL_ICON_BODY,
+            streams: vec![
+                shorts(&[0, 0, -1, -1, 0, 0, 3, -1, 0, 0, -1, 3]),
+                ushorts(&[5, 5, 0, 0, 5, 5, 0, 0, 5, 5, 0, 0]),
+                shorts(&[0; 12]),
+                per_vertex(&[0.0, 0.0, 0.0], 3),
+                per_vertex(&[254.0], 3),
+                per_vertex(&[0.0, 0.5], 3),
+            ],
+            uniforms: symbol_blocks(symbol_drawable()),
+            textures: &SYMBOL_ICON_SHADER_TEXTURES,
+            images: vec![sprite_sheet(16)],
+            vertices: 3,
+            expect: [40, 20, 64, 64],
+        },
+        // One draw holding both, read at a vertex marked as a sprite.
+        //
+        // This family puts glyphs and inline images in one bucket and marks each vertex with the
+        // low bit of the first size byte. The two atlases are deliberately different sizes -- 32
+        // for the glyphs, 16 for the sprites -- so the coordinate says which sheet was read and
+        // not only which texel.
+        //
+        //   `sized.x` of 0 is even, so this vertex is a sprite
+        //   uv = 5 / texsize_icon of 16 = 0.3125  ->  sheet texel 5, (80, 40, 128, 128)
+        //   times a half opacity  ->  (40, 20, 64, 64)
+        //
+        // Together with the case below, this pair *is* the test of the mark: invert it and this
+        // one takes the glyph path at 5 / 32 and draws the fill color instead.
+        Case {
+            name: "both_as_icon",
+            blocks: vec![
+                &SYMBOL_DRAWABLE_UBO,
+                &SYMBOL_TILE_PROPS_UBO,
+                &SYMBOL_EVALUATED_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
+            attributes: &SYMBOL_TEXT_AND_ICON_SHADER,
+            body: SYMBOL_TEXT_AND_ICON_BODY,
+            streams: text_and_icon_streams(5, 0),
+            uniforms: symbol_blocks(symbol_drawable_sized(768.0, 32.0, 16.0)),
+            textures: &SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES,
+            images: vec![
+                Image::red(32, 32, |x, y| if x == 5 && y == 5 { 255 } else { 0 }),
+                sprite_sheet(16),
+            ],
+            vertices: 3,
+            expect: [40, 20, 64, 64],
+        },
+        // The same draw, read at a vertex marked as a glyph.
+        //
+        //   `sized.x` of 1 is odd, so this vertex is a glyph
+        //   uv = 5 / texsize of 32 = 0.15625  ->  glyph texel 5, whose field is solid
+        //   the ramp is [0.71719, 0.78281] and the field is 1.0, so the coverage is one
+        //   the fill color (200, 100, 50, 128) times a half opacity  ->  (100, 50, 25, 64)
+        //
+        // The fill's alpha is 128 rather than 255 so the half opacity divides it exactly.
+        //
+        // Invert the mark and this reads the sprite sheet at 5 / 16 instead -- which is the case
+        // above's answer, (40, 20, 64, 64). The two cases are each other's mutation, which is the
+        // only way one pixel can say a branch went the right way.
+        Case {
+            name: "both_as_glyph",
+            blocks: vec![
+                &SYMBOL_DRAWABLE_UBO,
+                &SYMBOL_TILE_PROPS_UBO,
+                &SYMBOL_EVALUATED_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
+            attributes: &SYMBOL_TEXT_AND_ICON_SHADER,
+            body: SYMBOL_TEXT_AND_ICON_BODY,
+            streams: text_and_icon_streams(5, 1),
+            uniforms: symbol_blocks(symbol_drawable_sized(768.0, 32.0, 16.0)),
+            textures: &SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES,
+            images: vec![
+                Image::red(32, 32, |x, y| if x == 5 && y == 5 { 255 } else { 0 }),
+                sprite_sheet(16),
+            ],
+            vertices: 3,
+            expect: [100, 50, 25, 64],
         },
         // A circle, read at its own center: the extrusion interpolates to zero there, which is
         // inside the fill and nowhere near the stroke. With no stroke width the stroke's own

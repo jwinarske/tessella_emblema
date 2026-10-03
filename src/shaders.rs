@@ -56,7 +56,12 @@ impl From<Unrepresentable> for Error {
 /// through the scaled formats, which are optional in Vulkan and absent on parts this targets. The
 /// conversion is then visible in the shader instead of being a property of a format that may not
 /// exist.
-const fn attribute_type(declared: AttributeDataType) -> Option<&'static str> {
+///
+/// Public because it is half a statement. `device::vertex_format` is the other half -- how the
+/// same bytes are fetched -- and the two have to agree about their count and their class. Neither
+/// can be checked against the other while one of them is private.
+#[must_use]
+pub const fn attribute_type(declared: AttributeDataType) -> Option<&'static str> {
     match declared {
         AttributeDataType::Byte | AttributeDataType::Short | AttributeDataType::Int => Some("i32"),
         AttributeDataType::UByte | AttributeDataType::UShort | AttributeDataType::UInt => {

@@ -59,7 +59,7 @@ use tessella_emblema::shaders::{
     HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_PATTERN_BODY, RASTER_BODY, SYMBOL_ICON_BODY,
     SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY, module,
 };
-use tessella_emblema::surface::Surface;
+use tessella_emblema::surface::{GLOBE_CAMERA_UBO, Surface};
 
 /// The target's edge, in pixels. Small: one pixel is read and the rest is margin.
 const SIDE: u32 = 32;
@@ -67,6 +67,12 @@ const SIDE: u32 = 32;
 /// A family, the inputs that make one pixel predictable, and that pixel.
 struct Case {
     name: &'static str,
+    /// Which surface the family is assembled against, and so where its vertices land.
+    ///
+    /// Every case but the globe one below is a plane. That is not a preference: a surface is only
+    /// observable through *where* geometry lands, and the families' own arithmetic is easier to
+    /// read off a surface that does nothing.
+    surface: Surface,
     blocks: Vec<&'static UboLayout>,
     attributes: &'static [ShaderAttribute],
     body: &'static str,
@@ -434,6 +440,7 @@ fn cases() -> Vec<Case> {
         // opacity runs nothing to one over the same factor, so a dropped opacity is black.
         Case {
             name: "fill",
+            surface: Surface::Plane,
             blocks: vec![&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
             attributes: &FILL_SHADER,
             body: FILL_BODY,
@@ -463,6 +470,7 @@ fn cases() -> Vec<Case> {
         // checked to arrive unpacked.
         Case {
             name: "background",
+            surface: Surface::Plane,
             blocks: vec![&BACKGROUND_DRAWABLE_UBO, &BACKGROUND_PROPS_UBO],
             attributes: &BACKGROUND_SHADER,
             body: BACKGROUND_BODY,
@@ -497,6 +505,7 @@ fn cases() -> Vec<Case> {
         // from its own vertex.
         Case {
             name: "fill_outline",
+            surface: Surface::Plane,
             blocks: vec![
                 &FILL_OUTLINE_DRAWABLE_UBO,
                 &FILL_EVALUATED_PROPS_UBO,
@@ -554,6 +563,7 @@ fn cases() -> Vec<Case> {
         // this reads (255, 230, 25).
         Case {
             name: "fill_extrusion",
+            surface: Surface::Plane,
             blocks: vec![&FILL_EXTRUSION_DRAWABLE_UBO, &FILL_EXTRUSION_PROPS_UBO],
             attributes: &FILL_EXTRUSION_SHADER,
             body: FILL_EXTRUSION_BODY,
@@ -604,6 +614,7 @@ fn cases() -> Vec<Case> {
         // a half the mix is symmetric and the swap is invisible.
         Case {
             name: "extrusion_dim",
+            surface: Surface::Plane,
             blocks: vec![&FILL_EXTRUSION_DRAWABLE_UBO, &FILL_EXTRUSION_PROPS_UBO],
             attributes: &FILL_EXTRUSION_SHADER,
             body: FILL_EXTRUSION_BODY,
@@ -669,6 +680,7 @@ fn cases() -> Vec<Case> {
         // -- and a body that skipped it reads (16, 8, 32, 64).
         Case {
             name: "raster",
+            surface: Surface::Plane,
             blocks: vec![&RASTER_DRAWABLE_UBO, &RASTER_EVALUATED_PROPS_UBO],
             attributes: &RASTER_SHADER,
             body: RASTER_BODY,
@@ -733,6 +745,7 @@ fn cases() -> Vec<Case> {
         // the two cannot be confused with each other or with the neutral case above.
         Case {
             name: "raster_adjusted",
+            surface: Surface::Plane,
             blocks: vec![&RASTER_DRAWABLE_UBO, &RASTER_EVALUATED_PROPS_UBO],
             attributes: &RASTER_SHADER,
             body: RASTER_BODY,
@@ -793,6 +806,7 @@ fn cases() -> Vec<Case> {
         //     0.81176 the transpose reads (2, 2), which is magenta.
         Case {
             name: "heatmap_texture",
+            surface: Surface::Plane,
             blocks: vec![&HEATMAP_TEXTURE_PROPS_UBO, &GLOBAL_PAINT_PARAMS_UBO],
             attributes: &HEATMAP_TEXTURE_SHADER,
             body: HEATMAP_TEXTURE_BODY,
@@ -859,6 +873,7 @@ fn cases() -> Vec<Case> {
         // filter and not something a pixel here can say.
         Case {
             name: "color_relief",
+            surface: Surface::Plane,
             blocks: vec![
                 &COLOR_RELIEF_DRAWABLE_UBO,
                 &COLOR_RELIEF_TILE_PROPS_UBO,
@@ -938,6 +953,7 @@ fn cases() -> Vec<Case> {
         // pinned in `tests/shaders.rs` instead.
         Case {
             name: "symbol_sdf",
+            surface: Surface::Plane,
             blocks: vec![
                 &SYMBOL_DRAWABLE_UBO,
                 &SYMBOL_TILE_PROPS_UBO,
@@ -966,6 +982,7 @@ fn cases() -> Vec<Case> {
         // separates two mutations: the channel and the edge.
         Case {
             name: "symbol_below",
+            surface: Surface::Plane,
             blocks: vec![
                 &SYMBOL_DRAWABLE_UBO,
                 &SYMBOL_TILE_PROPS_UBO,
@@ -999,6 +1016,7 @@ fn cases() -> Vec<Case> {
         // everybody ships once -- would read nought either way. Here it reads 111 instead of 144.
         Case {
             name: "hillshade_prep",
+            surface: Surface::Plane,
             blocks: vec![
                 &HILLSHADE_PREPARE_DRAWABLE_UBO,
                 &HILLSHADE_PREPARE_TILE_PROPS_UBO,
@@ -1053,6 +1071,7 @@ fn cases() -> Vec<Case> {
         // Texel (1, 1) is painted differently, so dropping the body's `v` flip reads it instead.
         Case {
             name: "hillshade",
+            surface: Surface::Plane,
             blocks: vec![
                 &HILLSHADE_DRAWABLE_UBO,
                 &HILLSHADE_TILE_PROPS_UBO,
@@ -1144,6 +1163,7 @@ fn cases() -> Vec<Case> {
         // additively and a zero there would still be summed.
         Case {
             name: "heatmap",
+            surface: Surface::Plane,
             blocks: vec![&HEATMAP_DRAWABLE_UBO, &HEATMAP_EVALUATED_PROPS_UBO],
             attributes: &HEATMAP_SHADER,
             body: HEATMAP_BODY,
@@ -1213,6 +1233,7 @@ fn cases() -> Vec<Case> {
         // the other way reads texel 14.
         Case {
             name: "background_pattern",
+            surface: Surface::Plane,
             blocks: vec![
                 &BACKGROUND_PATTERN_DRAWABLE_UBO,
                 &BACKGROUND_PATTERN_PROPS_UBO,
@@ -1287,6 +1308,7 @@ fn cases() -> Vec<Case> {
         // sprites' corners is a rectangle containing neither.
         Case {
             name: "fill_pattern",
+            surface: Surface::Plane,
             blocks: vec![
                 &FILL_PATTERN_DRAWABLE_UBO,
                 &FILL_PATTERN_TILE_PROPS_UBO,
@@ -1382,6 +1404,7 @@ fn cases() -> Vec<Case> {
         // cover both.
         Case {
             name: "line_pattern",
+            surface: Surface::Plane,
             blocks: vec![
                 &LINE_PATTERN_DRAWABLE_UBO,
                 &LINE_PATTERN_TILE_PROPS_UBO,
@@ -1471,6 +1494,7 @@ fn cases() -> Vec<Case> {
         // a center pixel inside the quad reads the same texel either way. #15 pins both textually.
         Case {
             name: "symbol_icon",
+            surface: Surface::Plane,
             blocks: vec![
                 &SYMBOL_DRAWABLE_UBO,
                 &SYMBOL_TILE_PROPS_UBO,
@@ -1508,6 +1532,7 @@ fn cases() -> Vec<Case> {
         // one takes the glyph path at 5 / 32 and draws the fill color instead.
         Case {
             name: "both_as_icon",
+            surface: Surface::Plane,
             blocks: vec![
                 &SYMBOL_DRAWABLE_UBO,
                 &SYMBOL_TILE_PROPS_UBO,
@@ -1540,6 +1565,7 @@ fn cases() -> Vec<Case> {
         // only way one pixel can say a branch went the right way.
         Case {
             name: "both_as_glyph",
+            surface: Surface::Plane,
             blocks: vec![
                 &SYMBOL_DRAWABLE_UBO,
                 &SYMBOL_TILE_PROPS_UBO,
@@ -1558,6 +1584,97 @@ fn cases() -> Vec<Case> {
             vertices: 3,
             expect: [100, 50, 25, 64],
         },
+        // A fill bent onto a sphere, which is the first case on any surface but the plane.
+        //
+        // A surface is observable only through *where* geometry lands, so the assertion is
+        // coverage: the bend has to put this triangle over the pixel being read. That is weaker
+        // than the color assertions above and it took some care to make it mean anything.
+        //
+        // # Why the patch is not at the middle of the world
+        //
+        // At mercator (0.5, 0.5) the latitude and the longitude are both nought, and the bend is
+        // locally a scaled identity -- so a small patch there cannot be told from its own
+        // linearization, and a large one covers the whole target whatever the bend does. Worse,
+        // the point is a symmetry of three plausible mistakes at once: negating the sphere's `y`,
+        // dropping the longitude's 180, and skipping the trig entirely all land a patch centered
+        // there in the same place.
+        //
+        // So the patch sits at (0.6, 0.3) instead, where the latitude is -58.4 degrees and the
+        // longitude 36. The sphere point there is (0.309508, -0.850134), and the globe matrix
+        // scales by ten and translates that point to the origin -- which is what brings a patch
+        // from the southern Indian Ocean onto a 32-pixel target.
+        //
+        //   the triangle bends to clip (-0.21373, 0.08481), (0.29494, 0.08481), (0.10740, -0.28317)
+        //   and the center pixel at (0.03125, 0.03125) is inside it
+        //
+        // Five wrong bends were checked against that pixel and none covers it: the latitude
+        // without its doubling and offset lands the patch at (-1.4, 1.1), the sphere's `y`
+        // unnegated at (0.1, -17), the longitude without its 180 at (-6.3, 0.1), no trig at all
+        // at (-2.1, -10.6), and a latitude offset without the doubling at (2.3, -11.2).
+        //
+        // Three things this does *not* check, and cannot from here:
+        //
+        //   * **The bend's curvature.** Over a patch small enough to be a coverage test the bend
+        //     is linear to well under a pixel. The curvature is what `displace` exists for and
+        //     what the anchored surface approximates, and neither has a pixel.
+        //   * **The clamp on the latitude.** This patch sits at 0.3 of the way down the world,
+        //     nowhere near the edge, so clamping or not gives the same answer. It is there for a
+        //     tile that spans the pole, which is a configuration a 32-pixel target cannot hold.
+        //   * **The depth offset.** `merc.z` reaches `clip.z` and this case has no depth test, so
+        //     the term is computed and ignored.
+        Case {
+            name: "fill_on_globe",
+            surface: Surface::Globe,
+            blocks: vec![&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
+            attributes: &FILL_SHADER,
+            body: FILL_BODY,
+            streams: vec![
+                shorts(&COVERING),
+                per_vertex(&packed_color([0, 255, 255, 255]), 3),
+                per_vertex(&[1.0, 1.0], 3),
+            ],
+            uniforms: vec![
+                block(
+                    &FILL_DRAWABLE_UBO,
+                    &[
+                        // Tile units to mercator: a span of 0.005 about (0.6, 0.3).
+                        (
+                            "matrix",
+                            At::F(&[
+                                0.005, 0.0, 0.0, 0.0, //
+                                0.0, 0.005, 0.0, 0.0, //
+                                0.0, 0.0, 0.0, 0.0, //
+                                0.6, 0.3, 0.0, 1.0,
+                            ]),
+                        ),
+                        ("color_t", At::F(&[0.0])),
+                        ("opacity_t", At::F(&[0.0])),
+                    ],
+                ),
+                block(&FILL_EVALUATED_PROPS_UBO, &[]),
+                // The surface's own block, which binds after the family's -- the order `module`
+                // numbers them in.
+                block(
+                    &GLOBE_CAMERA_UBO,
+                    &[(
+                        // Ten times the unit sphere, with the patch's own point brought to the
+                        // origin. The third column is nought: a sphere's `z` is depth this case
+                        // does not test, and leaving it in would push the patch out of clip.
+                        "globe_matrix",
+                        At::F(&[
+                            10.0, 0.0, 0.0, 0.0, //
+                            0.0, 10.0, 0.0, 0.0, //
+                            0.0, 0.0, 0.0, 0.0, //
+                            -3.095_077, 8.501_343, 0.0, 1.0,
+                        ]),
+                    )],
+                ),
+            ],
+            textures: &[],
+            images: Vec::new(),
+            vertices: 3,
+            expect: [0, 255, 255, 255],
+        },
         // A circle, read at its own center: the extrusion interpolates to zero there, which is
         // inside the fill and nowhere near the stroke. With no stroke width the stroke's own
         // selection is skipped, so what is left is the fill color times its opacity.
@@ -1566,6 +1683,7 @@ fn cases() -> Vec<Case> {
         // units out, which covers the viewport.
         Case {
             name: "circle",
+            surface: Surface::Plane,
             blocks: vec![
                 &CIRCLE_DRAWABLE_UBO,
                 &CIRCLE_EVALUATED_PROPS_UBO,
@@ -1954,7 +2072,7 @@ impl Gpu {
     /// Draws one case and reads its pixel.
     fn run(&self, case: &Case) -> Result<[u8; 4], String> {
         let source = module(
-            Surface::Plane,
+            case.surface,
             &case.blocks,
             case.attributes,
             case.textures,

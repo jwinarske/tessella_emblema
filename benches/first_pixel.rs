@@ -27,12 +27,12 @@
 use ash::vk;
 use tessella_capture_abi::generated::shader_attributes::{
     BACKGROUND_PATTERN_SHADER, BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER,
-    FILL_EXTRUSION_SHADER, FILL_OUTLINE_SHADER, FILL_SHADER, HEATMAP_SHADER,
+    FILL_EXTRUSION_SHADER, FILL_OUTLINE_SHADER, FILL_PATTERN_SHADER, FILL_SHADER, HEATMAP_SHADER,
     HEATMAP_TEXTURE_SHADER, HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, RASTER_SHADER,
     SYMBOL_SDFSHADER, ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
-    BACKGROUND_PATTERN_SHADER_TEXTURES, COLOR_RELIEF_SHADER_TEXTURES,
+    BACKGROUND_PATTERN_SHADER_TEXTURES, COLOR_RELIEF_SHADER_TEXTURES, FILL_PATTERN_SHADER_TEXTURES,
     HEATMAP_TEXTURE_SHADER_TEXTURES, HILLSHADE_PREPARE_SHADER_TEXTURES, HILLSHADE_SHADER_TEXTURES,
     RASTER_SHADER_TEXTURES, SYMBOL_SDFSHADER_TEXTURES, ShaderTexture,
 };
@@ -41,9 +41,10 @@ use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
     COLOR_RELIEF_DRAWABLE_UBO, COLOR_RELIEF_EVALUATED_PROPS_UBO, COLOR_RELIEF_TILE_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
-    FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, GLOBAL_PAINT_PARAMS_UBO,
-    HEATMAP_DRAWABLE_UBO, HEATMAP_EVALUATED_PROPS_UBO, HEATMAP_TEXTURE_PROPS_UBO,
-    HILLSHADE_DRAWABLE_UBO, HILLSHADE_EVALUATED_PROPS_UBO, HILLSHADE_PREPARE_DRAWABLE_UBO,
+    FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, FILL_PATTERN_DRAWABLE_UBO,
+    FILL_PATTERN_TILE_PROPS_UBO, GLOBAL_PAINT_PARAMS_UBO, HEATMAP_DRAWABLE_UBO,
+    HEATMAP_EVALUATED_PROPS_UBO, HEATMAP_TEXTURE_PROPS_UBO, HILLSHADE_DRAWABLE_UBO,
+    HILLSHADE_EVALUATED_PROPS_UBO, HILLSHADE_PREPARE_DRAWABLE_UBO,
     HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO, RASTER_DRAWABLE_UBO,
     RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO, SYMBOL_EVALUATED_PROPS_UBO,
     SYMBOL_TILE_PROPS_UBO, UboLayout,
@@ -51,8 +52,8 @@ use tessella_capture_abi::generated::ubo_layouts::{
 use tessella_emblema::device::{preferred, vertex_format};
 use tessella_emblema::shaders::{
     BACKGROUND_BODY, BACKGROUND_PATTERN_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY,
-    FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY, HEATMAP_BODY, HEATMAP_TEXTURE_BODY, HILLSHADE_BODY,
-    HILLSHADE_PREPARE_BODY, RASTER_BODY, SYMBOL_SDF_BODY, module,
+    FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY, FILL_PATTERN_BODY, HEATMAP_BODY, HEATMAP_TEXTURE_BODY,
+    HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, RASTER_BODY, SYMBOL_SDF_BODY, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -1216,6 +1217,83 @@ fn cases() -> Vec<Case> {
                 ),
             ],
             textures: &BACKGROUND_PATTERN_SHADER_TEXTURES,
+            images: vec![Image::new(16, |x, y| {
+                [
+                    u8::try_from(x * 16).unwrap_or(255),
+                    u8::try_from(y * 8).unwrap_or(255),
+                    128,
+                    128,
+                ]
+            })],
+            vertices: 3,
+            expect: [48, 24, 64, 64],
+        },
+        // A tiled fill, which shares `pattern_pos` with the background above and differs in
+        // where its pattern's size comes from. A background is handed one; a fill derives it from
+        // the sprite's own extent in the atlas, divided twice:
+        //
+        //   the sprite is (0, 0) to (8, 8), so its extent is 8
+        //   display size = 8 / a pixel ratio of 2   = 4    (atlas pixels to screen pixels)
+        //   pattern size = 4 * a from-scale of 2.5  = 10   (screen pixels to tile units)
+        //
+        // Ten is the same size the background case uses, with the same anchor and the same tile
+        // factor of 500, so the pattern coordinate and the texel are the same -- which is the
+        // point. What is new here is the two divisions, and each one is separated:
+        //
+        //   clean                    ->  texel 6
+        //   pixel ratio dropped      ->  size 20, texel 7
+        //   from-scale dropped       ->  size 4, texel 5
+        //   tile factor dropped      ->  texel 2
+        //   sprite taken from `to`   ->  texel 14
+        //
+        // The sprite corners arrive as attributes rather than uniforms, because `pattern-from` is
+        // per feature -- and they are read straight through, since `FILL_PATTERN_DRAWABLE_UBO`'s
+        // `pattern_from_t` is a factor mbgl declares and never reads. Halfway between two
+        // sprites' corners is a rectangle containing neither.
+        Case {
+            name: "fill_pattern",
+            blocks: vec![
+                &FILL_PATTERN_DRAWABLE_UBO,
+                &FILL_PATTERN_TILE_PROPS_UBO,
+                &FILL_EVALUATED_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
+            attributes: &FILL_PATTERN_SHADER,
+            body: FILL_PATTERN_BODY,
+            streams: vec![
+                shorts(&COVERING),
+                ushorts(&[0, 0, 8, 8, 0, 0, 8, 8, 0, 0, 8, 8]),
+                ushorts(&[8, 8, 16, 16, 8, 8, 16, 16, 8, 8, 16, 16]),
+                // Nought to a half over a factor of one, so the opacity is a half and both the
+                // endpoint order and the factor are under test.
+                per_vertex(&[0.0, 0.5], 3),
+            ],
+            uniforms: vec![
+                block(
+                    &FILL_PATTERN_DRAWABLE_UBO,
+                    &[
+                        ("matrix", At::F(&CLIP)),
+                        ("pixel_coord_upper", At::F(&[1001.0, 1001.0])),
+                        ("pixel_coord_lower", At::F(&[7.0, 7.0])),
+                        ("tile_ratio", At::F(&[500.0])),
+                        ("opacity_t", At::F(&[1.0])),
+                    ],
+                ),
+                block(
+                    &FILL_PATTERN_TILE_PROPS_UBO,
+                    &[("texsize", At::F(&[16.0, 16.0]))],
+                ),
+                block(
+                    &FILL_EVALUATED_PROPS_UBO,
+                    &[
+                        ("fade", At::F(&[0.0])),
+                        ("from_scale", At::F(&[2.5])),
+                        ("to_scale", At::F(&[2.5])),
+                    ],
+                ),
+                block(&GLOBAL_PAINT_PARAMS_UBO, &[("pixel_ratio", At::F(&[2.0]))]),
+            ],
+            textures: &FILL_PATTERN_SHADER_TEXTURES,
             images: vec![Image::new(16, |x, y| {
                 [
                     u8::try_from(x * 16).unwrap_or(255),

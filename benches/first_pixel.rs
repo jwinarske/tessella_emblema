@@ -26,22 +26,24 @@
 
 use ash::vk;
 use tessella_capture_abi::generated::shader_attributes::{
-    BACKGROUND_SHADER, CIRCLE_SHADER, FILL_EXTRUSION_SHADER, FILL_OUTLINE_SHADER, FILL_SHADER,
-    HEATMAP_TEXTURE_SHADER, RASTER_SHADER, ShaderAttribute,
+    BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER, FILL_EXTRUSION_SHADER,
+    FILL_OUTLINE_SHADER, FILL_SHADER, HEATMAP_TEXTURE_SHADER, RASTER_SHADER, ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
-    HEATMAP_TEXTURE_SHADER_TEXTURES, RASTER_SHADER_TEXTURES, ShaderTexture,
+    COLOR_RELIEF_SHADER_TEXTURES, HEATMAP_TEXTURE_SHADER_TEXTURES, RASTER_SHADER_TEXTURES,
+    ShaderTexture,
 };
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
+    COLOR_RELIEF_DRAWABLE_UBO, COLOR_RELIEF_EVALUATED_PROPS_UBO, COLOR_RELIEF_TILE_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
     FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, GLOBAL_PAINT_PARAMS_UBO,
     HEATMAP_TEXTURE_PROPS_UBO, RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, UboLayout,
 };
 use tessella_emblema::device::{preferred, vertex_format};
 use tessella_emblema::shaders::{
-    BACKGROUND_BODY, CIRCLE_BODY, FILL_BODY, FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY,
-    HEATMAP_TEXTURE_BODY, RASTER_BODY, module,
+    BACKGROUND_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY, FILL_EXTRUSION_BODY,
+    FILL_OUTLINE_BODY, HEATMAP_TEXTURE_BODY, RASTER_BODY, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -66,7 +68,7 @@ struct Case {
     expect: [u8; 4],
 }
 
-/// An RGBA image the probe samples.
+/// An image the probe samples.
 ///
 /// Small, with every texel distinct where a case needs to tell which one was read. A ramp is one
 /// of these too -- wide and a few rows tall rather than square, because a ramp's second coordinate
@@ -74,12 +76,54 @@ struct Case {
 struct Image {
     width: u32,
     height: u32,
-    /// `width * height` texels, four bytes each.
-    texels: Vec<u8>,
+    texels: Texels,
+}
+
+/// What an image holds, which decides its format.
+///
+/// Three, because the producer uploads three. mbgl's `Texture2D::setFormat` takes a pixel type
+/// *and* a channel type, and the families here use three of the combinations: bytes in four
+/// channels for a sheet or a tile, bytes in one for a glyph atlas, and floats in four for a color
+/// relief's elevation stops -- which are meters over a range that spans the planet, where eight
+/// bits would be a forty-meter step.
+enum Texels {
+    /// `R8G8B8A8_UNORM`: a sheet, a tile, a color ramp.
+    Rgba(Vec<u8>),
+    /// `R8_UNORM`: one channel, which is what a glyph atlas is.
+    Red(Vec<u8>),
+    /// `R32G32B32A32_SFLOAT`: four floats a texel, which is `setFormat(RGBA, Float)`.
+    Floats(Vec<f32>),
+}
+
+impl Texels {
+    fn format(&self) -> vk::Format {
+        match self {
+            Self::Rgba(_) => vk::Format::R8G8B8A8_UNORM,
+            Self::Red(_) => vk::Format::R8_UNORM,
+            Self::Floats(_) => vk::Format::R32G32B32A32_SFLOAT,
+        }
+    }
+
+    /// Bytes a texel, which is what a row's stride is counted in.
+    fn width(&self) -> usize {
+        match self {
+            Self::Rgba(_) => 4,
+            Self::Red(_) => 1,
+            Self::Floats(_) => 16,
+        }
+    }
+
+    /// The bytes to write, little-endian, as the producer has them.
+    fn bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Rgba(bytes) | Self::Red(bytes) => bytes.clone(),
+            Self::Floats(values) => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        }
+    }
 }
 
 impl Image {
-    /// A square image whose texel `(x, y)` is `paint(x, y)`.
+    /// A square `R8G8B8A8_UNORM` image whose texel `(x, y)` is `paint(x, y)`.
     fn new(side: u32, paint: impl Fn(u32, u32) -> [u8; 4]) -> Self {
         Self::sized(side, side, paint)
     }
@@ -95,7 +139,32 @@ impl Image {
         Self {
             width,
             height,
-            texels,
+            texels: Texels::Rgba(texels),
+        }
+    }
+
+    /// A row of four-float texels, which is how a color relief's elevation stops arrive.
+    fn floats(values: &[[f32; 4]]) -> Self {
+        Self {
+            width: u32::try_from(values.len()).unwrap_or(1),
+            height: 1,
+            texels: Texels::Floats(values.iter().flatten().copied().collect()),
+        }
+    }
+
+    /// One byte a texel, which is how a glyph atlas arrives.
+    #[allow(dead_code)]
+    fn red(width: u32, height: u32, paint: impl Fn(u32, u32) -> u8) -> Self {
+        let mut texels = Vec::with_capacity((width * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                texels.push(paint(x, y));
+            }
+        }
+        Self {
+            width,
+            height,
+            texels: Texels::Red(texels),
         }
     }
 }
@@ -605,6 +674,90 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             expect: [128, 64, 0, 128],
+        },
+        // A color relief: an elevation decoded from a DEM, then looked up in a ramp by a binary
+        // search. The first case with three textures, and the first to read a float one.
+        //
+        //   uv          = (2458 / 8192) * (4 - 2) / 4 + 1 / 4 = 0.40002  ->  DEM texel (1, 1)
+        //   elevation   = dot((100, 40, 0, -1), (1, 0.5, 0, 10))         = 110 meters
+        //   the search  = 0..3, m = 1 (50), 110 >= 50 so l = 1
+        //                       m = 2 (100), 110 >= 100 so l = 2  ->  brackets 2..3
+        //   t           = (110 - 100) / (200 - 100)                      = 0.1
+        //   mix(stop 2, stop 3, 0.1) * a half opacity  ->  (10, 90, 55, 128)
+        //
+        // The stops are *floats*, four to a texel. That is not a choice here: a stop is meters
+        // over a range that spans the planet, so eight bits across it would be a forty-meter step
+        // and a style whose stops are ten apart would collapse into one. mbgl says the same in a
+        // line -- `setFormat(TexturePixelType::RGBA, TextureChannelDataType::Float)` -- and
+        // tessella's `whole_float` is the producer's half of it.
+        //
+        // Three stops rather than two bracketing values, so the search has somewhere to go wrong:
+        // an elevation of 110 against stops at 0, 50, 100 and 200 takes the upper branch twice,
+        // and a search that took either the other way brackets 1..2 and draws (0, 100, 50).
+        //
+        // Not under test here: the half-texel offset in `(index + 0.5) / stops`. This probe
+        // samples `NEAREST`, and with four stops every index lands on its own texel with or
+        // without the half -- 0.125 and 0.000 are both texel nought, 0.875 and 0.750 both texel
+        // three. The offset is load-bearing only under a `LINEAR` sampler, where dropping it would
+        // blend each stop with its neighbor, so whether it matters is the producer's choice of
+        // filter and not something a pixel here can say.
+        Case {
+            name: "color_relief",
+            blocks: vec![
+                &COLOR_RELIEF_DRAWABLE_UBO,
+                &COLOR_RELIEF_TILE_PROPS_UBO,
+                &COLOR_RELIEF_EVALUATED_PROPS_UBO,
+            ],
+            attributes: &COLOR_RELIEF_SHADER,
+            body: COLOR_RELIEF_BODY,
+            streams: vec![
+                shorts(&COVERING),
+                shorts(&[2458, 2458, 2458, 2458, 2458, 2458]),
+            ],
+            uniforms: vec![
+                block(&COLOR_RELIEF_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
+                block(
+                    &COLOR_RELIEF_TILE_PROPS_UBO,
+                    &[
+                        // Meters from the texel, with the alpha term as the offset: the body dots
+                        // `(rgb, -1)` with this, so the fourth component is subtracted.
+                        ("unpack", At::F(&[1.0, 0.5, 0.0, 10.0])),
+                        ("dimension", At::F(&[4.0, 4.0])),
+                        ("color_ramp_size", At::I(&[4])),
+                    ],
+                ),
+                block(
+                    &COLOR_RELIEF_EVALUATED_PROPS_UBO,
+                    &[("opacity", At::F(&[0.5]))],
+                ),
+            ],
+            textures: &COLOR_RELIEF_SHADER_TEXTURES,
+            images: vec![
+                // The DEM. Red and green both carry signal, so the unpack's first two weights are
+                // both under test; blue is zero because its weight is.
+                Image::new(4, |x, y| {
+                    [
+                        u8::try_from(x * 100).unwrap_or(255),
+                        u8::try_from(y * 40).unwrap_or(255),
+                        0,
+                        255,
+                    ]
+                }),
+                Image::floats(&[
+                    [0.0, 0.0, 0.0, 0.0],
+                    [50.0, 0.0, 0.0, 0.0],
+                    [100.0, 0.0, 0.0, 0.0],
+                    [200.0, 0.0, 0.0, 0.0],
+                ]),
+                Image::sized(4, 1, |x, _| match x {
+                    0 => [255, 255, 255, 255],
+                    1 => [255, 255, 0, 255],
+                    2 => [0, 200, 100, 255],
+                    _ => [200, 0, 200, 255],
+                }),
+            ],
+            vertices: 3,
+            expect: [10, 90, 55, 128],
         },
         // A circle, read at its own center: the extrusion interpolates to zero there, which is
         // inside the fill and nowhere near the stroke. With no stroke width the stroke's own
@@ -1557,7 +1710,7 @@ impl<'a> Held<'a> {
                 gpu.device.create_image(
                     &vk::ImageCreateInfo::default()
                         .image_type(vk::ImageType::TYPE_2D)
-                        .format(vk::Format::R8G8B8A8_UNORM)
+                        .format(source.texels.format())
                         .extent(vk::Extent3D {
                             width: source.width,
                             height: source.height,
@@ -1611,9 +1764,10 @@ impl<'a> Held<'a> {
             }
             .map_err(|why| format!("image {index} not mapped: {why}"))?
             .cast::<u8>();
-            let stride = (source.width * 4) as usize;
+            let bytes = source.texels.bytes();
+            let stride = source.width as usize * source.texels.width();
             for row in 0..source.height as usize {
-                let from = &source.texels[row * stride..(row + 1) * stride];
+                let from = &bytes[row * stride..(row + 1) * stride];
                 let at = layout.offset as usize + row * layout.row_pitch as usize;
                 unsafe {
                     std::ptr::copy_nonoverlapping(from.as_ptr(), mapped.add(at), stride);
@@ -1626,7 +1780,11 @@ impl<'a> Held<'a> {
                     &vk::ImageViewCreateInfo::default()
                         .image(image)
                         .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(vk::Format::R8G8B8A8_UNORM)
+                        // The identity component mapping, which is the default and what
+                        // `SYMBOL_SDF_BODY` requires of the producer: it reads a one-channel atlas
+                        // from `.r`, where mbgl's own backend swizzles red into alpha and reads
+                        // `.a`. The two have to agree and nothing but a pixel says whether they do.
+                        .format(source.texels.format())
                         .subresource_range(
                             vk::ImageSubresourceRange::default()
                                 .aspect_mask(vk::ImageAspectFlags::COLOR)

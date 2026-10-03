@@ -10,11 +10,11 @@ use tessella_capture_abi::generated::mbgl_enums::AttributeDataType;
 use tessella_capture_abi::generated::shader_attributes::{
     BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER, FILL_EXTRUSION_SHADER,
     FILL_OUTLINE_SHADER, FILL_SHADER, LINE_SHADER, RASTER_SHADER, SYMBOL_ICON_SHADER,
-    SYMBOL_SDFSHADER, ShaderAttribute,
+    SYMBOL_SDFSHADER, SYMBOL_TEXT_AND_ICON_SHADER, ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
     COLOR_RELIEF_SHADER_TEXTURES, RASTER_SHADER_TEXTURES, SYMBOL_ICON_SHADER_TEXTURES,
-    SYMBOL_SDFSHADER_TEXTURES, ShaderTexture,
+    SYMBOL_SDFSHADER_TEXTURES, SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES, ShaderTexture,
 };
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
@@ -26,8 +26,8 @@ use tessella_capture_abi::generated::ubo_layouts::{
 };
 use tessella_emblema::shaders::{
     BACKGROUND_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY, FILL_EXTRUSION_BODY,
-    FILL_OUTLINE_BODY, LINE_BODY, RASTER_BODY, SYMBOL_ICON_BODY, SYMBOL_SDF_BODY, attribute_name,
-    module,
+    FILL_OUTLINE_BODY, LINE_BODY, RASTER_BODY, SYMBOL_ICON_BODY, SYMBOL_SDF_BODY,
+    SYMBOL_TEXT_AND_ICON_BODY, attribute_name, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -170,6 +170,20 @@ fn families() -> Vec<Family> {
             attributes: &SYMBOL_SDFSHADER,
             textures: &SYMBOL_SDFSHADER_TEXTURES,
             body: SYMBOL_SDF_BODY,
+            surfaces: all,
+            height: false,
+        },
+        Family {
+            name: "symbol_text_and_icon",
+            blocks: vec![
+                &SYMBOL_DRAWABLE_UBO,
+                &SYMBOL_TILE_PROPS_UBO,
+                &SYMBOL_EVALUATED_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
+            attributes: &SYMBOL_TEXT_AND_ICON_SHADER,
+            textures: &SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES,
+            body: SYMBOL_TEXT_AND_ICON_BODY,
             surfaces: all,
             height: false,
         },
@@ -347,6 +361,66 @@ fn the_symbol_icon_keeps_its_placement_decisions() {
     assert!(
         source.contains("+ pixel_offset / 16.0;"),
         "the icon's pixel offset is not in sixteenths"
+    );
+}
+
+/// The text-and-icon family keeps the five decisions that draw the wrong sheet convincingly.
+///
+/// * **The mark is the low bit of the first size byte**, and `is_sdf == 0.0` is the *icon*. The
+///   sense inverted, every glyph samples the sprite sheet and every sprite the glyph atlas -- both
+///   with coordinates divided by the other's dimensions.
+/// * **The texture size is chosen per vertex**, because the two atlases are different sizes and
+///   one draw reads both.
+/// * **`is_icon` interpolates flat.** All four corners of a quad carry the same mark, so a
+///   smooth-interpolated integer would agree anyway on well-formed geometry -- and silently
+///   disagree on the diagonal of anything else.
+/// * **The font scale has no text branch.** `symbol_icon` and `symbol_sdf` both compute
+///   `is_text_prop ? size / 24.0 : size`; here every vertex belongs to a text label.
+/// * **There is no pixel offset.** This family declares none, so a placement copied from
+///   `symbol_icon` would name an attribute that does not arrive.
+#[test]
+fn the_text_and_icon_keeps_its_sheet_decisions() {
+    let both = families()
+        .into_iter()
+        .find(|family| family.name == "symbol_text_and_icon")
+        .expect("text and icon is in the matrix");
+    let source = module(
+        Surface::Plane,
+        &both.blocks,
+        both.attributes,
+        both.textures,
+        both.body,
+    )
+    .expect("assembles");
+
+    assert!(
+        source.contains("let is_sdf = sized.x - 2.0 * smallest;")
+            && source.contains("let is_icon = is_sdf == 0.0;"),
+        "the glyph-or-sprite mark is not the low bit, or its sense is reversed:\n{source}"
+    );
+    assert!(
+        source
+            .contains("out.tex = tex / select(drawable.texsize, drawable.texsize_icon, is_icon);"),
+        "the two atlases do not each divide by their own size"
+    );
+    assert!(
+        source.contains("@location(1) @interpolate(flat) is_icon: u32,"),
+        "the mark does not interpolate flat"
+    );
+    assert!(
+        source.contains("let font_scale = size / 24.0;")
+            && !source.contains("if drawable.is_text_prop != 0 {"),
+        "the font scale branches on the text property, which this family does not"
+    );
+    assert!(
+        !source.contains("symbol_pixel_offset"),
+        "the placement reads a pixel offset this family does not declare"
+    );
+    assert!(
+        source.contains(
+            "let sprite = textureSample(symbol_image_icon, symbol_image_icon_sampler, in.tex);"
+        ),
+        "the icon half does not read the second atlas"
     );
 }
 
@@ -978,7 +1052,7 @@ fn every_family_on_every_surface_compiles() {
         }
     }
     assert_eq!(
-        pairs, 35,
+        pairs, 39,
         "the matrix grew or shrank; look at the new pairs"
     );
 }

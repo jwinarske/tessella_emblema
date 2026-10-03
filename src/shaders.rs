@@ -1239,6 +1239,266 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
 }
 ";
 
+/// The hillshade-prepare family's body: a DEM in, a slope field out.
+///
+/// The first family that draws into a texture rather than onto the map. A Sobel kernel over nine
+/// DEM samples gives the slope at each pixel, and that is what [`HILLSHADE_BODY`] shades -- once
+/// per tile instead of once per frame, which is the whole reason for the two passes.
+///
+/// # No surface
+///
+/// mbgl's other shaders end their vertex stage with `applySurfaceTransform()`; this one writes
+/// `gl_Position.y *= -1.0` itself and stops. There is no map here to bend onto: the target is a
+/// texture the size of the DEM and the matrix takes the tile's own square to it. So this family
+/// has the plane alone, for the same reason the background has no raise -- not a limitation, an
+/// absence of anything to raise it above.
+pub const HILLSHADE_PREPARE_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let drawable = hillshade_prepare_drawable_ubo[ubo_index];
+    let tile = hillshade_prepare_tile_props_ubo[ubo_index];
+    var out: Out;
+
+    out.clip = place(vec3<f32>(vec2<f32>(in.hillshade_pos), 0.0), drawable.matrix);
+
+    // Into the tile's own square inside the padded DEM: one border texel a side, so the interior
+    // spans `1/stride` to `(dim - 1)/stride`.
+    let epsilon = vec2<f32>(1.0, 1.0) / tile.dimension;
+    let scale = (tile.dimension.x - 2.0) / tile.dimension.x;
+    out.uv = vec2<f32>(in.hillshade_texture_pos) / 8192.0 * scale + epsilon;
+    return out;
+}
+
+// Meters at a texture coordinate, the way the DEM encodes it: the texel times 255 with its alpha
+// replaced by -1, dotted with the unpack vector.
+fn elevation(uv: vec2<f32>, unpack: vec4<f32>) -> f32 {
+    let texel = textureSample(hillshade_image, hillshade_image_sampler, uv) * 255.0;
+    return dot(vec4<f32>(texel.rgb, -1.0), unpack);
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    let tile = hillshade_prepare_tile_props_ubo[ubo_index];
+    let epsilon = vec2<f32>(1.0, 1.0) / tile.dimension;
+    let tile_size = tile.dimension.x - 2.0;
+
+    // The eight neighbors of this pixel, named as the kernel is usually drawn. The center is not
+    // read: a Sobel operator weights the two columns and the two rows either side of it and the
+    // middle cancels.
+    //
+    //   a b c
+    //   d . f
+    //   g h i
+    let a = elevation(in.uv + vec2<f32>(-epsilon.x, -epsilon.y), tile.unpack);
+    let b = elevation(in.uv + vec2<f32>(0.0, -epsilon.y), tile.unpack);
+    let c = elevation(in.uv + vec2<f32>(epsilon.x, -epsilon.y), tile.unpack);
+    let d = elevation(in.uv + vec2<f32>(-epsilon.x, 0.0), tile.unpack);
+    let f = elevation(in.uv + vec2<f32>(epsilon.x, 0.0), tile.unpack);
+    let g = elevation(in.uv + vec2<f32>(-epsilon.x, epsilon.y), tile.unpack);
+    let h = elevation(in.uv + vec2<f32>(0.0, epsilon.y), tile.unpack);
+    let i = elevation(in.uv + vec2<f32>(epsilon.x, epsilon.y), tile.unpack);
+
+    // Pixel-space slope to world-space slope. Meters per pixel is `pow(2, 28.2562 - zoom)`, and
+    // the exaggeration term flattens the relief at low zoom where a pixel covers so much ground
+    // that the true slope would be noise.
+    var factor = 0.3;
+    if tile.zoom < 2.0 {
+        factor = 0.4;
+    } else if tile.zoom < 4.5 {
+        factor = 0.35;
+    }
+    var exaggeration = 0.0;
+    if tile.zoom < 15.0 {
+        exaggeration = (tile.zoom - 15.0) * factor;
+    }
+
+    let deriv = vec2<f32>(
+        (c + f + f + i) - (a + d + d + g),
+        (g + h + h + i) - (a + b + b + c)
+    ) * tile_size / pow(2.0, exaggeration + (28.2562 - tile.zoom));
+
+    // Stored in red and green over the range [-4, 4], which is the largest slope assumed to
+    // occur: eight units of slope across the channel's zero to one.
+    return clamp(
+        vec4<f32>(deriv.x / 8.0 + 0.5, deriv.y / 8.0 + 0.5, 1.0, 1.0),
+        vec4<f32>(0.0),
+        vec4<f32>(1.0)
+    );
+}
+";
+
+/// The hillshade family's body: five methods over one slope field.
+///
+/// Reads what [`HILLSHADE_PREPARE_BODY`] wrote and turns a slope into a color. `method` selects
+/// between five, which the style names and which do genuinely different things rather than being
+/// variations on one: `standard` is the legacy algorithm, `basic` and `multidirectional` are Lambertian
+/// with one light and up to four, and `combined` and `igor` split the result into a shadow and a
+/// highlight term that are summed.
+///
+/// # The latitude scale is not cosmetic
+///
+/// A Mercator pixel covers less ground the further it is from the equator, so the same elevation
+/// change across one pixel is a steeper real slope. Dividing by `cos(latitude)` undoes it; without
+/// it, relief flattens visibly toward the poles.
+pub const HILLSHADE_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let drawable = hillshade_drawable_ubo[ubo_index];
+    var out: Out;
+
+    out.clip = place(vec3<f32>(vec2<f32>(in.hillshade_pos), 0.0), drawable.matrix);
+    // Flipped, because the slope field was rendered into a texture whose rows run the other way.
+    let uv = vec2<f32>(in.hillshade_texture_pos) / 8192.0;
+    out.uv = vec2<f32>(uv.x, 1.0 - uv.y);
+    return out;
+}
+
+// The downhill direction. Where the x slope is zero the arctangent is undefined, so the aspect is
+// straight up or straight down by the sign of the y slope.
+fn aspect_of(deriv: vec2<f32>) -> f32 {
+    let pi = 3.141592653589793;
+    if deriv.x != 0.0 {
+        return atan2(deriv.y, -deriv.x);
+    }
+    return pi / 2.0 * select(-1.0, 1.0, deriv.y > 0.0);
+}
+
+// How much of the light reaches a surface of this slope, for a light at one altitude and azimuth.
+fn lambert(deriv: vec2<f32>, altitude: f32, cos_az: f32, sin_az: f32) -> f32 {
+    let cos_alt = cos(altitude);
+    let sin_alt = sin(altitude);
+    let cang = (sin_alt - (deriv.y * cos_az * cos_alt - deriv.x * sin_az * cos_alt))
+        / sqrt(1.0 + dot(deriv, deriv));
+    return clamp(cang, 0.0, 1.0);
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    let tile = hillshade_tile_props_ubo[ubo_index];
+    let props = hillshade_evaluated_props_ubo[0];
+    let pi = 3.141592653589793;
+
+    let pixel = textureSample(hillshade_image, hillshade_image_sampler, in.uv);
+
+    // The latitude of this row, and the Mercator distortion there.
+    let latitude = (tile.latrange.x - tile.latrange.y) * in.uv.y + tile.latrange.y;
+    let scale_factor = cos(radians(latitude));
+    // Back from the stored [0, 1] to the slope range [-4, 4].
+    let deriv = ((pixel.rg * 8.0) - 4.0) / scale_factor;
+
+    let azimuth = props.azimuths.x + pi;
+    // Every method but the standard one works on the slope already exaggerated.
+    let lit = deriv * tile.exaggeration * 2.0;
+
+    if tile.method == 4 {
+        // BASIC: one Lambertian light, the shade split either side of a half.
+        let shade = lambert(lit, props.altitudes.x, cos(azimuth), sin(azimuth));
+        if shade > 0.5 {
+            return props.highlights[0] * (2.0 * shade - 1.0);
+        }
+        return props.shadows[0] * (1.0 - 2.0 * shade);
+    }
+
+    if tile.method == 1 {
+        // COMBINED: the angle to the light and the steepness as two terms that are summed, so a
+        // slope facing away is dark *and* a flat surface is neutral whichever way it faces.
+        let cos_alt = cos(props.altitudes.x);
+        let sin_alt = sin(props.altitudes.x);
+        let cos_az = cos(azimuth);
+        let sin_az = sin(azimuth);
+        let cang = clamp(
+            acos(
+                (sin_alt - (lit.y * cos_az * cos_alt - lit.x * sin_az * cos_alt))
+                    / sqrt(1.0 + dot(lit, lit))
+            ),
+            0.0,
+            pi / 2.0
+        );
+        let steepness = atan(length(lit)) * 4.0 / pi / pi;
+        return props.shadows[0] * (cang * steepness)
+            + props.highlights[0] * ((pi / 2.0 - cang) * steepness);
+    }
+
+    if tile.method == 2 {
+        // IGOR: no light altitude at all. The shadow is how steep the slope is times how far it
+        // faces away from the light, and the highlight is the remainder.
+        let aspect = aspect_of(lit);
+        let slope_strength = atan(length(lit)) * 2.0 / pi;
+        let aspect_strength = 1.0 - abs(((aspect + azimuth) / pi + 0.5) % 2.0 - 1.0);
+        return props.shadows[0] * (slope_strength * aspect_strength)
+            + props.highlights[0] * (slope_strength * (1.0 - aspect_strength));
+    }
+
+    if tile.method == 3 {
+        // MULTIDIRECTIONAL: up to four lights, each contributing its share. The azimuths are
+        // negated here where the single-light methods add pi, which is the same half turn.
+        var altitudes = array<f32, 4>(
+            props.altitudes.x,
+            props.altitudes.y,
+            props.altitudes.z,
+            props.altitudes.w
+        );
+        var azimuths = array<f32, 4>(
+            props.azimuths.x,
+            props.azimuths.y,
+            props.azimuths.z,
+            props.azimuths.w
+        );
+        let lights = min(tile.num_lights, 4);
+        var total = vec4<f32>(0.0);
+        for (var light = 0; light < lights; light++) {
+            let shade = lambert(
+                lit,
+                altitudes[light],
+                -cos(azimuths[light]),
+                -sin(azimuths[light])
+            );
+            if shade > 0.5 {
+                total += props.highlights[light] * (2.0 * shade - 1.0) / f32(lights);
+            } else {
+                total += props.shadows[light] * (1.0 - 2.0 * shade) / f32(lights);
+            }
+        }
+        return total;
+    }
+
+    // STANDARD, the legacy algorithm, and the default for a method this build does not know. The
+    // slope is scaled exponentially by the intensity rather than linearly, so turning the
+    // exaggeration up steepens the gentle ground more than the cliffs.
+    let slope = atan(0.625 * length(deriv));
+    let aspect = aspect_of(deriv);
+    let intensity = tile.exaggeration;
+    let base = 1.875 - intensity * 1.75;
+    let most = 0.5 * pi;
+    // At an intensity of a half the base is one and the curve is flat, so the division has
+    // nothing to divide by -- and the unscaled slope is the answer that limit approaches.
+    var scaled = slope;
+    if abs(intensity - 0.5) > 1e-6 {
+        scaled = ((pow(base, slope) - 1.0) / (pow(base, most) - 1.0)) * most;
+    }
+
+    let reach = clamp(intensity * 2.0, 0.0, 1.0);
+    let accent = (1.0 - cos(scaled)) * props.accent * reach;
+    let shade = abs(((aspect + azimuth) / pi + 0.5) % 2.0 - 1.0);
+    let shaded = mix(props.shadows[0], props.highlights[0], shade) * sin(scaled) * reach;
+
+    // The accent shows through whatever the shade leaves transparent.
+    return accent * (1.0 - shaded.a) + shaded;
+}
+";
+
 /// The line family's body.
 ///
 /// The position attribute carries the point and its normal together, as mbgl packs it: the low bit

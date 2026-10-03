@@ -9,25 +9,29 @@ use std::collections::BTreeSet;
 use tessella_capture_abi::generated::mbgl_enums::AttributeDataType;
 use tessella_capture_abi::generated::shader_attributes::{
     BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER, FILL_EXTRUSION_SHADER,
-    FILL_OUTLINE_SHADER, FILL_SHADER, LINE_SHADER, RASTER_SHADER, SYMBOL_ICON_SHADER,
-    SYMBOL_SDFSHADER, SYMBOL_TEXT_AND_ICON_SHADER, ShaderAttribute,
+    FILL_OUTLINE_SHADER, FILL_SHADER, HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, LINE_SHADER,
+    RASTER_SHADER, SYMBOL_ICON_SHADER, SYMBOL_SDFSHADER, SYMBOL_TEXT_AND_ICON_SHADER,
+    ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
-    COLOR_RELIEF_SHADER_TEXTURES, RASTER_SHADER_TEXTURES, SYMBOL_ICON_SHADER_TEXTURES,
-    SYMBOL_SDFSHADER_TEXTURES, SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES, ShaderTexture,
+    COLOR_RELIEF_SHADER_TEXTURES, HILLSHADE_PREPARE_SHADER_TEXTURES, HILLSHADE_SHADER_TEXTURES,
+    RASTER_SHADER_TEXTURES, SYMBOL_ICON_SHADER_TEXTURES, SYMBOL_SDFSHADER_TEXTURES,
+    SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES, ShaderTexture,
 };
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
     COLOR_RELIEF_DRAWABLE_UBO, COLOR_RELIEF_EVALUATED_PROPS_UBO, COLOR_RELIEF_TILE_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
     FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, GLOBAL_PAINT_PARAMS_UBO,
-    LINE_DRAWABLE_UBO, LINE_EVALUATED_PROPS_UBO, RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO,
-    SYMBOL_DRAWABLE_UBO, SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
+    HILLSHADE_DRAWABLE_UBO, HILLSHADE_EVALUATED_PROPS_UBO, HILLSHADE_PREPARE_DRAWABLE_UBO,
+    HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO, LINE_DRAWABLE_UBO,
+    LINE_EVALUATED_PROPS_UBO, RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO,
+    SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
 use tessella_emblema::shaders::{
     BACKGROUND_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY, FILL_EXTRUSION_BODY,
-    FILL_OUTLINE_BODY, LINE_BODY, RASTER_BODY, SYMBOL_ICON_BODY, SYMBOL_SDF_BODY,
-    SYMBOL_TEXT_AND_ICON_BODY, attribute_name, module,
+    FILL_OUTLINE_BODY, HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_BODY, RASTER_BODY,
+    SYMBOL_ICON_BODY, SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY, attribute_name, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -184,6 +188,32 @@ fn families() -> Vec<Family> {
             attributes: &SYMBOL_TEXT_AND_ICON_SHADER,
             textures: &SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES,
             body: SYMBOL_TEXT_AND_ICON_BODY,
+            surfaces: all,
+            height: false,
+        },
+        Family {
+            name: "hillshade_prepare",
+            blocks: vec![
+                &HILLSHADE_PREPARE_DRAWABLE_UBO,
+                &HILLSHADE_PREPARE_TILE_PROPS_UBO,
+            ],
+            attributes: &HILLSHADE_PREPARE_SHADER,
+            textures: &HILLSHADE_PREPARE_SHADER_TEXTURES,
+            body: HILLSHADE_PREPARE_BODY,
+            // Draws into a texture, not onto the map: see the body's own note.
+            surfaces: &[Surface::Plane],
+            height: false,
+        },
+        Family {
+            name: "hillshade",
+            blocks: vec![
+                &HILLSHADE_DRAWABLE_UBO,
+                &HILLSHADE_TILE_PROPS_UBO,
+                &HILLSHADE_EVALUATED_PROPS_UBO,
+            ],
+            attributes: &HILLSHADE_SHADER,
+            textures: &HILLSHADE_SHADER_TEXTURES,
+            body: HILLSHADE_BODY,
             surfaces: all,
             height: false,
         },
@@ -421,6 +451,78 @@ fn the_text_and_icon_keeps_its_sheet_decisions() {
             "let sprite = textureSample(symbol_image_icon, symbol_image_icon_sampler, in.tex);"
         ),
         "the icon half does not read the second atlas"
+    );
+}
+
+/// The two hillshade passes keep the six decisions that shade believable relief wrongly.
+///
+/// * **The Sobel kernel's weights and its missing center.** The near neighbors count twice and the
+///   center not at all. A wrong weight gives relief that still reads as terrain.
+/// * **The row order of the y derivative.** `(g + h + h + i) - (a + b + b + c)`; reversed, every
+///   hill reads as a valley -- the one hillshade defect everybody ships at least once.
+/// * **The encode and the decode are inverses.** `deriv / 8 + 0.5` into the texture and
+///   `pixel * 8 - 4` out of it. Mismatched, the relief is simply scaled, which looks like a style
+///   choice.
+/// * **The slope field's rows run the other way**, so the second pass flips `v`.
+/// * **The five method numbers.** `standard` 0, `combined` 1, `igor` 2, `multidirectional` 3,
+///   `basic` 4, and an unknown number falls through to the standard one. Two swapped draws a
+///   different method's perfectly good hillshade.
+/// * **The latitude scale divides.** A Mercator pixel covers less ground toward the poles, so the
+///   same elevation change over it is a steeper real slope. Multiplying instead flattens the
+///   relief exactly where it should sharpen.
+#[test]
+fn the_hillshade_keeps_its_slope_decisions() {
+    let family = |name: &str| {
+        let found = families()
+            .into_iter()
+            .find(|family| family.name == name)
+            .unwrap_or_else(|| panic!("{name} is in the matrix"));
+        module(
+            Surface::Plane,
+            &found.blocks,
+            found.attributes,
+            found.textures,
+            found.body,
+        )
+        .expect("assembles")
+    };
+    let prepare = family("hillshade_prepare");
+    let shade = family("hillshade");
+
+    assert!(
+        prepare.contains("(c + f + f + i) - (a + d + d + g),")
+            && prepare.contains("(g + h + h + i) - (a + b + b + c)"),
+        "the Sobel kernel's weights or its rows moved:\n{prepare}"
+    );
+    assert!(
+        !prepare.contains("let e = elevation("),
+        "the kernel reads its own center, which it weights at zero"
+    );
+    assert!(
+        prepare.contains("vec4<f32>(deriv.x / 8.0 + 0.5, deriv.y / 8.0 + 0.5, 1.0, 1.0),")
+            && shade.contains("let deriv = ((pixel.rg * 8.0) - 4.0) / scale_factor;"),
+        "the slope's encode and decode are not inverses"
+    );
+    assert!(
+        shade.contains("out.uv = vec2<f32>(uv.x, 1.0 - uv.y);"),
+        "the second pass does not flip the slope field's rows"
+    );
+    assert!(
+        shade.contains("if tile.method == 4 {")
+            && shade.contains("if tile.method == 1 {")
+            && shade.contains("if tile.method == 2 {")
+            && shade.contains("if tile.method == 3 {")
+            && shade.contains("let slope = atan(0.625 * length(deriv));"),
+        "a method number moved, or the standard one is no longer the fallthrough"
+    );
+    assert!(
+        shade.contains("let scale_factor = cos(radians(latitude));"),
+        "the latitude scale is not the cosine of the latitude"
+    );
+    assert!(
+        shade.contains("let lit = deriv * tile.exaggeration * 2.0;")
+            && shade.contains("let intensity = tile.exaggeration;"),
+        "the standard method takes the exaggerated slope, or the others take the raw one"
     );
 }
 
@@ -1052,7 +1154,7 @@ fn every_family_on_every_surface_compiles() {
         }
     }
     assert_eq!(
-        pairs, 39,
+        pairs, 44,
         "the matrix grew or shrank; look at the new pairs"
     );
 }

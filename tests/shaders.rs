@@ -20,9 +20,9 @@ use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
     COLOR_RELIEF_DRAWABLE_UBO, COLOR_RELIEF_EVALUATED_PROPS_UBO, COLOR_RELIEF_TILE_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
-    FILL_EXTRUSION_PROPS_UBO, GLOBAL_PAINT_PARAMS_UBO, LINE_DRAWABLE_UBO, LINE_EVALUATED_PROPS_UBO,
-    RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO,
-    SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
+    FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, GLOBAL_PAINT_PARAMS_UBO,
+    LINE_DRAWABLE_UBO, LINE_EVALUATED_PROPS_UBO, RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO,
+    SYMBOL_DRAWABLE_UBO, SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
 use tessella_emblema::shaders::{
     BACKGROUND_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY, FILL_EXTRUSION_BODY,
@@ -86,7 +86,14 @@ fn families() -> Vec<Family> {
         },
         Family {
             name: "fill_outline",
-            blocks: vec![&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
+            // Its own drawable block, which mbgl binds at the fill's slot: the layouts match but
+            // the interpolation factor is named `outline_color_t`, because the outline's color is
+            // a property of its own.
+            blocks: vec![
+                &FILL_OUTLINE_DRAWABLE_UBO,
+                &FILL_EVALUATED_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
             attributes: &FILL_OUTLINE_SHADER,
             textures: &[],
             body: FILL_OUTLINE_BODY,
@@ -168,7 +175,11 @@ fn families() -> Vec<Family> {
         },
         Family {
             name: "circle",
-            blocks: vec![&CIRCLE_DRAWABLE_UBO, &CIRCLE_EVALUATED_PROPS_UBO],
+            blocks: vec![
+                &CIRCLE_DRAWABLE_UBO,
+                &CIRCLE_EVALUATED_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
             attributes: &CIRCLE_SHADER,
             textures: &[],
             body: CIRCLE_BODY,
@@ -450,6 +461,132 @@ fn the_symbol_sdf_keeps_its_edge_decisions() {
         source.contains("out.gamma = clip.w;")
             && source.contains("select(fill_gamma, halo_gamma, is_halo) * in.gamma;"),
         "the threshold is not scaled by the perspective divide"
+    );
+}
+
+/// The circle keeps the four decisions that draw a believable circle of the wrong size.
+///
+/// * **The center is the position halved.** The corner sign rides in the low bit, so a body that
+///   places the raw position puts every circle at twice its tile coordinate.
+/// * **All four pitch and scale paths.** Lying on the ground the extrusion is in tile units and
+///   goes on before the matrix; standing up it is added in clip space after. Each of the two is
+///   scaled differently again by `scale_with_map`. One path alone draws three styles wrong.
+/// * **The antialias floor is one device pixel over the circle's reach**, not a constant: a small
+///   circle fades over more of itself than a large one, and the style's blur and this floor are
+///   the same quantity, so the wider wins rather than both applying.
+/// * **The coverage ramp descends.** `smoothstep`'s second edge is the negative blur, which is
+///   what makes the fill opaque at the center and clear at the rim rather than the reverse.
+#[test]
+fn the_circle_keeps_its_extrusion_decisions() {
+    let circle = families()
+        .into_iter()
+        .find(|family| family.name == "circle")
+        .expect("circle is in the matrix");
+    let source = module(
+        Surface::Plane,
+        &circle.blocks,
+        circle.attributes,
+        circle.textures,
+        circle.body,
+    )
+    .expect("assembles");
+
+    assert!(
+        source.contains("let center = floor(position * 0.5);")
+            && source.contains("let extrude = (position % vec2<f32>(2.0, 2.0)) * 2.0 - 1.0;"),
+        "the center is not the halved position:\n{source}"
+    );
+    assert!(
+        source.contains("if props.pitch_with_map != 0 {")
+            && source.contains("corner += scaled_extrude * reach;")
+            && source
+                .contains("(projected_center.w / max(global.camera_to_center_distance, 1e-6))")
+            && source.contains(concat!(
+                "let factor = select(\n",
+                "            placed.w,\n",
+                "            global.camera_to_center_distance,\n",
+                "            props.scale_with_map != 0\n",
+            )),
+        "one of the four pitch and scale paths is missing"
+    );
+    assert!(
+        source.contains(
+            "out.antialias_blur = 1.0 / max(global.pixel_ratio, 1e-6) / max(reach, 1e-6);"
+        ) && source.contains("let antialiased_blur = -max(in.blur, in.antialias_blur);"),
+        "the antialias floor is not one pixel over the reach, or does not take the wider blur"
+    );
+    assert!(
+        source.contains("let opacity_t = smoothstep(0.0, antialiased_blur, extrude_length - 1.0);"),
+        "the coverage ramp does not descend"
+    );
+    assert!(
+        source.contains("in.stroke_width < 0.01"),
+        "a stroke too thin to have an edge still gets one"
+    );
+}
+
+/// The fill outline keeps its feather, which is the only thing making it an outline.
+///
+/// An outline is line primitives one pixel wide and they rasterize hard. mbgl fades them by this
+/// fragment's distance from the vertex's own screen position, which needs the perspective divide
+/// done in the vertex stage -- interpolating `xy/w` is not the same number as interpolating `xy`
+/// and `w` and dividing here. Without any of it an outline still draws, as a hard aliased line.
+#[test]
+fn the_fill_outline_keeps_its_feather() {
+    let outline = families()
+        .into_iter()
+        .find(|family| family.name == "fill_outline")
+        .expect("fill outline is in the matrix");
+    let source = module(
+        Surface::Plane,
+        &outline.blocks,
+        outline.attributes,
+        outline.textures,
+        outline.body,
+    )
+    .expect("assembles");
+
+    assert!(
+        source.contains("out.screen = (clip.xy / clip.w + 1.0) / 2.0 * global.world_size;"),
+        "the screen position is not divided in the vertex stage:\n{source}"
+    );
+    assert!(
+        source.contains("let distance = length(in.screen - in.clip.xy);")
+            && source.contains("let alpha = 1.0 - smoothstep(0.0, 1.0, distance);"),
+        "the outline has no feather"
+    );
+    assert!(
+        source.contains("drawable.outline_color_t"),
+        "the outline mixes with the fill's interpolation factor, not its own"
+    );
+}
+
+/// The color relief pins a tile that covers a pole rather than sampling off the DEM.
+///
+/// The sentinel is a `y` at the end of the signed short range, which is not a coordinate. Left
+/// alone it scales to a texture coordinate far outside the image and the pole draws as whatever
+/// the sampler's addressing mode gives back -- a plausible color, from the wrong elevation.
+#[test]
+fn the_color_relief_pins_the_poles() {
+    let relief = families()
+        .into_iter()
+        .find(|family| family.name == "color_relief")
+        .expect("color relief is in the matrix");
+    let source = module(
+        Surface::Plane,
+        &relief.blocks,
+        relief.attributes,
+        relief.textures,
+        relief.body,
+    )
+    .expect("assembles");
+
+    assert!(
+        source.contains("if f32(in.color_relief_pos.y) < -32767.5 {")
+            && source.contains("out.uv.y = 0.0;")
+            && source.contains("if f32(in.color_relief_pos.y) > 32766.5 {")
+            && source.contains("out.uv.y = 1.0;"),
+        "a tile covering a pole is not pinned:\n{source}"
     );
 }
 

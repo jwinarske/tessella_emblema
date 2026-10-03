@@ -399,22 +399,40 @@ struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) outline_color: vec4<f32>,
     @location(1) opacity: f32,
+    @location(2) screen: vec2<f32>,
 }
 
 @vertex
 fn vertex_main(in: In) -> Out {
     ubo_index = in.instance_index;
-    let drawable = fill_drawable_ubo[ubo_index];
+    let drawable = fill_outline_drawable_ubo[ubo_index];
+    let global = global_paint_params_ubo[0];
     var out: Out;
-    out.clip = place(vec3<f32>(vec2<f32>(in.fill_pos), 0.0), drawable.matrix);
-    out.outline_color = mix_color(in.fill_outline_color, drawable.color_t);
+
+    let clip = place(vec3<f32>(vec2<f32>(in.fill_pos), 0.0), drawable.matrix);
+    out.clip = clip;
+
+    // Where this vertex landed on screen, in pixels, which is what the fragment measures its own
+    // distance from. The perspective divide has to happen here: a fragment gets the interpolated
+    // result, and interpolating before dividing is not the same number.
+    out.screen = (clip.xy / clip.w + 1.0) / 2.0 * global.world_size;
+
+    out.outline_color = mix_color(in.fill_outline_color, drawable.outline_color_t);
     out.opacity = mix_value(in.fill_opacity, drawable.opacity_t);
     return out;
 }
 
 @fragment
 fn fragment_main(in: Out) -> @location(0) vec4<f32> {
-    return in.outline_color * in.opacity;
+    // An outline is drawn as lines one pixel wide, which rasterize hard. The fade is this
+    // fragment's distance from the vertex's own screen position: the outline's geometry runs along
+    // the polygon's edge, so that distance is how far across the one-pixel line this pixel sits.
+    //
+    // `in.clip` is `@builtin(position)`, and in a fragment stage that builtin is the framebuffer
+    // coordinate rather than the clip position the vertex stage wrote -- WGSL's `gl_FragCoord`.
+    let distance = length(in.screen - in.clip.xy);
+    let alpha = 1.0 - smoothstep(0.0, 1.0, distance);
+    return in.outline_color * in.opacity * alpha;
 }
 ";
 
@@ -429,30 +447,71 @@ struct Out {
     @location(0) color: vec4<f32>,
     @location(1) stroke_color: vec4<f32>,
     @location(2) extrude: vec2<f32>,
-    @location(3) radius: f32,
-    @location(4) blur: f32,
-    @location(5) opacity: f32,
-    @location(6) stroke_width: f32,
-    @location(7) stroke_opacity: f32,
+    @location(3) antialias_blur: f32,
+    @location(4) radius: f32,
+    @location(5) blur: f32,
+    @location(6) opacity: f32,
+    @location(7) stroke_width: f32,
+    @location(8) stroke_opacity: f32,
 }
 
 @vertex
 fn vertex_main(in: In) -> Out {
     ubo_index = in.instance_index;
     let drawable = circle_drawable_ubo[ubo_index];
+    let props = circle_evaluated_props_ubo[0];
+    let global = global_paint_params_ubo[0];
     var out: Out;
 
     let radius = mix_value(in.circle_radius, drawable.radius_t);
     let stroke_width = mix_value(in.circle_stroke_width, drawable.stroke_width_t);
-    // The low two bits of the position say which corner this vertex is, as mbgl packs it.
-    let corner = vec2<f32>(vec2<i32>(in.circle_pos) % 2) * 2.0 - 1.0;
-    let reach = (radius + stroke_width) * drawable.extrude_scale;
+    let reach = radius + stroke_width;
 
-    out.clip = place(
-        vec3<f32>(vec2<f32>(in.circle_pos) + corner * reach, 0.0),
-        drawable.matrix
-    );
-    out.extrude = corner;
+    // The corner sign rides in the low bit of each coordinate, the same trick the line vertex
+    // uses: the point is doubled and zero or one added. So the center is the halved position and
+    // the extrusion is what is left, mapped from {0,1} back to {-1,+1}.
+    let position = vec2<f32>(in.circle_pos);
+    let extrude = (position % vec2<f32>(2.0, 2.0)) * 2.0 - 1.0;
+    let scaled_extrude = extrude * drawable.extrude_scale;
+    let center = floor(position * 0.5);
+
+    if props.pitch_with_map != 0 {
+        // Lying on the ground, so the extrusion is in tile units and goes on before the matrix.
+        var corner = center;
+        if props.scale_with_map != 0 {
+            corner += scaled_extrude * reach;
+        } else {
+            // Pitching with the map scales the circle with it, so a circle held at a constant
+            // pixel size is rescaled by the pitch effect at its own center -- which needs the
+            // perspective divide the matrix is about to do, measured first and multiplied in.
+            let projected_center = place(vec3<f32>(center, 0.0), drawable.matrix);
+            corner += scaled_extrude
+                * reach
+                * (projected_center.w / max(global.camera_to_center_distance, 1e-6));
+        }
+        out.clip = place(vec3<f32>(corner, 0.0), drawable.matrix);
+    } else {
+        // Standing up on the screen: the center is placed and the extrusion added in clip space
+        // afterwards, scaled so it survives the perspective divide as a pixel size.
+        let placed = place(vec3<f32>(center, 0.0), drawable.matrix);
+        let factor = select(
+            placed.w,
+            global.camera_to_center_distance,
+            props.scale_with_map != 0
+        );
+        out.clip = vec4<f32>(
+            placed.xy + scaled_extrude * reach * factor,
+            placed.z,
+            placed.w
+        );
+    }
+
+    // The blur that hides the quad's own edge: one device pixel spread over the circle's reach, so
+    // a small circle fades over more of itself than a large one. Guarded, because a circle with no
+    // radius and no stroke is a style that evaluated to nothing rather than an impossible one.
+    out.antialias_blur = 1.0 / max(global.pixel_ratio, 1e-6) / max(reach, 1e-6);
+
+    out.extrude = extrude;
     out.color = mix_color(in.circle_color, drawable.color_t);
     out.stroke_color = mix_color(in.circle_stroke_color, drawable.stroke_color_t);
     out.radius = radius;
@@ -465,16 +524,30 @@ fn vertex_main(in: In) -> Out {
 
 @fragment
 fn fragment_main(in: Out) -> @location(0) vec4<f32> {
-    let distance = length(in.extrude) * (in.radius + in.stroke_width);
-    let antialias = in.blur + 1.0;
-    let fill = 1.0 - smoothstep(in.radius - antialias, in.radius + antialias, distance);
-    let outer = in.radius + in.stroke_width;
-    let stroke = 1.0 - smoothstep(outer - antialias, outer + antialias, distance);
-    return mix(
-        in.stroke_color * in.stroke_opacity * stroke,
-        in.color * in.opacity,
-        fill
+    // Everything here is in units of the quad, where 1.0 is the circle's outer edge, which is what
+    // makes the shape resolution-independent.
+    let extrude_length = length(in.extrude);
+
+    // Negative, and used as `smoothstep`'s *second* edge: the ramp descends. The style's blur and
+    // the one-pixel floor are the same quantity, so the wider of the two wins rather than both
+    // applying.
+    let antialiased_blur = -max(in.blur, in.antialias_blur);
+
+    let opacity_t = smoothstep(0.0, antialiased_blur, extrude_length - 1.0);
+    // Where the fill ends and the stroke begins, as a fraction of the reach. Below a hundredth of
+    // a pixel there is no stroke to find an edge for, and the ratio would be a hard seam.
+    let color_t = select(
+        smoothstep(
+            antialiased_blur,
+            0.0,
+            extrude_length - in.radius / max(in.radius + in.stroke_width, 1e-6)
+        ),
+        0.0,
+        in.stroke_width < 0.01
     );
+
+    return opacity_t
+        * mix(in.color * in.opacity, in.stroke_color * in.stroke_opacity, color_t);
 }
 ";
 
@@ -584,6 +657,15 @@ fn vertex_main(in: In) -> Out {
     let epsilon = 1.0 / tile.dimension;
     let scale = (tile.dimension.x - 2.0) / tile.dimension.x;
     out.uv = (vec2<f32>(in.color_relief_texture_pos) / 8192.0) * scale + epsilon;
+
+    // A tile covering a pole carries a sentinel `y` at the end of the signed range rather than a
+    // coordinate, so the row it samples is pinned instead of running off the DEM.
+    if f32(in.color_relief_pos.y) < -32767.5 {
+        out.uv.y = 0.0;
+    }
+    if f32(in.color_relief_pos.y) > 32766.5 {
+        out.uv.y = 1.0;
+    }
 
     out.clip = place(vec3<f32>(vec2<f32>(in.color_relief_pos), 0.0), drawable.matrix);
     return out;
@@ -860,10 +942,17 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
 ///
 /// # The atlas is read from red, where mbgl reads alpha
 ///
-/// `GLYPH_ATLAS_FORMAT` is `TexturePixelType::Alpha`, one channel. GL's `GL_ALPHA` samples as
-/// `(0, 0, 0, a)`, which is why mbgl reads `.a`; Vulkan has no alpha-only format, so one channel
-/// is `R8_UNORM` and samples as `(r, 0, 0, 1)`. Reading `.a` here would be 1.0 at every pixel --
-/// every glyph a solid block. The bytes are the same; only the channel they arrive in differs.
+/// `GLYPH_ATLAS_FORMAT` is `TexturePixelType::Alpha`, one channel, and Vulkan has no alpha-only
+/// format -- so the image is `R8_UNORM` either way and the channel the data arrives in is the
+/// image view's to decide. mbgl's own Vulkan backend uploads `R8_UNORM` and then sets a component
+/// mapping of `(Zero, Zero, Zero, R)` on the view (`src/mbgl/vulkan/texture2d.cpp`), which is why
+/// its shader reads `.a`.
+///
+/// This reads `.r`, so the producer must bind the atlas through a view with the **identity**
+/// component mapping -- the default, and what anyone creating an `R8_UNORM` view gets without
+/// asking. The two have to agree and nothing checks that they do: through an identity view `.a`
+/// samples 1.0 at every pixel and every glyph is a solid block, and through mbgl's swizzled view
+/// `.r` samples zero and no glyph appears at all.
 ///
 /// A one-channel atlas is also a known hazard on this hardware: a sibling consumer found Adreno
 /// GLES sampling `r8` as zero under minification and widened its atlases to RGBA. Whether Vulkan

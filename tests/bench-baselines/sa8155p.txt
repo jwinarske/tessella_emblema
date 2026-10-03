@@ -1,4 +1,4 @@
-# `draw_cost` on an sa8155p (Adreno 640), against the desktop and the Pi 5.
+# `draw_cost` and `first_pixel` on an sa8155p (Adreno 640), against the desktop and the Pi 5.
 #
 # `sa81x5-guest`, Cockpit SDK(IVI) v12.9.0 (Yocto dunfell), kernel 5.4.219, 6 cores,
 # glibc 2.31. Vulkan 1.2.198 through `/usr/lib/libvulkan_adreno.so` -- Qualcomm's own
@@ -109,3 +109,32 @@
 # the image view or descriptor is re-bound per draw where GLES caches it -- terrain scenes
 # bind a texture per tile, which is the merge blocker already recorded for them -- and the
 # backend's own per-draw work.
+
+# ---------------------------------------------------------------------------
+# `first_pixel` on the same board, 2026-10-03: 24 of 24 cases pass.
+#
+# Every one of the eighteen families, on all four surfaces between them, builds a pipeline
+# here and draws the pixel the oracle derived from mbgl's arithmetic -- bit-identical to
+# RADV and to lavapipe, with no value differing by a step.
+#
+#   fill [0,0,255,255]  background [0,0,255,255]  fill_outline [255,255,255,255]
+#   fill_extrusion [255,115,12,255]  extrusion_dim [125,125,125,255]
+#   raster [32,16,64,64]  raster_adjusted [54,37,87,255]
+#   heatmap_texture [128,64,0,128]  color_relief [10,90,55,128]
+#   symbol_sdf [200,100,50,255]  symbol_below [0,0,0,0]
+#   hillshade_prep [194,144,255,255]  hillshade [95,47,24,118]
+#   heatmap [80,255,255,255]  background_pattern [48,24,64,64]
+#   fill_pattern [48,24,64,64]  line_pattern [32,16,64,64]
+#   symbol_icon [40,20,64,64]  both_as_icon [40,20,64,64]  both_as_glyph [100,50,25,64]
+#   fill_on_globe [0,255,255,255]  fill_anchored [255,255,0,255]
+#   fill_raised [255,0,255,255]  circle [0,255,0,255]
+#
+# This is the board that could not build a single pipeline before the matrix-free form, so
+# the result is worth more than its brevity suggests: the no-matrix rule holds across every
+# family, the three bent and raised placements included, and nothing else in the eighteen
+# bodies trips this compiler.
+#
+# The device is reported `internal` by `device::preferred`, which is right -- an Adreno is
+# an integrated part -- and the probe opens it through `TSL_VULKAN_LIB` as `draw_cost` does.
+#
+# Compare `imx8mp.txt`, where 2 of the same 24 build.

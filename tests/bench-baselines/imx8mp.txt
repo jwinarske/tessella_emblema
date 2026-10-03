@@ -1,4 +1,4 @@
-# `draw_cost` on an i.MX8M Plus (VeriSilicon GC7000UL).
+# `draw_cost` and `first_pixel` on an i.MX8M Plus (VeriSilicon GC7000UL).
 #
 # `root@wafer-imx8mp.lan`, NXP Yocto, aarch64, glibc 2.39, 4 cores, idle at load 0.00.
 # Vulkan loader 1.3.275 with NXP's ICD at /etc/vulkan/icd.d/imx_icd.json naming
@@ -83,3 +83,49 @@
 # expensive on this part: a million of them is 3.5 ms. So where terrain's per-vertex fetch
 # is a rounding error on Adreno, on Vivante it is a cost worth designing around, and this
 # is the board where moving the raise off the vertex stage would actually pay.
+
+# ---------------------------------------------------------------------------
+# `first_pixel` on the same board, 2026-10-03: 2 of 24 cases build.
+#
+# The readback oracle was taken to both boards. On the sa8155p's Adreno 640 all 24 cases
+# pass and every pixel is bit-identical to RADV and to lavapipe. Here, the driver's SPIR-V
+# front end segfaults for 22 of them, in the same place the matrix defect was found:
+#
+#   #0  libVSC.so
+#   #1  VIR_Shader_CompositeConstruct   libVSC.so
+#   #2..4  gcSPV_Decode                 libSPIRV_viv.so
+#   #5..7  libvulkan_VSI.so.1           (pipeline creation)
+#
+# `background` and `heatmap_texture` build and draw correctly. Everything else dies before
+# its first draw, so the crash is in shader compilation and not in the clear, the readback
+# or the linear attachment -- `background` exercises all three and passes.
+#
+# # One trigger, bisected on the board
+#
+# `TSL_ONLY` runs a single case, which is what makes this findable: the probe prints a
+# case's name only after it has drawn, so a crash names the case and nothing inside it.
+# Against `fill`:
+#
+#   both attribute reads replaced by constants                        builds
+#   the `Float4` read kept (`mix_color(in.fill_color, ...)`)           segfault
+#   the `Float2` read kept (`in.fill_opacity.y`, no mix at all)        segfault
+#   neither read, `mix(0.0, 1.0, drawable.opacity_t)` instead         builds
+#
+# So **reading a `Float2` or `Float4` vertex attribute is enough on its own**. It is not
+# the `mix`, and it is not the unpacking: the bare component read fails too. A `Short2`
+# attribute is fine -- `background` reads one, and so does the passing form of `fill`.
+#
+# # And at least one more, not yet bisected
+#
+# `raster` declares two `Short2` attributes and no float ones, and still segfaults. So
+# there is a second trigger in the bodies that `background` and `heatmap_texture` avoid.
+# Both of those are the two simplest bodies in the crate, which is consistent with almost
+# anything; the next step is to bisect `raster` the same way `fill` was.
+#
+# # What this does not say
+#
+# That the shaders are wrong. The same modules draw 24 for 24 on Adreno and on two desktop
+# drivers, bit-identical, and the pixels are derived from mbgl's own arithmetic. This is a
+# vendor compiler that cannot compile them, which is the third such defect this board and
+# the sa8155p have produced between them -- after Adreno's assertion on a `mat4x4` in a
+# storage buffer and Vivante's own on constructing one from columns.

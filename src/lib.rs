@@ -21,9 +21,18 @@
 //! naming a different size or format is a different image rather than damage, and regions
 //! accumulate across updates and have to be kept from becoming a whole-texture write by accident.
 //!
+//! [`shaders`], the largest part: a body per family, and the assembler that joins one to a
+//! surface and to the ABI's own declarations. Eighteen families, each transcribed from
+//! `include/mbgl/shaders/vulkan/*.hpp` — the Vulkan backend's text, which is what the ABI's
+//! tables are generated from and which differs from the GL shaders in places that matter.
+//!
+//! [`preamble`], which declares those families' uniform blocks from the same tables, and refuses
+//! a block whose fields WGSL would place somewhere other than the producer put them.
+//!
 //! [`surface`], which is the other half of a shader module: a family says what a vertex is and a
 //! surface says where it lands, so a module is one (family, surface) pair and the surface supplies
-//! the one function the body places through.
+//! the two functions a body places through — `place` for a point and `displace` for a direction,
+//! which is linear on a plane and is not on a sphere.
 //!
 //! [`uniforms`], which shadows a layer's consolidated buffer so a frame's scattered slot writes
 //! become the few contiguous ranges §11.7 asks for rather than a whole-buffer rewrite.
@@ -33,16 +42,32 @@
 //! (family, surface) and one module per permutation — see `tests/naga_overrides.rs` for why it is
 //! needed and `spec` for what it does.
 //!
+//! # How the shaders are checked
+//!
+//! Two ways, because reading a shader cannot catch what reading cannot see.
+//!
+//! `tests/shaders.rs` assembles every (family, surface) pair — 57 of them — compiles each to
+//! SPIR-V, and pins the decisions that are silent when wrong. A wrong one of those still draws,
+//! which is why they are pinned at all.
+//!
+//! `benches/first_pixel.rs` *runs* them. Twenty-one cases pick inputs that make one pixel
+//! predictable, derive that pixel from mbgl's own arithmetic by hand, draw, and read it back. It
+//! is a bench rather than a test because it needs a GPU and CI has none; it has caught defects
+//! the pins could not, including a feather mirrored by a coordinate flip naga applies after a
+//! body runs.
+//!
 //! # What is not here yet
 //!
 //! In dependency order: the reader half (`tessella-consume`, ported once to Rust and living in
 //! the tessella workspace); the geometry, uniform-block and texture stores keyed by the ABI's
-//! ids; the shader modules, one per (family, surface); and the hand-off itself, which waits on
-//! emblema gaining `VulkanTexture::assume_layout`.
+//! ids; the pipelines those modules become; and the hand-off itself, which waits on emblema
+//! gaining `VulkanTexture::assume_layout`.
 //!
-//! Nothing here reads the stream yet. [`tessella_capture_abi`] is a dependency from the first
-//! commit regardless, because it is the boundary this crate exists to sit on and its types are
-//! what every store above will be keyed by.
+//! Nothing here reads the stream yet, and nothing in this crate touches a GPU —
+//! `#![forbid(unsafe_code)]` is still at the top of this file, so the only `ash` calls are in the
+//! benches. [`tessella_capture_abi`] is a dependency from the first commit regardless, because it
+//! is the boundary this crate exists to sit on and its types are what every store above will be
+//! keyed by.
 
 #![forbid(unsafe_code)]
 

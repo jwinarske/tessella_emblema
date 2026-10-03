@@ -26,16 +26,17 @@
 
 use ash::vk;
 use tessella_capture_abi::generated::shader_attributes::{
-    BACKGROUND_SHADER, CIRCLE_SHADER, FILL_OUTLINE_SHADER, FILL_SHADER, ShaderAttribute,
+    BACKGROUND_SHADER, CIRCLE_SHADER, FILL_EXTRUSION_SHADER, FILL_OUTLINE_SHADER, FILL_SHADER,
+    ShaderAttribute,
 };
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
-    FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO,
-    GLOBAL_PAINT_PARAMS_UBO, UboLayout,
+    FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
+    FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, GLOBAL_PAINT_PARAMS_UBO, UboLayout,
 };
 use tessella_emblema::device::{preferred, vertex_format};
 use tessella_emblema::shaders::{
-    BACKGROUND_BODY, CIRCLE_BODY, FILL_BODY, FILL_OUTLINE_BODY, module,
+    BACKGROUND_BODY, CIRCLE_BODY, FILL_BODY, FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -130,7 +131,7 @@ fn run() -> Result<usize, String> {
                 case.name, case.expect
             ));
         }
-        println!("  {:<13} {drawn:?}", case.name);
+        println!("  {:<15} {drawn:?}", case.name);
     }
     Ok(cases.len())
 }
@@ -239,6 +240,110 @@ fn cases() -> Vec<Case> {
             vertices: 3,
             expect: [255, 255, 255, 255],
         },
+        // An extrusion's roof, which is the one family that computes a color rather than
+        // carrying one. Every number is derived from `fill_extrusion.hpp` by hand, so a
+        // disagreement is between mbgl's arithmetic and this crate's rather than between the
+        // shader and a restatement of itself.
+        //
+        // Lit brightly, where the surface's own luminance is what narrows the range:
+        //
+        //   luminance   = 1.0*0.2126 + 0.25098*0.7152 + 0*0.0722   = 0.39210
+        //   ambient     = (1.03, 0.28098, 0.03)
+        //   facing      = clamp(dot((0, 0, 1), (0, 0, 2)), 0, 1)   = 1
+        //   directional = mix(1 - 1, max(1 - 0.39210 + 1, 1), 1)   = 1.60790
+        //   lit         = clamp(ambient * 1.60790)  ->  (255, 115, 12)
+        //
+        // The color is deliberately not gray: with equal channels any permutation of the
+        // luminance weights gives the same answer, and that mutation survived a gray case. Red
+        // saturates the clamp and the other two channels carry the signal.
+        //
+        // The light sits at twice the height it needs to, which costs the expectation nothing and
+        // puts the `facing` clamp's upper end under test: without it the dot product is two, and
+        // this reads (255, 230, 25).
+        Case {
+            name: "fill_extrusion",
+            blocks: vec![&FILL_EXTRUSION_DRAWABLE_UBO, &FILL_EXTRUSION_PROPS_UBO],
+            attributes: &FILL_EXTRUSION_SHADER,
+            body: FILL_EXTRUSION_BODY,
+            streams: vec![
+                shorts(&COVERING),
+                ushorts(&[0, 0, 0, 0, 0, 0]),
+                per_vertex(&packed_color([255, 64, 0, 255]), 3),
+                per_vertex(&[0.0, 0.0], 3),
+                per_vertex(&[0.0, 0.0], 3),
+            ],
+            uniforms: vec![
+                block(
+                    &FILL_EXTRUSION_DRAWABLE_UBO,
+                    &[
+                        ("matrix", At::F(&CLIP)),
+                        ("base_t", At::F(&[0.0])),
+                        ("height_t", At::F(&[0.0])),
+                        ("color_t", At::F(&[0.0])),
+                    ],
+                ),
+                block(
+                    &FILL_EXTRUSION_PROPS_UBO,
+                    &[
+                        ("light_color", At::F(&[1.0, 1.0, 1.0])),
+                        ("light_position", At::F(&[0.0, 0.0, 2.0])),
+                        ("light_intensity", At::F(&[1.0])),
+                        ("vertical_gradient", At::F(&[0.0])),
+                        ("opacity", At::F(&[1.0])),
+                    ],
+                ),
+            ],
+            vertices: 3,
+            expect: [255, 115, 12, 255],
+        },
+        // The same roof under a dim light at an angle, which is where the other half of the
+        // shading shows. Above, the light is overhead and at full intensity, so the mix lands on
+        // its upper end and the `max` that guards it never binds.
+        //
+        //   luminance   = 0.50196,  ambient = 0.53196
+        //   least = 1 - 0.1 = 0.9,  most = max(1 - 0.50196 + 0.1, 1) = 1.0
+        //   directional = mix(0.9, 1.0, 0.25)                        = 0.92500
+        //   lit         = 0.53196 * 0.925  ->  125
+        //
+        // Three mutations separate here and nowhere else: dropping the `max` reads 112, swapping
+        // the mix's arms reads 132, and a facing of a quarter is what keeps those two apart -- at
+        // a half the mix is symmetric and the swap is invisible.
+        Case {
+            name: "extrusion_dim",
+            blocks: vec![&FILL_EXTRUSION_DRAWABLE_UBO, &FILL_EXTRUSION_PROPS_UBO],
+            attributes: &FILL_EXTRUSION_SHADER,
+            body: FILL_EXTRUSION_BODY,
+            streams: vec![
+                shorts(&COVERING),
+                ushorts(&[0, 0, 0, 0, 0, 0]),
+                per_vertex(&packed_color([128, 128, 128, 255]), 3),
+                per_vertex(&[0.0, 0.0], 3),
+                per_vertex(&[0.0, 0.0], 3),
+            ],
+            uniforms: vec![
+                block(
+                    &FILL_EXTRUSION_DRAWABLE_UBO,
+                    &[
+                        ("matrix", At::F(&CLIP)),
+                        ("base_t", At::F(&[0.0])),
+                        ("height_t", At::F(&[0.0])),
+                        ("color_t", At::F(&[0.0])),
+                    ],
+                ),
+                block(
+                    &FILL_EXTRUSION_PROPS_UBO,
+                    &[
+                        ("light_color", At::F(&[1.0, 1.0, 1.0])),
+                        ("light_position", At::F(&[0.0, 0.0, 0.25])),
+                        ("light_intensity", At::F(&[0.1])),
+                        ("vertical_gradient", At::F(&[0.0])),
+                        ("opacity", At::F(&[1.0])),
+                    ],
+                ),
+            ],
+            vertices: 3,
+            expect: [125, 125, 125, 255],
+        },
         // A circle, read at its own center: the extrusion interpolates to zero there, which is
         // inside the fill and nowhere near the stroke. With no stroke width the stroke's own
         // selection is skipped, so what is left is the fill color times its opacity.
@@ -325,6 +430,14 @@ fn per_vertex(values: &[f32], vertices: usize) -> Vec<u8> {
 
 /// A stream of sixteen-bit positions.
 fn shorts(values: &[i16]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+/// A stream of unsigned sixteen-bit values, which is what a packed pair arrives as.
+fn ushorts(values: &[u16]) -> Vec<u8> {
     values
         .iter()
         .flat_map(|value| value.to_le_bytes())

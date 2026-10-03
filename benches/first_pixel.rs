@@ -449,6 +449,8 @@ impl Gpu {
     /// The vertex buffers' contents are built per attribute from `FILL_SHADER`, so each one holds
     /// exactly what its declared type says and the pipeline below describes it from the same
     /// table.
+    // Vulkan setup, which is a sequence rather than a composition.
+    #[allow(clippy::too_many_lines)]
     fn fill_buffers(&mut self, physical: vk::PhysicalDevice) -> Result<(), String> {
         // The triangle covers the viewport: with the identity matrix a tile position is a clip
         // position, so these three corners put the whole target inside the triangle.

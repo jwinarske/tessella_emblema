@@ -27,11 +27,12 @@
 use ash::vk;
 use tessella_capture_abi::generated::shader_attributes::{
     BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER, FILL_EXTRUSION_SHADER,
-    FILL_OUTLINE_SHADER, FILL_SHADER, HEATMAP_TEXTURE_SHADER, RASTER_SHADER, SYMBOL_SDFSHADER,
-    ShaderAttribute,
+    FILL_OUTLINE_SHADER, FILL_SHADER, HEATMAP_TEXTURE_SHADER, HILLSHADE_PREPARE_SHADER,
+    HILLSHADE_SHADER, RASTER_SHADER, SYMBOL_SDFSHADER, ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
-    COLOR_RELIEF_SHADER_TEXTURES, HEATMAP_TEXTURE_SHADER_TEXTURES, RASTER_SHADER_TEXTURES,
+    COLOR_RELIEF_SHADER_TEXTURES, HEATMAP_TEXTURE_SHADER_TEXTURES,
+    HILLSHADE_PREPARE_SHADER_TEXTURES, HILLSHADE_SHADER_TEXTURES, RASTER_SHADER_TEXTURES,
     SYMBOL_SDFSHADER_TEXTURES, ShaderTexture,
 };
 use tessella_capture_abi::generated::ubo_layouts::{
@@ -39,13 +40,16 @@ use tessella_capture_abi::generated::ubo_layouts::{
     COLOR_RELIEF_DRAWABLE_UBO, COLOR_RELIEF_EVALUATED_PROPS_UBO, COLOR_RELIEF_TILE_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
     FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, GLOBAL_PAINT_PARAMS_UBO,
-    HEATMAP_TEXTURE_PROPS_UBO, RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO,
-    SYMBOL_DRAWABLE_UBO, SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
+    HEATMAP_TEXTURE_PROPS_UBO, HILLSHADE_DRAWABLE_UBO, HILLSHADE_EVALUATED_PROPS_UBO,
+    HILLSHADE_PREPARE_DRAWABLE_UBO, HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO,
+    RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO,
+    SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
 use tessella_emblema::device::{preferred, vertex_format};
 use tessella_emblema::shaders::{
     BACKGROUND_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY, FILL_EXTRUSION_BODY,
-    FILL_OUTLINE_BODY, HEATMAP_TEXTURE_BODY, RASTER_BODY, SYMBOL_SDF_BODY, module,
+    FILL_OUTLINE_BODY, HEATMAP_TEXTURE_BODY, HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, RASTER_BODY,
+    SYMBOL_SDF_BODY, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -927,6 +931,127 @@ fn cases() -> Vec<Case> {
             images: vec![glyph_atlas()],
             vertices: 3,
             expect: [0, 0, 0, 0],
+        },
+        // The first hillshade pass, which writes a slope rather than a picture.
+        //
+        // Nine DEM texels through a Sobel kernel. A coordinate of 4096 under a dimension of four
+        // puts the center sample at uv 0.5 and its neighbors at 0.25 and 0.75, which are texels
+        // 1, 2 and 3 -- so the kernel reads a 3x3 window and not the image's edge.
+        //
+        //   the DEM holds x * 20 + y * 5 in red, and the unpack takes red alone, so
+        //     a b c = 25 45 65     d . f = 30 . 70     g h i = 35 55 75
+        //   deriv.x = (65 + 70 + 70 + 75) - (25 + 30 + 30 + 35) = 160
+        //   deriv.y = (35 + 55 + 55 + 75) - (25 + 45 + 45 + 65) = 40
+        //   scaled by (4 - 2) / 2^(0 + 28.2562 - 21)  ->  (2.09323, 0.52331)
+        //   encoded as deriv / 8 + 0.5  ->  (194, 144, 255, 255)
+        //
+        // The DEM's two axes carry different weights on purpose. With a pure gradient in `x` the
+        // `y` derivative is nought, and reversing the kernel's rows -- the hillshade defect
+        // everybody ships once -- would read nought either way. Here it reads 111 instead of 144.
+        Case {
+            name: "hillshade_prep",
+            blocks: vec![
+                &HILLSHADE_PREPARE_DRAWABLE_UBO,
+                &HILLSHADE_PREPARE_TILE_PROPS_UBO,
+            ],
+            attributes: &HILLSHADE_PREPARE_SHADER,
+            body: HILLSHADE_PREPARE_BODY,
+            streams: vec![
+                shorts(&COVERING),
+                shorts(&[4096, 4096, 4096, 4096, 4096, 4096]),
+            ],
+            uniforms: vec![
+                block(&HILLSHADE_PREPARE_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
+                block(
+                    &HILLSHADE_PREPARE_TILE_PROPS_UBO,
+                    &[
+                        ("unpack", At::F(&[1.0, 0.0, 0.0, 0.0])),
+                        ("dimension", At::F(&[4.0, 4.0])),
+                        // At or above 15 the exaggeration term is nought, which keeps the
+                        // expectation to one power of two. A zoom of 21 is what scales the
+                        // derivative into a readable part of the channel.
+                        ("zoom", At::F(&[21.0])),
+                    ],
+                ),
+            ],
+            textures: &HILLSHADE_PREPARE_SHADER_TEXTURES,
+            images: vec![Image::new(4, |x, y| {
+                [u8::try_from(x * 20 + y * 5).unwrap_or(255), 0, 0, 255]
+            })],
+            vertices: 3,
+            expect: [194, 144, 255, 255],
+        },
+        // The second pass, shading the slope the first one wrote.
+        //
+        // Method four, which is one Lambertian light -- the simplest of the five, and the one
+        // whose answer can be derived without a page of trigonometry.
+        //
+        //   a coordinate of 3072 is uv 0.375, and the body flips `v`  ->  texel (1, 2)
+        //   the latitude there is 0.625 of the way from nought to 60, so 37.5 degrees, whose
+        //     cosine is 0.79335 -- the Mercator scale, because a pixel that far north covers less
+        //     ground and the same rise over it is a steeper real slope
+        //   that texel is (144, 128), so deriv = (0.51765, 0.00784) / 0.79335 and the slope the
+        //     light sees is twice that times an exaggeration of a half  = (0.65242, 0.00988)
+        //   with the light at an altitude of 1.4 and an azimuth of pi/2,
+        //     shade = (sin - lit.x * cos) / sqrt(1 + lit . lit) = 0.732329,  above a half
+        //   so the highlight applies:  (0.8, 0.4, 0.2, 1) * (2 * 0.732329 - 1)  ->  95, 47, 24, 118
+        //
+        // The altitude is 1.4 after measuring two others. At pi/3 the shade is 0.539, a hair
+        // above the branch at a half, and the pixel it draws is 16 -- an expectation that close to
+        // a discontinuity says more about float precision than about the shading. At 2.0 the shade
+        // clamps and the light's angle stops mattering at all.
+        //
+        // Texel (1, 1) is painted differently, so dropping the body's `v` flip reads it instead.
+        Case {
+            name: "hillshade",
+            blocks: vec![
+                &HILLSHADE_DRAWABLE_UBO,
+                &HILLSHADE_TILE_PROPS_UBO,
+                &HILLSHADE_EVALUATED_PROPS_UBO,
+            ],
+            attributes: &HILLSHADE_SHADER,
+            body: HILLSHADE_BODY,
+            streams: vec![
+                shorts(&COVERING),
+                shorts(&[3072, 3072, 3072, 3072, 3072, 3072]),
+            ],
+            uniforms: vec![
+                block(&HILLSHADE_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
+                block(
+                    &HILLSHADE_TILE_PROPS_UBO,
+                    &[
+                        // A real latitude, not nought. At nought the cosine is one and dividing
+                        // by it is the identity, so a body that dropped the Mercator scale draws
+                        // the same pixel -- that mutation survived until this was 60.
+                        ("latrange", At::F(&[60.0, 0.0])),
+                        ("exaggeration", At::F(&[0.5])),
+                        ("method", At::I(&[4])),
+                        ("num_lights", At::I(&[1])),
+                    ],
+                ),
+                block(
+                    &HILLSHADE_EVALUATED_PROPS_UBO,
+                    &[
+                        ("altitudes", At::F(&[1.4, 0.0, 0.0, 0.0])),
+                        (
+                            "azimuths",
+                            At::F(&[std::f32::consts::FRAC_PI_2, 0.0, 0.0, 0.0]),
+                        ),
+                        // Four colors each, one per light, which the preamble emits as four
+                        // `vec4`s under the no-matrix rule. Only the first is read here.
+                        ("shadows", At::F(&[0.2, 0.4, 0.8, 1.0])),
+                        ("highlights", At::F(&[0.8, 0.4, 0.2, 1.0])),
+                    ],
+                ),
+            ],
+            textures: &HILLSHADE_SHADER_TEXTURES,
+            images: vec![Image::new(4, |x, y| match (x, y) {
+                (1, 2) => [144, 128, 0, 255],
+                (1, 1) => [200, 200, 0, 255],
+                _ => [128, 128, 0, 255],
+            })],
+            vertices: 3,
+            expect: [95, 47, 24, 118],
         },
         // A circle, read at its own center: the extrusion interpolates to zero there, which is
         // inside the fill and nowhere near the stroke. With no stroke width the stroke's own

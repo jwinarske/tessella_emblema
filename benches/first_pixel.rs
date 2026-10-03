@@ -27,19 +27,21 @@
 use ash::vk;
 use tessella_capture_abi::generated::shader_attributes::{
     BACKGROUND_SHADER, CIRCLE_SHADER, FILL_EXTRUSION_SHADER, FILL_OUTLINE_SHADER, FILL_SHADER,
-    RASTER_SHADER, ShaderAttribute,
+    HEATMAP_TEXTURE_SHADER, RASTER_SHADER, ShaderAttribute,
 };
-use tessella_capture_abi::generated::texture_slots::{RASTER_SHADER_TEXTURES, ShaderTexture};
+use tessella_capture_abi::generated::texture_slots::{
+    HEATMAP_TEXTURE_SHADER_TEXTURES, RASTER_SHADER_TEXTURES, ShaderTexture,
+};
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
     FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, GLOBAL_PAINT_PARAMS_UBO,
-    RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, UboLayout,
+    HEATMAP_TEXTURE_PROPS_UBO, RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, UboLayout,
 };
 use tessella_emblema::device::{preferred, vertex_format};
 use tessella_emblema::shaders::{
-    BACKGROUND_BODY, CIRCLE_BODY, FILL_BODY, FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY, RASTER_BODY,
-    module,
+    BACKGROUND_BODY, CIRCLE_BODY, FILL_BODY, FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY,
+    HEATMAP_TEXTURE_BODY, RASTER_BODY, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -64,25 +66,37 @@ struct Case {
     expect: [u8; 4],
 }
 
-/// A square RGBA image the probe samples.
+/// An RGBA image the probe samples.
 ///
-/// Square and small, with every texel distinct where a case needs to tell which one was read.
+/// Small, with every texel distinct where a case needs to tell which one was read. A ramp is one
+/// of these too -- wide and a few rows tall rather than square, because a ramp's second coordinate
+/// is a constant the body chooses and a single row would make any choice look right.
 struct Image {
-    side: u32,
-    /// `side * side` texels, four bytes each.
+    width: u32,
+    height: u32,
+    /// `width * height` texels, four bytes each.
     texels: Vec<u8>,
 }
 
 impl Image {
-    /// An image whose texel `(x, y)` is `paint(x, y)`.
+    /// A square image whose texel `(x, y)` is `paint(x, y)`.
     fn new(side: u32, paint: impl Fn(u32, u32) -> [u8; 4]) -> Self {
-        let mut texels = Vec::with_capacity((side * side * 4) as usize);
-        for y in 0..side {
-            for x in 0..side {
+        Self::sized(side, side, paint)
+    }
+
+    /// The same, for an image that is not square.
+    fn sized(width: u32, height: u32, paint: impl Fn(u32, u32) -> [u8; 4]) -> Self {
+        let mut texels = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
                 texels.extend_from_slice(&paint(x, y));
             }
         }
-        Self { side, texels }
+        Self {
+            width,
+            height,
+            texels,
+        }
     }
 }
 
@@ -120,6 +134,24 @@ const CLIP: [f32; 16] = [
 
 /// A triangle covering the viewport, in tile units that the identity makes clip units.
 const COVERING: [i16; 6] = [-1, -1, 3, -1, -1, 3];
+
+/// A triangle covering the viewport in a coordinate space of nought to one.
+///
+/// `heatmap_texture`'s quad is the viewport rather than a tile, so its positions are a unit square
+/// and the matrix is what reaches clip space. See `UNIT_CLIP`.
+const UNIT: [i16; 6] = [0, 0, 2, 0, 0, 2];
+
+/// Nought to one onto clip space, with `y` negated as [`CLIP`] is.
+///
+/// `clip = (2x - 1, 1 - 2y)`, so the unit square covers the viewport exactly and the center pixel
+/// comes from a position near a half in both axes -- which is what makes the texture coordinate
+/// this case reads predictable.
+const UNIT_CLIP: [f32; 16] = [
+    2.0, 0.0, 0.0, 0.0, //
+    0.0, -2.0, 0.0, 0.0, //
+    0.0, 0.0, 1.0, 0.0, //
+    -1.0, 1.0, 0.0, 1.0,
+];
 
 /// Two triangles whose low bits spell the four corners of one quad, centered at the origin.
 ///
@@ -512,6 +544,67 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             expect: [54, 37, 87, 255],
+        },
+        // The heatmap's second pass, which turns an accumulated density into a color through a
+        // ramp. The first pass is not here: it writes a texture rather than a picture, and what
+        // this one checks is the lookup.
+        //
+        //   the center pixel is at clip (0.03125, 0.03125), which this matrix and a world size
+        //   of two reach from position (0.25781, 0.24219)  ->  density texel (1, 0), red 207
+        //   density = 0.81176  ->  ramp texel (3, 1) = (255, 128, 0, 255), times a half opacity
+        //
+        // Three numbers are chosen to separate three mutations that otherwise collide, and each
+        // one did collide before it was:
+        //
+        //   * **A world size of two, not one.** At one the multiply is the identity and a body
+        //     that dropped it reads the same texel. At two, dropping it moves the position to
+        //     (0.51563, 0.48438) and the pixel to (170, 128, 0).
+        //   * **A ramp three rows tall, with only the middle one painted.** One row makes any
+        //     second coordinate look right, and three is the smallest count where a half lands
+        //     inside a row rather than on a boundary -- so `0.5` is under test, and row nought
+        //     draws the magenta above it.
+        //   * **A density above three quarters.** The ramp is four wide and three tall, so for a
+        //     density near a half the lookup and its own transpose land on the same texel. At
+        //     0.81176 the transpose reads (2, 2), which is magenta.
+        Case {
+            name: "heatmap_texture",
+            blocks: vec![&HEATMAP_TEXTURE_PROPS_UBO, &GLOBAL_PAINT_PARAMS_UBO],
+            attributes: &HEATMAP_TEXTURE_SHADER,
+            body: HEATMAP_TEXTURE_BODY,
+            streams: vec![shorts(&UNIT)],
+            uniforms: vec![
+                block(
+                    &HEATMAP_TEXTURE_PROPS_UBO,
+                    // A half, so dropping the multiply is visible: at one it is the identity.
+                    &[("matrix", At::F(&UNIT_CLIP)), ("opacity", At::F(&[0.5]))],
+                ),
+                block(
+                    &GLOBAL_PAINT_PARAMS_UBO,
+                    &[("world_size", At::F(&[2.0, 2.0]))],
+                ),
+            ],
+            textures: &HEATMAP_TEXTURE_SHADER_TEXTURES,
+            images: vec![
+                // The density, in red, as the first pass writes it. Every texel distinct, so the
+                // pixel says which was read.
+                Image::new(4, |x, y| {
+                    [
+                        u8::try_from(255 - x * 48).unwrap_or(255),
+                        u8::try_from(y * 32).unwrap_or(255),
+                        0,
+                        255,
+                    ]
+                }),
+                Image::sized(4, 3, |x, y| {
+                    if y == 1 {
+                        [u8::try_from(x * 85).unwrap_or(255), 128, 0, 255]
+                    } else {
+                        [255, 0, 255, 255]
+                    }
+                }),
+            ],
+            vertices: 3,
+            expect: [128, 64, 0, 128],
         },
         // A circle, read at its own center: the extrusion interpolates to zero there, which is
         // inside the fill and nowhere near the stroke. With no stroke width the stroke's own
@@ -1466,8 +1559,8 @@ impl<'a> Held<'a> {
                         .image_type(vk::ImageType::TYPE_2D)
                         .format(vk::Format::R8G8B8A8_UNORM)
                         .extent(vk::Extent3D {
-                            width: source.side,
-                            height: source.side,
+                            width: source.width,
+                            height: source.height,
                             depth: 1,
                         })
                         .mip_levels(1)
@@ -1518,8 +1611,8 @@ impl<'a> Held<'a> {
             }
             .map_err(|why| format!("image {index} not mapped: {why}"))?
             .cast::<u8>();
-            let stride = (source.side * 4) as usize;
-            for row in 0..source.side as usize {
+            let stride = (source.width * 4) as usize;
+            for row in 0..source.height as usize {
                 let from = &source.texels[row * stride..(row + 1) * stride];
                 let at = layout.offset as usize + row * layout.row_pitch as usize;
                 unsafe {

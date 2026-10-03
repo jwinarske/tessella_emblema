@@ -6,21 +6,24 @@
 
 use tessella_capture_abi::generated::shader_attributes::{
     BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER, FILL_EXTRUSION_SHADER,
-    FILL_OUTLINE_SHADER, FILL_SHADER, LINE_SHADER, RASTER_SHADER, ShaderAttribute,
+    FILL_OUTLINE_SHADER, FILL_SHADER, LINE_SHADER, RASTER_SHADER, SYMBOL_ICON_SHADER,
+    ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
-    COLOR_RELIEF_SHADER_TEXTURES, RASTER_SHADER_TEXTURES, ShaderTexture,
+    COLOR_RELIEF_SHADER_TEXTURES, RASTER_SHADER_TEXTURES, SYMBOL_ICON_SHADER_TEXTURES,
+    ShaderTexture,
 };
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
     COLOR_RELIEF_DRAWABLE_UBO, COLOR_RELIEF_EVALUATED_PROPS_UBO, COLOR_RELIEF_TILE_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
-    FILL_EXTRUSION_PROPS_UBO, LINE_DRAWABLE_UBO, LINE_EVALUATED_PROPS_UBO, RASTER_DRAWABLE_UBO,
-    RASTER_EVALUATED_PROPS_UBO, UboLayout,
+    FILL_EXTRUSION_PROPS_UBO, GLOBAL_PAINT_PARAMS_UBO, LINE_DRAWABLE_UBO, LINE_EVALUATED_PROPS_UBO,
+    RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO,
+    SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
 use tessella_emblema::shaders::{
     BACKGROUND_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY, FILL_EXTRUSION_BODY,
-    FILL_OUTLINE_BODY, LINE_BODY, RASTER_BODY, attribute_name, module,
+    FILL_OUTLINE_BODY, LINE_BODY, RASTER_BODY, SYMBOL_ICON_BODY, attribute_name, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -124,6 +127,20 @@ fn families() -> Vec<Family> {
             // No direct bend: it has no height term, and this is the family with a height.
             surfaces: &[Surface::Plane, Surface::GlobeAnchored],
             height: true,
+        },
+        Family {
+            name: "symbol_icon",
+            blocks: vec![
+                &SYMBOL_DRAWABLE_UBO,
+                &SYMBOL_TILE_PROPS_UBO,
+                &SYMBOL_EVALUATED_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
+            attributes: &SYMBOL_ICON_SHADER,
+            textures: &SYMBOL_ICON_SHADER_TEXTURES,
+            body: SYMBOL_ICON_BODY,
+            surfaces: all,
+            height: false,
         },
         Family {
             name: "circle",
@@ -238,6 +255,55 @@ fn the_roof_sits_at_the_top_and_keeps_its_fraction() {
     assert!(
         source.contains("place(vec3<f32>(footprint + decimals, z), drawable.matrix)"),
         "the fraction is not added, or the height is not the third component"
+    );
+}
+
+/// The symbol icon keeps the three decisions that are silent when wrong.
+///
+/// * **The corner is added in the label plane**, after `label_plane_matrix`, not in tile units.
+///   That is the whole reason a symbol is placed through two matrices; added in tile units, type
+///   changes size across a tile.
+/// * **The perspective ratio inverts with `pitch_with_map`.** Laid out in pitched space, distance
+///   shrinks a label and the ratio counteracts part of it; laid out in viewport space it grows
+///   one. Backwards, distant type gets larger.
+/// * **The fade's direction is its low bit.** The packed float carries the opacity in the high
+///   bits and which way it is moving in the low one; with the sign reversed, a label fading in
+///   fades out.
+///
+/// All three compile, validate and draw, which is what makes them worth pinning.
+#[test]
+fn the_symbol_icon_keeps_its_placement_decisions() {
+    let icon = families()
+        .into_iter()
+        .find(|family| family.name == "symbol_icon")
+        .expect("symbol icon is in the matrix");
+    let source = module(
+        Surface::Plane,
+        &icon.blocks,
+        icon.attributes,
+        icon.textures,
+        icon.body,
+    )
+    .expect("assembles");
+
+    assert!(
+        source.contains("let in_plane = transform(drawable.label_plane_matrix,")
+            && source.contains("let on_plane = in_plane.xy / in_plane.w + spun * offset;"),
+        "the corner is not added in the label plane:\n{source}"
+    );
+    assert!(
+        source.contains("place(vec3<f32>(on_plane, 0.0), drawable.coord_matrix)"),
+        "the placed point does not go through the coordinate matrix"
+    );
+    assert!(
+        source.contains("var ratio = global.camera_to_center_distance / to_anchor;")
+            && source.contains("ratio = to_anchor / global.camera_to_center_distance;"),
+        "the perspective ratio does not invert with the pitch"
+    );
+    assert!(
+        source.contains("var change = -global.symbol_fade_change;")
+            && source.contains("change = global.symbol_fade_change;"),
+        "the fade's direction is not taken from its low bit"
     );
 }
 
@@ -629,7 +695,7 @@ fn every_family_on_every_surface_compiles() {
         }
     }
     assert_eq!(
-        pairs, 27,
+        pairs, 31,
         "the matrix grew or shrank; look at the new pairs"
     );
 }

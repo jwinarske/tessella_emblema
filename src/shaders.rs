@@ -84,8 +84,9 @@ const fn attribute_type(declared: AttributeDataType) -> Option<&'static str> {
         AttributeDataType::Float2 => Some("vec2<f32>"),
         AttributeDataType::Float3 => Some("vec3<f32>"),
         AttributeDataType::Float4 => Some("vec4<f32>"),
-        // Eight shorts: mbgl packs a symbol's placement into one attribute, read as two vec4s
-        // worth of integers and taken apart in the body.
+        // Eight shorts. No family in the ABI's tables declares one -- the arm is here because the
+        // enum has the variant, not because anything reads it. An earlier comment here said this
+        // was a symbol's packed placement; it is not, and the symbol families declare `UShort4`.
         AttributeDataType::UShort8 => Some("array<u32, 8>"),
         // Invalid is the ABI saying it does not know, and a shader cannot read a
         // type nobody named. Refused by the caller rather than guessed at here.
@@ -726,6 +727,121 @@ fn vertex_main(in: In) -> Out {
 @fragment
 fn fragment_main(in: Out) -> @location(0) vec4<f32> {
     return in.shade;
+}
+";
+
+/// The symbol-icon family's body.
+///
+/// A sprite placed where a label was laid out. The hardest placement of any family here, because a
+/// symbol is positioned twice: the anchor goes through the *label plane* matrix, where the layout
+/// decided it, and the glyph's own corner offset is added in that plane before the result goes
+/// through the coordinate matrix to clip space. Adding the offset in tile units instead would
+/// make type change size across a tile.
+///
+/// It is also the first family to read [`GLOBAL_PAINT_PARAMS_UBO`], which carries what a frame
+/// knows and a drawable does not: how far the camera is from the center, the viewport's aspect,
+/// and how far the fades have advanced.
+///
+/// # Where this departs from fluorite
+///
+/// fluorite packs `projected_pos` and `fade_opacity` into one attribute slot, because Filament ran
+/// out of custom slots. Nothing here has that limit: each attribute binds at the location the
+/// producer gives it, so the two are read separately.
+///
+/// [`GLOBAL_PAINT_PARAMS_UBO`]: tessella_capture_abi::generated::ubo_layouts::GLOBAL_PAINT_PARAMS_UBO
+pub const SYMBOL_ICON_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) tex: vec2<f32>,
+    @location(1) fade: f32,
+    @location(2) opacity: f32,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let drawable = symbol_drawable_ubo[ubo_index];
+    let global = global_paint_params_ubo[0];
+    var out: Out;
+
+    let anchor = vec2<f32>(in.symbol_pos_offset.xy);
+    let corner = vec2<f32>(in.symbol_pos_offset.zw);
+    let tex = vec2<f32>(in.symbol_data.xy);
+    let sized = vec2<f32>(in.symbol_data.zw);
+    let pixel_offset = vec2<f32>(in.symbol_pixel_offset.xy);
+
+    // The layout's own position, and the angle of the segment the label sits on.
+    let placed = in.symbol_projected_pos;
+    let segment_angle = -placed.z;
+
+    // Three ways a size arrives, which is what the two flags distinguish: interpolated between
+    // the feature's own stops, the feature's lower stop alone, or the layer's constant.
+    let smallest = floor(sized.x * 0.5);
+    var size = drawable.size;
+    if drawable.is_size_zoom_constant == 0 && drawable.is_size_feature_constant == 0 {
+        size = mix(smallest, sized.y, drawable.size_t) / 128.0;
+    } else if drawable.is_size_zoom_constant != 0 && drawable.is_size_feature_constant == 0 {
+        size = smallest / 128.0;
+    }
+
+    // How far the anchor is from the camera, which is what makes distant type smaller. Laid out
+    // in pitched space distance shrinks a label and this counteracts part of it; laid out in
+    // viewport space it grows one, so the ratio inverts.
+    let anchor_point = transform(drawable.matrix, vec3<f32>(anchor, 0.0));
+    let to_anchor = anchor_point.w;
+    var ratio = global.camera_to_center_distance / to_anchor;
+    if drawable.pitch_with_map != 0 {
+        ratio = to_anchor / global.camera_to_center_distance;
+    }
+    // The zero floor is what stops an overzoomed near-field symbol becoming enormous.
+    let perspective = clamp(0.5 + 0.5 * ratio, 0.0, 4.0);
+    if drawable.is_offset == 0 {
+        size *= perspective;
+    }
+    var font_scale = size;
+    if drawable.is_text_prop != 0 {
+        font_scale = size / 24.0;
+    }
+
+    // A label horizontal in tile units is not horizontal on screen. Its angle there is found by
+    // projecting a short horizontal line and measuring what became of it.
+    var rotation = 0.0;
+    if drawable.rotate_symbol != 0 {
+        let along = transform(drawable.matrix, vec3<f32>(anchor + vec2<f32>(1.0, 0.0), 0.0));
+        let here = anchor_point.xy / anchor_point.w;
+        let there = along.xy / along.w;
+        rotation = atan2((there.y - here.y) / global.aspect_ratio, there.x - here.x);
+    }
+
+    let turn = segment_angle + rotation;
+    let spun = mat2x2<f32>(cos(turn), -sin(turn), sin(turn), cos(turn));
+
+    // The anchor in the label plane, with the corner added there rather than in tile units.
+    let in_plane = transform(drawable.label_plane_matrix, vec3<f32>(placed.xy, 0.0));
+    let offset = corner / 32.0 * font_scale + pixel_offset;
+    let on_plane = in_plane.xy / in_plane.w + spun * offset;
+    out.clip = place(vec3<f32>(on_plane, 0.0), drawable.coord_matrix);
+
+    // Two values in one float: the opacity in the high bits and the direction it is moving in the
+    // low bit, so a label fading in and one fading out are told apart.
+    let whole = floor(in.symbol_fade_opacity / 2.0);
+    let rising = in.symbol_fade_opacity - whole * 2.0;
+    var change = -global.symbol_fade_change;
+    if rising > 0.5 {
+        change = global.symbol_fade_change;
+    }
+    out.fade = clamp(whole / 127.0 + change, 0.0, 1.0);
+
+    out.tex = tex / drawable.texsize;
+    out.opacity = mix_value(in.symbol_opacity, drawable.opacity_t);
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    // The sheet is premultiplied, so the opacity and the fade scale it directly.
+    let sprite = textureSample(symbol_image, symbol_image_sampler, in.tex);
+    return sprite * (in.opacity * in.fade);
 }
 ";
 

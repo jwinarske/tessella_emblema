@@ -27,23 +27,25 @@
 use ash::vk;
 use tessella_capture_abi::generated::shader_attributes::{
     BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER, FILL_EXTRUSION_SHADER,
-    FILL_OUTLINE_SHADER, FILL_SHADER, HEATMAP_TEXTURE_SHADER, RASTER_SHADER, ShaderAttribute,
+    FILL_OUTLINE_SHADER, FILL_SHADER, HEATMAP_TEXTURE_SHADER, RASTER_SHADER, SYMBOL_SDFSHADER,
+    ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
     COLOR_RELIEF_SHADER_TEXTURES, HEATMAP_TEXTURE_SHADER_TEXTURES, RASTER_SHADER_TEXTURES,
-    ShaderTexture,
+    SYMBOL_SDFSHADER_TEXTURES, ShaderTexture,
 };
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
     COLOR_RELIEF_DRAWABLE_UBO, COLOR_RELIEF_EVALUATED_PROPS_UBO, COLOR_RELIEF_TILE_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
     FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, GLOBAL_PAINT_PARAMS_UBO,
-    HEATMAP_TEXTURE_PROPS_UBO, RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, UboLayout,
+    HEATMAP_TEXTURE_PROPS_UBO, RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO,
+    SYMBOL_DRAWABLE_UBO, SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
 use tessella_emblema::device::{preferred, vertex_format};
 use tessella_emblema::shaders::{
     BACKGROUND_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY, FILL_EXTRUSION_BODY,
-    FILL_OUTLINE_BODY, HEATMAP_TEXTURE_BODY, RASTER_BODY, module,
+    FILL_OUTLINE_BODY, HEATMAP_TEXTURE_BODY, RASTER_BODY, SYMBOL_SDF_BODY, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -153,7 +155,6 @@ impl Image {
     }
 
     /// One byte a texel, which is how a glyph atlas arrives.
-    #[allow(dead_code)]
     fn red(width: u32, height: u32, paint: impl Fn(u32, u32) -> u8) -> Self {
         let mut texels = Vec::with_capacity((width * height) as usize);
         for y in 0..height {
@@ -221,6 +222,68 @@ const UNIT_CLIP: [f32; 16] = [
     0.0, 0.0, 1.0, 0.0, //
     -1.0, 1.0, 0.0, 1.0,
 ];
+
+/// The glyph a symbol case samples, and the two texels that matter.
+///
+/// One channel, which is what `GLYPH_ATLAS_FORMAT` is. Texel (5, 5) is solid, so one case lands
+/// inside the glyph; (6, 6) holds 153, which is below the coverage ramp but above where the ramp
+/// would sit if the field's zero level moved -- so the case that lands there separates two
+/// mutations rather than one.
+fn glyph_atlas() -> Image {
+    Image::red(16, 16, |x, y| match (x, y) {
+        (5, 5) => 255,
+        (6, 6) => 153,
+        _ => 0,
+    })
+}
+
+/// A symbol's drawable block, which every symbol case shares but for the gamma.
+///
+/// The three matrices are all [`CLIP`], which collapses the two-stage placement: the layout
+/// position is the origin, so the label plane contributes nothing and the corner offset reaches
+/// clip space directly. Both size flags are set and the offset flag with them, so the size is the
+/// block's own and the perspective term is skipped -- the placement this leaves is
+/// `corner / 32 * font_scale`, and a font scale of 32 makes that the corner itself.
+fn symbol_drawable() -> Vec<u8> {
+    block(
+        &SYMBOL_DRAWABLE_UBO,
+        &[
+            ("matrix", At::F(&CLIP)),
+            ("label_plane_matrix", At::F(&CLIP)),
+            ("coord_matrix", At::F(&CLIP)),
+            ("texsize", At::F(&[16.0, 16.0])),
+            ("texsize_icon", At::F(&[16.0, 16.0])),
+            // Not a text property, so the font scale is the size rather than the size over 24.
+            ("is_text_prop", At::I(&[0])),
+            ("rotate_symbol", At::I(&[0])),
+            ("pitch_with_map", At::I(&[0])),
+            ("is_size_zoom_constant", At::I(&[1])),
+            ("is_size_feature_constant", At::I(&[1])),
+            ("is_offset", At::I(&[1])),
+            ("size", At::F(&[32.0])),
+        ],
+    )
+}
+
+/// The ten streams a symbol-SDF vertex needs, with the corner and the glyph's texel chosen.
+fn symbol_streams(tex: u16) -> Vec<Vec<u8>> {
+    vec![
+        // The anchor at the origin and the corner covering the viewport, in one `Short4`.
+        shorts(&[0, 0, -1, -1, 0, 0, 3, -1, 0, 0, -1, 3]),
+        // The glyph's texel, then a size this case does not use.
+        ushorts(&[tex, tex, 0, 0, tex, tex, 0, 0, tex, tex, 0, 0]),
+        shorts(&[0; 12]),
+        per_vertex(&[0.0, 0.0, 0.0], 3),
+        // 254 is an opacity of 127 with the rising bit clear, which with no fade change in
+        // flight is a fade of exactly one.
+        per_vertex(&[254.0], 3),
+        per_vertex(&packed_color([200, 100, 50, 255]), 3),
+        per_vertex(&packed_color([255, 0, 255, 255]), 3),
+        per_vertex(&[1.0, 1.0], 3),
+        per_vertex(&[0.0, 0.0], 3),
+        per_vertex(&[0.0, 0.0], 3),
+    ]
+}
 
 /// Two triangles whose low bits spell the four corners of one quad, centered at the origin.
 ///
@@ -758,6 +821,112 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             expect: [10, 90, 55, 128],
+        },
+        // A glyph, read from the middle of its own solid texel.
+        //
+        // This is the case that puts a pixel behind the obligation `SYMBOL_SDF_BODY` documents.
+        // `GLYPH_ATLAS_FORMAT` is one channel, Vulkan has no alpha-only format, and so the channel
+        // the field arrives in is the image view's to decide: mbgl's own backend uploads
+        // `R8_UNORM` and maps red into alpha, and its shader reads `.a`. This crate reads `.r`,
+        // which is right through a view with the identity mapping -- the default, and what the
+        // probe creates.
+        //
+        //   gamma = (0.105 / 1) / (32 * 0.1) = 0.03281,  inner edge = 192 / 256 = 0.75
+        //   the ramp is [0.71719, 0.78281], and the solid texel is 1.0, above it
+        //   alpha = 1  ->  the fill color, times an opacity and a fade of one
+        //
+        // The ends of the ramp rather than its middle, on purpose: at the middle one byte of the
+        // atlas moves the result by a step and a half, and an expectation that tight says more
+        // about float precision than about the shader.
+        //
+        // Not covered by either symbol case: the halo, which needs `is_halo` and a second draw;
+        // and `edge_gamma`'s own value, which only sets the ramp's *width* -- both texels sit
+        // outside it, so widening it moves the answer by less than a quantization step. Both are
+        // pinned in `tests/shaders.rs` instead.
+        Case {
+            name: "symbol_sdf",
+            blocks: vec![
+                &SYMBOL_DRAWABLE_UBO,
+                &SYMBOL_TILE_PROPS_UBO,
+                &SYMBOL_EVALUATED_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
+            attributes: &SYMBOL_SDFSHADER,
+            body: SYMBOL_SDF_BODY,
+            streams: symbol_streams(5),
+            uniforms: vec![
+                symbol_drawable(),
+                block(
+                    &SYMBOL_TILE_PROPS_UBO,
+                    &[
+                        ("is_text", At::I(&[0])),
+                        ("is_halo", At::I(&[0])),
+                        ("gamma_scale", At::F(&[0.1])),
+                    ],
+                ),
+                block(&SYMBOL_EVALUATED_PROPS_UBO, &[]),
+                block(
+                    &GLOBAL_PAINT_PARAMS_UBO,
+                    &[
+                        ("camera_to_center_distance", At::F(&[1.0])),
+                        ("symbol_fade_change", At::F(&[0.0])),
+                        ("aspect_ratio", At::F(&[1.0])),
+                        ("pixel_ratio", At::F(&[1.0])),
+                    ],
+                ),
+            ],
+            textures: &SYMBOL_SDFSHADER_TEXTURES,
+            images: vec![glyph_atlas()],
+            vertices: 3,
+            expect: [200, 100, 50, 255],
+        },
+        // The same glyph, read one texel over, outside the letter.
+        //
+        // Nothing is drawn, and that is the assertion. The case above is what says the setup draws
+        // at all, and the pair is what separates the channels: `.a` through an identity-mapped
+        // view is 1.0 at *every* texel, so a body reading it would draw the fill color here too
+        // and the two cases would be indistinguishable.
+        //
+        // The texel is 153 rather than nought, which is 0.6 -- below the ramp at
+        // [0.71719, 0.78281] and so still no coverage, but *above* the [0.46719, 0.53281] the ramp
+        // would sit at if the field's zero level moved from 192 to 128. So this one pixel
+        // separates two mutations: the channel and the edge.
+        Case {
+            name: "symbol_below",
+            blocks: vec![
+                &SYMBOL_DRAWABLE_UBO,
+                &SYMBOL_TILE_PROPS_UBO,
+                &SYMBOL_EVALUATED_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
+            attributes: &SYMBOL_SDFSHADER,
+            body: SYMBOL_SDF_BODY,
+            streams: symbol_streams(6),
+            uniforms: vec![
+                symbol_drawable(),
+                block(
+                    &SYMBOL_TILE_PROPS_UBO,
+                    &[
+                        ("is_text", At::I(&[0])),
+                        ("is_halo", At::I(&[0])),
+                        ("gamma_scale", At::F(&[0.1])),
+                    ],
+                ),
+                block(&SYMBOL_EVALUATED_PROPS_UBO, &[]),
+                block(
+                    &GLOBAL_PAINT_PARAMS_UBO,
+                    &[
+                        ("camera_to_center_distance", At::F(&[1.0])),
+                        ("symbol_fade_change", At::F(&[0.0])),
+                        ("aspect_ratio", At::F(&[1.0])),
+                        ("pixel_ratio", At::F(&[1.0])),
+                    ],
+                ),
+            ],
+            textures: &SYMBOL_SDFSHADER_TEXTURES,
+            images: vec![glyph_atlas()],
+            vertices: 3,
+            expect: [0, 0, 0, 0],
         },
         // A circle, read at its own center: the extrusion interpolates to zero there, which is
         // inside the fill and nowhere near the stroke. With no stroke width the stroke's own

@@ -845,6 +845,154 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
 }
 ";
 
+/// The symbol-SDF family's body: text, and its halo.
+///
+/// The icon's placement exactly -- see [`SYMBOL_ICON_BODY`] -- with four more paint properties and
+/// a different fragment stage. A glyph is a signed distance field rather than a picture, so the
+/// edge is found by thresholding the distance and the width of that threshold is what makes type
+/// look right at a size rather than blurred or bitten.
+///
+/// # The atlas is read from red, where mbgl reads alpha
+///
+/// `GLYPH_ATLAS_FORMAT` is `TexturePixelType::Alpha`, one channel. GL's `GL_ALPHA` samples as
+/// `(0, 0, 0, a)`, which is why mbgl reads `.a`; Vulkan has no alpha-only format, so one channel
+/// is `R8_UNORM` and samples as `(r, 0, 0, 1)`. Reading `.a` here would be 1.0 at every pixel --
+/// every glyph a solid block. The bytes are the same; only the channel they arrive in differs.
+///
+/// A one-channel atlas is also a known hazard on this hardware: a sibling consumer found Adreno
+/// GLES sampling `r8` as zero under minification and widened its atlases to RGBA. Whether Vulkan
+/// on that part does the same is untested here.
+///
+/// # The halo is subtracted, not drawn under
+///
+/// A translucent fill wants a translucent halo *inside* it. Drawing the halo first and the fill
+/// over it doubles the coverage where they meet, so the fill's own alpha is subtracted from the
+/// halo's instead.
+pub const SYMBOL_SDF_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) tex: vec2<f32>,
+    @location(1) fade: f32,
+    @location(2) font_scale: f32,
+    @location(3) gamma: f32,
+    @location(4) paint: vec4<f32>,
+    @location(5) opacity: f32,
+    @location(6) halo_width: f32,
+    @location(7) halo_blur: f32,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let drawable = symbol_drawable_ubo[ubo_index];
+    let tile = symbol_tile_props_ubo[ubo_index];
+    let global = global_paint_params_ubo[0];
+    var out: Out;
+
+    let anchor = vec2<f32>(in.symbol_pos_offset.xy);
+    let corner = vec2<f32>(in.symbol_pos_offset.zw);
+    let tex = vec2<f32>(in.symbol_data.xy);
+    let sized = vec2<f32>(in.symbol_data.zw);
+    let pixel_offset = vec2<f32>(in.symbol_pixel_offset.xy);
+    let placed = in.symbol_projected_pos;
+    let segment_angle = -placed.z;
+
+    let smallest = floor(sized.x * 0.5);
+    var size = drawable.size;
+    if drawable.is_size_zoom_constant == 0 && drawable.is_size_feature_constant == 0 {
+        size = mix(smallest, sized.y, drawable.size_t) / 128.0;
+    } else if drawable.is_size_zoom_constant != 0 && drawable.is_size_feature_constant == 0 {
+        size = smallest / 128.0;
+    }
+
+    let anchor_point = transform(drawable.matrix, vec3<f32>(anchor, 0.0));
+    let to_anchor = anchor_point.w;
+    var ratio = global.camera_to_center_distance / to_anchor;
+    if drawable.pitch_with_map != 0 {
+        ratio = to_anchor / global.camera_to_center_distance;
+    }
+    let perspective = clamp(0.5 + 0.5 * ratio, 0.0, 4.0);
+    if drawable.is_offset == 0 {
+        size *= perspective;
+    }
+    // Twenty-four is the size the glyphs were rasterized at, so this is how far the field has to
+    // be stretched to reach the size the style asked for.
+    var font_scale = size;
+    if drawable.is_text_prop != 0 {
+        font_scale = size / 24.0;
+    }
+
+    var rotation = 0.0;
+    if drawable.rotate_symbol != 0 {
+        let along = transform(drawable.matrix, vec3<f32>(anchor + vec2<f32>(1.0, 0.0), 0.0));
+        let here = anchor_point.xy / anchor_point.w;
+        let there = along.xy / along.w;
+        rotation = atan2((there.y - here.y) / global.aspect_ratio, there.x - here.x);
+    }
+    let turn = segment_angle + rotation;
+    let spun = mat2x2<f32>(cos(turn), -sin(turn), sin(turn), cos(turn));
+
+    let in_plane = transform(drawable.label_plane_matrix, vec3<f32>(placed.xy, 0.0));
+    let offset = corner / 32.0 * font_scale + pixel_offset;
+    let on_plane = in_plane.xy / in_plane.w + spun * offset;
+    let clip = place(vec3<f32>(on_plane, 0.0), drawable.coord_matrix);
+    out.clip = clip;
+
+    let whole = floor(in.symbol_fade_opacity / 2.0);
+    let rising = in.symbol_fade_opacity - whole * 2.0;
+    var change = -global.symbol_fade_change;
+    if rising > 0.5 {
+        change = global.symbol_fade_change;
+    }
+    out.fade = clamp(whole / 127.0 + change, 0.0, 1.0);
+
+    // The halo pass and the fill pass are two draws of the same geometry, told apart here.
+    let fill = mix_color(in.symbol_color, drawable.fill_color_t);
+    let halo = mix_color(in.symbol_halo_color, drawable.halo_color_t);
+    out.paint = select(fill, halo, tile.is_halo != 0);
+
+    out.tex = tex / drawable.texsize;
+    out.font_scale = font_scale;
+    // The perspective divide the threshold has to be measured in, which is the clip `w`.
+    out.gamma = clip.w;
+    out.opacity = mix_value(in.symbol_opacity, drawable.opacity_t);
+    out.halo_width = mix_value(in.symbol_halo_width, drawable.halo_width_t);
+    out.halo_blur = mix_value(in.symbol_halo_blur, drawable.halo_blur_t);
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    let tile = symbol_tile_props_ubo[ubo_index];
+    let global = global_paint_params_ubo[0];
+
+    // The atlas stores eight distance units a pixel.
+    let sdf_px = 8.0;
+    let edge_gamma = 0.105 / max(global.pixel_ratio, 1e-6);
+    let font_gamma = in.font_scale * tile.gamma_scale;
+    let fill_gamma = edge_gamma / font_gamma;
+    let halo_gamma = (in.halo_blur * 1.19 / sdf_px + edge_gamma) / font_gamma;
+
+    let is_halo = tile.is_halo != 0;
+    let gamma = select(fill_gamma, halo_gamma, is_halo) * in.gamma;
+
+    // Where the letter's edge sits in the field, and where a halo's does.
+    let fill_edge = (256.0 - 64.0) / 256.0;
+    let inner = select(fill_edge, fill_edge + halo_gamma * in.gamma, is_halo);
+
+    // `.r`, where mbgl reads `.a`: a one-channel format is `R8_UNORM` here and alpha reads 1.0.
+    let distance = textureSample(symbol_image, symbol_image_sampler, in.tex).r;
+    var alpha = smoothstep(inner - gamma, inner + gamma, distance);
+    if is_halo {
+        // Subtracted rather than drawn under, so a translucent fill keeps a translucent halo.
+        let halo_edge = (6.0 - in.halo_width / in.font_scale) / sdf_px;
+        alpha = min(smoothstep(halo_edge - gamma, halo_edge + gamma, distance), 1.0 - alpha);
+    }
+
+    return in.paint * (alpha * in.opacity * in.fade);
+}
+";
+
 /// The line family's body.
 ///
 /// The position attribute carries the point and its normal together, as mbgl packs it: the low bit

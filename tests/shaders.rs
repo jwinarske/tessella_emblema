@@ -7,11 +7,11 @@
 use tessella_capture_abi::generated::shader_attributes::{
     BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER, FILL_EXTRUSION_SHADER,
     FILL_OUTLINE_SHADER, FILL_SHADER, LINE_SHADER, RASTER_SHADER, SYMBOL_ICON_SHADER,
-    ShaderAttribute,
+    SYMBOL_SDFSHADER, ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
     COLOR_RELIEF_SHADER_TEXTURES, RASTER_SHADER_TEXTURES, SYMBOL_ICON_SHADER_TEXTURES,
-    ShaderTexture,
+    SYMBOL_SDFSHADER_TEXTURES, ShaderTexture,
 };
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
@@ -23,7 +23,8 @@ use tessella_capture_abi::generated::ubo_layouts::{
 };
 use tessella_emblema::shaders::{
     BACKGROUND_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY, FILL_EXTRUSION_BODY,
-    FILL_OUTLINE_BODY, LINE_BODY, RASTER_BODY, SYMBOL_ICON_BODY, attribute_name, module,
+    FILL_OUTLINE_BODY, LINE_BODY, RASTER_BODY, SYMBOL_ICON_BODY, SYMBOL_SDF_BODY, attribute_name,
+    module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -47,6 +48,8 @@ struct Family {
 /// A background has neither of the two surfaces that need a block of their own: it covers the
 /// viewport rather than a tile, so the producer writes it no bend block and never marks it
 /// raised. Everything else has all four.
+// A table of 31 entries once every family is here, and nothing but a table.
+#[allow(clippy::too_many_lines)]
 fn families() -> Vec<Family> {
     let all = &[
         Surface::Plane,
@@ -139,6 +142,20 @@ fn families() -> Vec<Family> {
             attributes: &SYMBOL_ICON_SHADER,
             textures: &SYMBOL_ICON_SHADER_TEXTURES,
             body: SYMBOL_ICON_BODY,
+            surfaces: all,
+            height: false,
+        },
+        Family {
+            name: "symbol_sdf",
+            blocks: vec![
+                &SYMBOL_DRAWABLE_UBO,
+                &SYMBOL_TILE_PROPS_UBO,
+                &SYMBOL_EVALUATED_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
+            attributes: &SYMBOL_SDFSHADER,
+            textures: &SYMBOL_SDFSHADER_TEXTURES,
+            body: SYMBOL_SDF_BODY,
             surfaces: all,
             height: false,
         },
@@ -304,6 +321,59 @@ fn the_symbol_icon_keeps_its_placement_decisions() {
         source.contains("var change = -global.symbol_fade_change;")
             && source.contains("change = global.symbol_fade_change;"),
         "the fade's direction is not taken from its low bit"
+    );
+}
+
+/// The symbol SDF keeps the five decisions that draw something plausible when wrong.
+///
+/// * **The atlas is read from `.r`.** `GLYPH_ATLAS_FORMAT` is one channel, which is `R8_UNORM`
+///   here and `GL_ALPHA` in mbgl. Reading `.a` gives 1.0 everywhere: every glyph a solid block.
+/// * **The halo is subtracted, not drawn under.** `min(halo, 1.0 - fill)` keeps a translucent
+///   fill's halo translucent; without it the two coverages add where they meet.
+/// * **Zero distance is 192/256, and the field is 8 units a pixel.** Both are how the atlas was
+///   rasterized. Wrong, type is uniformly fattened or thinned rather than absent.
+/// * **The paint selection's arms.** Swapped, the fill pass draws the halo color and the halo
+///   pass the fill color -- two passes of the right shape in the wrong colors.
+/// * **The threshold scales by the clip `w`.** The edge is a screen-space width, so it needs the
+///   perspective divide the position got. Without it, pitched type blurs with distance.
+#[test]
+fn the_symbol_sdf_keeps_its_edge_decisions() {
+    let sdf = families()
+        .into_iter()
+        .find(|family| family.name == "symbol_sdf")
+        .expect("symbol sdf is in the matrix");
+    let source = module(
+        Surface::Plane,
+        &sdf.blocks,
+        sdf.attributes,
+        sdf.textures,
+        sdf.body,
+    )
+    .expect("assembles");
+
+    assert!(
+        source.contains("textureSample(symbol_image, symbol_image_sampler, in.tex).r;"),
+        "the atlas is not read from red:\n{source}"
+    );
+    assert!(
+        source.contains(
+            "alpha = min(smoothstep(halo_edge - gamma, halo_edge + gamma, distance), 1.0 - alpha);"
+        ),
+        "the fill's coverage is not subtracted from the halo's"
+    );
+    assert!(
+        source.contains("let fill_edge = (256.0 - 64.0) / 256.0;")
+            && source.contains("let sdf_px = 8.0;"),
+        "the field's zero level or its scale moved"
+    );
+    assert!(
+        source.contains("out.paint = select(fill, halo, tile.is_halo != 0);"),
+        "the halo and the fill colors are not selected in that order"
+    );
+    assert!(
+        source.contains("out.gamma = clip.w;")
+            && source.contains("select(fill_gamma, halo_gamma, is_halo) * in.gamma;"),
+        "the threshold is not scaled by the perspective divide"
     );
 }
 
@@ -695,7 +765,7 @@ fn every_family_on_every_surface_compiles() {
         }
     }
     assert_eq!(
-        pairs, 31,
+        pairs, 35,
         "the matrix grew or shrank; look at the new pairs"
     );
 }
@@ -732,6 +802,13 @@ fn every_attribute_is_read() {
     }
 }
 
+/// Attribute and factor pairs whose names do not match, as `(attribute field, factor)`.
+///
+/// A symbol's fill color is `idSymbolColorVertexAttribute` and its factor is `fill_color_t`: the
+/// attribute is named for the shader's input and the factor for the style property, and here the
+/// two diverge. mbgl's `symbol_sdf_paint.glsl` is what says they are the same property.
+const FACTOR_ALIASES: &[(&str, &str)] = &[("symbol_color", "fill_color_t")];
+
 /// Every data-driven property's zoom factor is used where its attribute is.
 ///
 /// The `_t` fields exist to mix an attribute between its two zoom endpoints. Reading the attribute
@@ -745,7 +822,8 @@ fn every_attribute_is_read() {
 /// family declares the attribute, it has to mix with the factor.
 ///
 /// Paired by name with the underscores removed, because the two spellings differ: the attribute is
-/// `idLineGapWidthVertexAttribute` and the factor is `gapwidth_t`.
+/// `idLineGapWidthVertexAttribute` and the factor is `gapwidth_t`. Where the shader's name for an
+/// attribute is not the style property's name at all, the pair is named in [`FACTOR_ALIASES`].
 #[test]
 fn every_zoom_factor_is_used() {
     let mut paired = 0;
@@ -767,7 +845,8 @@ fn every_zoom_factor_is_used() {
                         let Some(stem) = factor.name.strip_suffix("_t") else {
                             continue;
                         };
-                        if !flat.ends_with(&stem.replace('_', "")) {
+                        let aliased = FACTOR_ALIASES.contains(&(field.as_str(), factor.name));
+                        if !aliased && !flat.ends_with(&stem.replace('_', "")) {
                             continue;
                         }
                         paired += 1;

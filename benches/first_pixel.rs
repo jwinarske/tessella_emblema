@@ -26,14 +26,17 @@
 
 use ash::vk;
 use tessella_capture_abi::generated::shader_attributes::{
-    BACKGROUND_SHADER, CIRCLE_SHADER, FILL_SHADER, ShaderAttribute,
+    BACKGROUND_SHADER, CIRCLE_SHADER, FILL_OUTLINE_SHADER, FILL_SHADER, ShaderAttribute,
 };
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
-    FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, GLOBAL_PAINT_PARAMS_UBO, UboLayout,
+    FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO,
+    GLOBAL_PAINT_PARAMS_UBO, UboLayout,
 };
 use tessella_emblema::device::{preferred, vertex_format};
-use tessella_emblema::shaders::{BACKGROUND_BODY, CIRCLE_BODY, FILL_BODY, module};
+use tessella_emblema::shaders::{
+    BACKGROUND_BODY, CIRCLE_BODY, FILL_BODY, FILL_OUTLINE_BODY, module,
+};
 use tessella_emblema::surface::Surface;
 
 /// The target's edge, in pixels. Small: one pixel is read and the rest is margin.
@@ -133,6 +136,8 @@ fn run() -> Result<usize, String> {
 }
 
 /// Every family this probe can set up without a texture, and the pixel each should draw.
+// A table, and nothing but a table.
+#[allow(clippy::too_many_lines)]
 fn cases() -> Vec<Case> {
     vec![
         // A flat fill, at the far end of both of its interpolations.
@@ -185,6 +190,54 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             expect: [0, 0, 255, 255],
+        },
+        // An outline, which is the one family whose fragment stage reads its own screen position
+        // back and so the one that can tell which way `y` runs.
+        //
+        // Full coverage at the center is the answer and not a missing feather. The vertex stage
+        // divides by `w` and the result is then interpolated; with no perspective that
+        // interpolation is the fragment's own position, so the distance is zero and the fade is
+        // one. The feather only separates from the fragment under a `w` that varies, which is the
+        // case it exists for.
+        //
+        // This case is why `FILL_OUTLINE_BODY` negates `y`. Without that it draws nothing at all:
+        // naga flips the position after the body runs, so the position the body computed is
+        // mirrored against the one the fragment is at, and every fragment is more than a pixel
+        // from its own vertex.
+        Case {
+            name: "fill_outline",
+            blocks: vec![
+                &FILL_OUTLINE_DRAWABLE_UBO,
+                &FILL_EVALUATED_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
+            attributes: &FILL_OUTLINE_SHADER,
+            body: FILL_OUTLINE_BODY,
+            streams: vec![
+                shorts(&COVERING),
+                per_vertex(&packed_color([255, 255, 255, 255]), 3),
+                per_vertex(&[1.0, 1.0], 3),
+            ],
+            uniforms: vec![
+                block(
+                    &FILL_OUTLINE_DRAWABLE_UBO,
+                    &[
+                        ("matrix", At::F(&CLIP)),
+                        ("outline_color_t", At::F(&[0.0])),
+                        ("opacity_t", At::F(&[0.0])),
+                    ],
+                ),
+                block(&FILL_EVALUATED_PROPS_UBO, &[]),
+                block(
+                    &GLOBAL_PAINT_PARAMS_UBO,
+                    &[(
+                        "world_size",
+                        At::F(&[f64::from(SIDE) as f32, f64::from(SIDE) as f32]),
+                    )],
+                ),
+            ],
+            vertices: 3,
+            expect: [255, 255, 255, 255],
         },
         // A circle, read at its own center: the extrusion interpolates to zero there, which is
         // inside the fill and nowhere near the stroke. With no stroke width the stroke's own

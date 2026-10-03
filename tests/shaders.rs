@@ -989,8 +989,10 @@ fn the_fill_outline_keeps_its_feather() {
     .expect("assembles");
 
     assert!(
-        source.contains("out.screen = (clip.xy / clip.w + 1.0) / 2.0 * global.world_size;"),
-        "the screen position is not divided in the vertex stage:\n{source}"
+        source.contains(
+            "out.screen = (vec2<f32>(clip.x, -clip.y) / clip.w + 1.0) / 2.0 * global.world_size;"
+        ),
+        "the screen position is not divided, or does not undo naga's coordinate flip:\n{source}"
     );
     assert!(
         source.contains("let distance = length(in.screen - in.clip.xy);")

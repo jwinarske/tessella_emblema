@@ -446,7 +446,17 @@ fn vertex_main(in: In) -> Out {
     // Where this vertex landed on screen, in pixels, which is what the fragment measures its own
     // distance from. The perspective divide has to happen here: a fragment gets the interpolated
     // result, and interpolating before dividing is not the same number.
-    out.screen = (clip.xy / clip.w + 1.0) / 2.0 * global.world_size;
+    //
+    // `y` is negated, which mbgl's does not appear to do. It does: `applySurfaceTransform()` ends
+    // with `gl_Position.y *= -1.0` and mbgl calls it *before* computing this position. Here the
+    // same flip arrives from naga, which negates the output position under
+    // `WriterFlags::ADJUST_COORDINATE_SPACE` -- after this body has run. So the flip is applied by
+    // hand to the copy this stage reads back, and the two agree again.
+    //
+    // Getting it wrong is a mirror about the target's middle, which puts every fragment more than
+    // a pixel from its own vertex and fades the whole outline to nothing. See `benches/first_pixel`
+    // for the measurement that found it.
+    out.screen = (vec2<f32>(clip.x, -clip.y) / clip.w + 1.0) / 2.0 * global.world_size;
 
     out.outline_color = mix_color(in.fill_outline_color, drawable.outline_color_t);
     out.opacity = mix_value(in.fill_opacity, drawable.opacity_t);

@@ -178,3 +178,24 @@ fn each_value_is_its_own_module() {
         "the two permutations differ, so each is its own SPIR-V"
     );
 }
+
+/// naga negates the output position's `y`, which is the flip mbgl writes by hand.
+///
+/// `WriterFlags::ADJUST_COORDINATE_SPACE` is in `Options::default()`, and it emits
+/// `gl_Position.y *= -1.0` after the entry point's own code. mbgl's shaders do the same thing in
+/// `applySurfaceTransform()`, so a body ported from mbgl's text lands in the right place without
+/// asking for it -- and that is exactly why the flip is easy not to know about.
+///
+/// It matters to any body that reads its own clip position back, because the flip has not happened
+/// yet when the body runs. `FILL_OUTLINE_BODY` is the one that does, and it negates `y` itself to
+/// compensate; if this flag ever stops being a default, that compensation becomes the bug and
+/// every outline fades to nothing. Pinned here rather than discovered there.
+#[test]
+fn naga_flips_the_position_for_us() {
+    let flags = naga::back::spv::Options::default().flags;
+    assert!(
+        flags.contains(naga::back::spv::WriterFlags::ADJUST_COORDINATE_SPACE),
+        "naga no longer flips the position; FILL_OUTLINE_BODY compensates for a flip that is \
+         no longer happening"
+    );
+}

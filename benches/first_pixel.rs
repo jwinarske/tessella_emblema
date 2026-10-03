@@ -59,7 +59,7 @@ use tessella_emblema::shaders::{
     HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_PATTERN_BODY, RASTER_BODY, SYMBOL_ICON_BODY,
     SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY, module,
 };
-use tessella_emblema::surface::{GLOBE_BEND_UBO, GLOBE_CAMERA_UBO, Surface};
+use tessella_emblema::surface::{GLOBE_BEND_UBO, GLOBE_CAMERA_UBO, Surface, TERRAIN_DRAWABLE_UBO};
 
 /// The target's edge, in pixels. Small: one pixel is read and the rest is margin.
 const SIDE: u32 = 32;
@@ -1763,6 +1763,89 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             expect: [255, 255, 0, 255],
+        },
+        // The raise: a fill standing on a DEM, which is the fourth and last surface.
+        //
+        // The placement reads the elevation per vertex and adds it to the position's third
+        // component, so the raise is observable only where the drawable's matrix turns a height
+        // into lateral movement -- which is what a real projection does, and what this matrix's
+        // third column is for. The base is 0.2 a tile unit and the height coefficient 3, so the
+        // shape is dominated by the three vertices' elevations rather than by the triangle.
+        //
+        //   uv       = position * 0.1 + 0.3, so the three vertices read texels (0,0), (2,0), (0,2)
+        //   meters   = dot((r, g, 0), (1, 0.5, 0)) - 10        =  -10,  70,  10
+        //   height   = (meters - a skirt of 20) * 0.01         = -0.30, 0.50, -0.10
+        //   clip     = (0.2x + 3h, -(0.2y + 3h))  ->  (-1.1, 1.1), (2.1, -1.3), (-0.5, -0.3)
+        //
+        // The pixel read is one of nineteen the correct raise covers and seven wrong ones do not:
+        // the texture coordinate unscaled or unoffset, the skirt not subtracted, the exaggeration
+        // dropped, the unpack's base added rather than subtracted, its green weight ignored, and
+        // the height not added at all.
+        //
+        // Those coefficients came from a search. The obvious ones -- a base of 0.3 against a
+        // height coefficient of 0.5 -- gave *no* qualifying pixel, because the triangle's own size
+        // swamped the heights and four of the seven mutations drew almost the same shape.
+        //
+        // The DEM binds after the family's textures, which is the order `module` declares them in
+        // and the order this probe already binds them -- so the surface's own image needed no new
+        // machinery, only a case with an empty family texture table and one image.
+        Case {
+            name: "fill_raised",
+            at: (8, 13),
+            surface: Surface::Terrain,
+            blocks: vec![&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
+            attributes: &FILL_SHADER,
+            body: FILL_BODY,
+            streams: vec![
+                shorts(&COVERING),
+                per_vertex(&packed_color([255, 0, 255, 255]), 3),
+                per_vertex(&[1.0, 1.0], 3),
+            ],
+            uniforms: vec![
+                block(
+                    &FILL_DRAWABLE_UBO,
+                    &[
+                        // The third column is what makes a height visible: a raised vertex moves
+                        // sideways, as it does under any real projection.
+                        (
+                            "matrix",
+                            At::F(&[
+                                0.2, 0.0, 0.0, 0.0, //
+                                0.0, 0.2, 0.0, 0.0, //
+                                3.0, 3.0, 0.0, 0.0, //
+                                0.0, 0.0, 0.0, 1.0,
+                            ]),
+                        ),
+                        ("color_t", At::F(&[0.0])),
+                        ("opacity_t", At::F(&[0.0])),
+                    ],
+                ),
+                block(&FILL_EVALUATED_PROPS_UBO, &[]),
+                block(
+                    &TERRAIN_DRAWABLE_UBO,
+                    &[
+                        // Red and green both weighted, so both are under test; the base is
+                        // subtracted, which is the sign a mutation gets wrong.
+                        ("unpack", At::F(&[1.0, 0.5, 0.0, 10.0])),
+                        // The coordinate's scale, then its offset in `yz`, then the exaggeration.
+                        ("params", At::F(&[0.1, 0.3, 0.3, 0.01])),
+                        // The ground under the camera's center, which the height is measured from
+                        // so that raising the relief leaves the center where it is.
+                        ("skirt", At::F(&[0.0, 20.0, 0.0, 0.0])),
+                    ],
+                ),
+            ],
+            textures: &[],
+            images: vec![Image::new(4, |x, y| {
+                [
+                    u8::try_from(x * 40).unwrap_or(255),
+                    u8::try_from(y * 20).unwrap_or(255),
+                    0,
+                    255,
+                ]
+            })],
+            vertices: 3,
+            expect: [255, 0, 255, 255],
         },
         // A circle, read at its own center: the extrusion interpolates to zero there, which is
         // inside the fill and nowhere near the stroke. With no stroke width the stroke's own

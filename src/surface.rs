@@ -224,6 +224,10 @@ const PLANE_PLACEMENT: &str = r"
 fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
     return transform(columns, position);
 }
+
+fn displace(at: vec2<f32>, delta: vec2<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
+    return columns[0] * delta.x + columns[1] * delta.y;
+}
 ";
 
 /// A sphere, bent in the vertex stage.
@@ -271,6 +275,13 @@ fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
     clip.z += merc.z;
     return clip;
 }
+
+// Two evaluations and their difference, because this bend has no linear part to extrude along: it
+// takes tile-local coordinates through trig to a sphere position. The secant rather than the
+// tangent, which for a displacement of a line's width is the same answer.
+fn displace(at: vec2<f32>, delta: vec2<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
+    return place(vec3<f32>(at + delta, 0.0), columns) - place(vec3<f32>(at, 0.0), columns);
+}
 ";
 
 /// A sphere, by the quadratic the producer expanded about the tile's center.
@@ -311,6 +322,17 @@ fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
         // along the plane's z. Zero for every family but the extrusions.
         + bend.d_h * position.z;
 }
+
+// The Jacobian *here*, not at the anchor: differentiating the expansion gives the linear term plus
+// the second-order term's contribution, and at low zoom a tile is wide enough that the bend turns
+// measurably across it.
+fn displace(at: vec2<f32>, delta: vec2<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
+    let bend = globe_bend_ubo[ubo_index];
+    let d = at - vec2<f32>(TILE_CENTER, TILE_CENTER);
+    let j_u = bend.d_u + bend.d_uu * d.x + bend.d_uv * d.y;
+    let j_v = bend.d_v + bend.d_vv * d.y + bend.d_uv * d.x;
+    return j_u * delta.x + j_v * delta.y;
+}
 ";
 
 /// A DEM, with the height read per vertex.
@@ -343,5 +365,12 @@ fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
     let height = (meters - terrain.skirt.y) * terrain.params.w;
 
     return transform(columns, vec3<f32>(position.xy, position.z + height));
+}
+
+// The linear part, with no second sample. A line's extrusion is a line width in tile units and the
+// ground does not climb measurably across one, so the height at the extruded point is the height
+// already read -- which the displacement does not carry anyway.
+fn displace(at: vec2<f32>, delta: vec2<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
+    return columns[0] * delta.x + columns[1] * delta.y;
 }
 ";

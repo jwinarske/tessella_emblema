@@ -16,6 +16,7 @@
 //! `vkGetPhysicalDeviceFormatProperties`; these decide what to do with it.
 
 use ash::vk;
+use tessella_capture_abi::generated::mbgl_enums::AttributeDataType;
 
 /// Whether a view's pass needs depth, or only stencil.
 ///
@@ -112,6 +113,64 @@ pub fn check_vertex_formats(
         .copied()
         .find(|format| !buffer_features(*format).contains(wanted))
         .map_or(Ok(()), |format| Err(Unsupported::VertexFormat(format)))
+}
+
+/// The Vulkan vertex format for a type a shader declares.
+///
+/// The declared type decides this and the supplied type does not: the producer's buffer may hold
+/// bytes where the shader declares shorts, and the ABI records both — `declared_data_type` is what
+/// the pipeline's vertex input must agree with, because that is what the shader reads.
+///
+/// # Integers are integers
+///
+/// Every integer type here maps to a `_SINT` or `_UINT` format, never a `_SNORM` or `_UNORM` one.
+/// The distinction is invisible until it draws: a `Short2` tile position bound as `R16G16_SNORM`
+/// arrives divided by 32,767, which puts the whole tile inside one pixel at the origin — and
+/// nothing errors, because both formats are two shorts. mbgl's own line shader depends on the
+/// unnormalized reading, which is why `fill_outline`'s reference calls `a_data` "raw bytes, not
+/// normalized".
+///
+/// Returns `None` for a type no shader in the tables declares. That is not the same as a type
+/// Vulkan lacks: `UShort8` has no single vertex format and nothing asks for one, so the absence is
+/// recorded rather than worked around.
+#[must_use]
+pub const fn vertex_format(declared: AttributeDataType) -> Option<vk::Format> {
+    let format = match declared {
+        AttributeDataType::Byte => vk::Format::R8_SINT,
+        AttributeDataType::Byte2 => vk::Format::R8G8_SINT,
+        AttributeDataType::Byte3 => vk::Format::R8G8B8_SINT,
+        AttributeDataType::Byte4 => vk::Format::R8G8B8A8_SINT,
+        AttributeDataType::UByte => vk::Format::R8_UINT,
+        AttributeDataType::UByte2 => vk::Format::R8G8_UINT,
+        AttributeDataType::UByte3 => vk::Format::R8G8B8_UINT,
+        AttributeDataType::UByte4 => vk::Format::R8G8B8A8_UINT,
+        AttributeDataType::Short => vk::Format::R16_SINT,
+        AttributeDataType::Short2 => vk::Format::R16G16_SINT,
+        AttributeDataType::Short3 => vk::Format::R16G16B16_SINT,
+        AttributeDataType::Short4 => vk::Format::R16G16B16A16_SINT,
+        AttributeDataType::UShort => vk::Format::R16_UINT,
+        AttributeDataType::UShort2 => vk::Format::R16G16_UINT,
+        AttributeDataType::UShort3 => vk::Format::R16G16B16_UINT,
+        AttributeDataType::UShort4 => vk::Format::R16G16B16A16_UINT,
+        AttributeDataType::Int => vk::Format::R32_SINT,
+        AttributeDataType::Int2 => vk::Format::R32G32_SINT,
+        AttributeDataType::Int3 => vk::Format::R32G32B32_SINT,
+        AttributeDataType::Int4 => vk::Format::R32G32B32A32_SINT,
+        AttributeDataType::UInt => vk::Format::R32_UINT,
+        AttributeDataType::UInt2 => vk::Format::R32G32_UINT,
+        AttributeDataType::UInt3 => vk::Format::R32G32B32_UINT,
+        AttributeDataType::UInt4 => vk::Format::R32G32B32A32_UINT,
+        AttributeDataType::Float => vk::Format::R32_SFLOAT,
+        AttributeDataType::Float2 => vk::Format::R32G32_SFLOAT,
+        AttributeDataType::Float3 => vk::Format::R32G32B32_SFLOAT,
+        AttributeDataType::Float4 => vk::Format::R32G32B32A32_SFLOAT,
+        // Eight shorts is not a vertex format. Nothing declares it; see `shaders::attribute_type`.
+        //
+        // No wildcard arm: a variant added to the generated enum should fail to compile here
+        // rather than quietly become a type with no format.
+        AttributeDataType::UShort8 | AttributeDataType::Invalid => return None,
+    };
+    Some(format)
 }
 
 #[cfg(test)]

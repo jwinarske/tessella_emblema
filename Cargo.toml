@@ -37,5 +37,9 @@ cast_possible_truncation = "allow"
 name = "draw_cost"
 harness = false
 
+[[bench]]
+name = "first_pixel"
+harness = false
+
 [dev-dependencies]
 naga = { version = "23", features = ["wgsl-in", "spv-out"] }

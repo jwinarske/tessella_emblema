@@ -357,6 +357,32 @@ fn unpack_color(packed: vec2<f32>) -> vec4<f32> {
 fn mix_color(packed: vec4<f32>, t: f32) -> vec4<f32> {
     return mix(unpack_color(packed.xy), unpack_color(packed.zw), t);
 }
+
+// GLSL's `mod`, which is not WGSL's `%`. The difference is the sign: `%` takes the dividend's,
+// `mod` always takes the divisor's. Every use here is on a non-negative quantity, so the two agree
+// -- written out anyway, because a pattern offset that went negative would tile backwards from
+// here and nothing upstream would have changed.
+fn wrap(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    return a - b * floor(a / b);
+}
+
+// Where a pattern's own texture coordinate sits at a tile position, in units of the pattern.
+//
+// `common.hpp`'s `get_pattern_pos`. A pattern is anchored to the world rather than to the tile, so
+// that a repeating fill does not visibly restart at every tile edge -- which is what the pixel
+// coordinate is for. It arrives split in two because the number is larger than an `f32` holds at
+// the precision a pattern needs: the upper half is in units of 65,536 and the two nested wraps
+// bring it down a byte at a time without ever forming the whole value.
+fn pattern_pos(
+    upper: vec2<f32>,
+    lower: vec2<f32>,
+    pattern_size: vec2<f32>,
+    tile_units_to_pixels: f32,
+    position: vec2<f32>
+) -> vec2<f32> {
+    let offset = wrap(wrap(wrap(upper, pattern_size) * 256.0, pattern_size) * 256.0 + lower, pattern_size);
+    return (tile_units_to_pixels * position + offset) / pattern_size;
+}
 ";
 
 /// The fill family's body.
@@ -1496,6 +1522,161 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
 
     // The accent shows through whatever the shade leaves transparent.
     return accent * (1.0 - shaded.a) + shaded;
+}
+";
+
+/// The background-pattern family's body: the background, tiled with a sprite.
+///
+/// Two patterns, not one. A style changing `background-pattern` cross-fades between the old sprite
+/// and the new, so both are sampled every frame and `mix` holds where between them the transition
+/// is. The two reduce to the same picture once it finishes, which is why the fade is a uniform and
+/// not a branch.
+///
+/// Unlike [`FILL_PATTERN_BODY`] the sizes arrive already computed, because a background has no
+/// feature to evaluate them against -- so there is no display size to divide by the pixel ratio
+/// here, just `scale` times `pattern_size`.
+pub const BACKGROUND_PATTERN_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) pos_a: vec2<f32>,
+    @location(1) pos_b: vec2<f32>,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let drawable = background_pattern_drawable_ubo[ubo_index];
+    let props = background_pattern_props_ubo[0];
+    var out: Out;
+
+    let position = vec2<f32>(in.background_pos);
+    out.pos_a = pattern_pos(
+        drawable.pixel_coord_upper,
+        drawable.pixel_coord_lower,
+        props.scale_a * props.pattern_size_a,
+        drawable.tile_units_to_pixels,
+        position
+    );
+    out.pos_b = pattern_pos(
+        drawable.pixel_coord_upper,
+        drawable.pixel_coord_lower,
+        props.scale_b * props.pattern_size_b,
+        drawable.tile_units_to_pixels,
+        position
+    );
+
+    out.clip = place(vec3<f32>(position, 0.0), drawable.matrix);
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    let props = background_pattern_props_ubo[0];
+    let texsize = global_paint_params_ubo[0].pattern_atlas_texsize;
+
+    // The fraction of one repeat, interpolated across the sprite's own corners in the atlas. The
+    // wrap is what makes the pattern repeat, and it has to happen here rather than on the sampler:
+    // the sprite is a window into a shared sheet, so a repeat addressing mode would walk into its
+    // neighbors.
+    let in_a = wrap(in.pos_a, vec2<f32>(1.0, 1.0));
+    let pos_a = mix(props.pattern_tl_a / texsize, props.pattern_br_a / texsize, in_a);
+    let color_a = textureSample(background_image, background_image_sampler, pos_a);
+
+    let in_b = wrap(in.pos_b, vec2<f32>(1.0, 1.0));
+    let pos_b = mix(props.pattern_tl_b / texsize, props.pattern_br_b / texsize, in_b);
+    let color_b = textureSample(background_image, background_image_sampler, pos_b);
+
+    return mix(color_a, color_b, props.mix) * props.opacity;
+}
+";
+
+/// The fill-pattern family's body: a fill, tiled with a sprite.
+///
+/// The two sprites arrive as attributes rather than uniforms -- `pattern-from` and `pattern-to`
+/// are per feature, since one layer's features can carry different sprite names -- each packed as
+/// four shorts: the sprite's top left and bottom right in the atlas.
+///
+/// # The sprite names are not interpolated
+///
+/// `FILL_PATTERN_DRAWABLE_UBO` carries `pattern_from_t` and `pattern_to_t` and mbgl's shader reads
+/// neither, which is why they are named in `UNUSED_FACTORS`. A pattern is a window into a sheet,
+/// not a number; halfway between two sprites' corners is a rectangle containing neither. The
+/// cross-fade is `fade`, applied to the two sampled colors, and that is the only blending a
+/// pattern transition gets.
+///
+/// # The size is in display pixels, divided twice
+///
+/// The sprite's extent in the atlas is in atlas pixels, so dividing by the device pixel ratio
+/// gives the size it should occupy on screen, and dividing by the tile ratio converts that to the
+/// tile units `pattern_pos` works in. Either one dropped tiles the pattern at a plausible but
+/// wrong size.
+pub const FILL_PATTERN_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) pos_a: vec2<f32>,
+    @location(1) pos_b: vec2<f32>,
+    @location(2) pattern_from: vec4<f32>,
+    @location(3) pattern_to: vec4<f32>,
+    @location(4) opacity: f32,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let drawable = fill_pattern_drawable_ubo[ubo_index];
+    let props = fill_evaluated_props_ubo[0];
+    let global = global_paint_params_ubo[0];
+    var out: Out;
+
+    // Straight through, not mixed: see this body's own note.
+    let pattern_from = vec4<f32>(in.fill_pattern_from);
+    let pattern_to = vec4<f32>(in.fill_pattern_to);
+    out.pattern_from = pattern_from;
+    out.pattern_to = pattern_to;
+
+    // The sprite's extent in the atlas, as the size it should cover on screen.
+    let display_a = (pattern_from.zw - pattern_from.xy) / max(global.pixel_ratio, 1e-6);
+    let display_b = (pattern_to.zw - pattern_to.xy) / max(global.pixel_ratio, 1e-6);
+
+    let position = vec2<f32>(in.fill_pos);
+    out.pos_a = pattern_pos(
+        drawable.pixel_coord_upper,
+        drawable.pixel_coord_lower,
+        props.from_scale * display_a,
+        drawable.tile_ratio,
+        position
+    );
+    out.pos_b = pattern_pos(
+        drawable.pixel_coord_upper,
+        drawable.pixel_coord_lower,
+        props.to_scale * display_b,
+        drawable.tile_ratio,
+        position
+    );
+
+    out.opacity = mix_value(in.fill_opacity, drawable.opacity_t);
+    out.clip = place(vec3<f32>(position, 0.0), drawable.matrix);
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    let tile = fill_pattern_tile_props_ubo[ubo_index];
+    let props = fill_evaluated_props_ubo[0];
+
+    // This tile's own atlas size, where the background reads the shared one: a fill's sprites are
+    // bound per tile.
+    let texsize = tile.texsize;
+
+    let in_a = wrap(in.pos_a, vec2<f32>(1.0, 1.0));
+    let pos_a = mix(in.pattern_from.xy / texsize, in.pattern_from.zw / texsize, in_a);
+    let color_a = textureSample(fill_image, fill_image_sampler, pos_a);
+
+    let in_b = wrap(in.pos_b, vec2<f32>(1.0, 1.0));
+    let pos_b = mix(in.pattern_to.xy / texsize, in.pattern_to.zw / texsize, in_b);
+    let color_b = textureSample(fill_image, fill_image_sampler, pos_b);
+
+    return mix(color_a, color_b, props.fade) * in.opacity;
 }
 ";
 

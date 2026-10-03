@@ -8,30 +8,34 @@ use std::collections::BTreeSet;
 
 use tessella_capture_abi::generated::mbgl_enums::AttributeDataType;
 use tessella_capture_abi::generated::shader_attributes::{
-    BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER, FILL_EXTRUSION_SHADER,
-    FILL_OUTLINE_SHADER, FILL_SHADER, HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, LINE_SHADER,
-    RASTER_SHADER, SYMBOL_ICON_SHADER, SYMBOL_SDFSHADER, SYMBOL_TEXT_AND_ICON_SHADER,
-    ShaderAttribute,
+    BACKGROUND_PATTERN_SHADER, BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER,
+    FILL_EXTRUSION_SHADER, FILL_OUTLINE_SHADER, FILL_PATTERN_SHADER, FILL_SHADER,
+    HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, LINE_SHADER, RASTER_SHADER, SYMBOL_ICON_SHADER,
+    SYMBOL_SDFSHADER, SYMBOL_TEXT_AND_ICON_SHADER, ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
-    COLOR_RELIEF_SHADER_TEXTURES, HILLSHADE_PREPARE_SHADER_TEXTURES, HILLSHADE_SHADER_TEXTURES,
-    RASTER_SHADER_TEXTURES, SYMBOL_ICON_SHADER_TEXTURES, SYMBOL_SDFSHADER_TEXTURES,
-    SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES, ShaderTexture,
+    BACKGROUND_PATTERN_SHADER_TEXTURES, COLOR_RELIEF_SHADER_TEXTURES, FILL_PATTERN_SHADER_TEXTURES,
+    HILLSHADE_PREPARE_SHADER_TEXTURES, HILLSHADE_SHADER_TEXTURES, RASTER_SHADER_TEXTURES,
+    SYMBOL_ICON_SHADER_TEXTURES, SYMBOL_SDFSHADER_TEXTURES, SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES,
+    ShaderTexture,
 };
 use tessella_capture_abi::generated::ubo_layouts::{
-    BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
+    BACKGROUND_DRAWABLE_UBO, BACKGROUND_PATTERN_DRAWABLE_UBO, BACKGROUND_PATTERN_PROPS_UBO,
+    BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
     COLOR_RELIEF_DRAWABLE_UBO, COLOR_RELIEF_EVALUATED_PROPS_UBO, COLOR_RELIEF_TILE_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
-    FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, GLOBAL_PAINT_PARAMS_UBO,
-    HILLSHADE_DRAWABLE_UBO, HILLSHADE_EVALUATED_PROPS_UBO, HILLSHADE_PREPARE_DRAWABLE_UBO,
+    FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, FILL_PATTERN_DRAWABLE_UBO,
+    FILL_PATTERN_TILE_PROPS_UBO, GLOBAL_PAINT_PARAMS_UBO, HILLSHADE_DRAWABLE_UBO,
+    HILLSHADE_EVALUATED_PROPS_UBO, HILLSHADE_PREPARE_DRAWABLE_UBO,
     HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO, LINE_DRAWABLE_UBO,
     LINE_EVALUATED_PROPS_UBO, RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO,
     SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
 use tessella_emblema::shaders::{
-    BACKGROUND_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY, FILL_EXTRUSION_BODY,
-    FILL_OUTLINE_BODY, HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_BODY, RASTER_BODY,
-    SYMBOL_ICON_BODY, SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY, attribute_name, module,
+    BACKGROUND_BODY, BACKGROUND_PATTERN_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY,
+    FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY, FILL_PATTERN_BODY, HILLSHADE_BODY,
+    HILLSHADE_PREPARE_BODY, LINE_BODY, RASTER_BODY, SYMBOL_ICON_BODY, SYMBOL_SDF_BODY,
+    SYMBOL_TEXT_AND_ICON_BODY, attribute_name, module,
 };
 use tessella_emblema::surface::Surface;
 
@@ -214,6 +218,33 @@ fn families() -> Vec<Family> {
             attributes: &HILLSHADE_SHADER,
             textures: &HILLSHADE_SHADER_TEXTURES,
             body: HILLSHADE_BODY,
+            surfaces: all,
+            height: false,
+        },
+        Family {
+            name: "background_pattern",
+            blocks: vec![
+                &BACKGROUND_PATTERN_DRAWABLE_UBO,
+                &BACKGROUND_PATTERN_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
+            attributes: &BACKGROUND_PATTERN_SHADER,
+            textures: &BACKGROUND_PATTERN_SHADER_TEXTURES,
+            body: BACKGROUND_PATTERN_BODY,
+            surfaces: flat_or_bent,
+            height: false,
+        },
+        Family {
+            name: "fill_pattern",
+            blocks: vec![
+                &FILL_PATTERN_DRAWABLE_UBO,
+                &FILL_PATTERN_TILE_PROPS_UBO,
+                &FILL_EVALUATED_PROPS_UBO,
+                &GLOBAL_PAINT_PARAMS_UBO,
+            ],
+            attributes: &FILL_PATTERN_SHADER,
+            textures: &FILL_PATTERN_SHADER_TEXTURES,
+            body: FILL_PATTERN_BODY,
             surfaces: all,
             height: false,
         },
@@ -523,6 +554,79 @@ fn the_hillshade_keeps_its_slope_decisions() {
         shade.contains("let lit = deriv * tile.exaggeration * 2.0;")
             && shade.contains("let intensity = tile.exaggeration;"),
         "the standard method takes the exaggerated slope, or the others take the raw one"
+    );
+}
+
+/// The two pattern families keep the four decisions that tile a plausible wrong pattern.
+///
+/// * **The pixel coordinate comes down a byte at a time.** `pattern_pos`'s three nested wraps
+///   never form the whole world coordinate, because at the precision a pattern needs it does not
+///   fit an `f32`. Collapsed to one wrap it still tiles, and drifts with the camera.
+/// * **The repeat is a wrap in the shader, not on the sampler.** A sprite is a window into a
+///   shared sheet, so a repeat addressing mode walks into its neighbors.
+/// * **The fill's size divides by both ratios.** The pixel ratio takes atlas pixels to display
+///   pixels and the tile ratio takes those to tile units. Either one dropped tiles the pattern at
+///   a believable wrong size.
+/// * **Each family's `texsize` comes from its own place.** The background reads the shared atlas
+///   size out of the paint params; a fill reads the one bound for its tile.
+#[test]
+fn the_patterns_keep_their_tiling_decisions() {
+    let assembled = |name: &str| {
+        let found = families()
+            .into_iter()
+            .find(|family| family.name == name)
+            .unwrap_or_else(|| panic!("{name} is in the matrix"));
+        module(
+            Surface::Plane,
+            &found.blocks,
+            found.attributes,
+            found.textures,
+            found.body,
+        )
+        .expect("assembles")
+    };
+    let background = assembled("background_pattern");
+    let fill = assembled("fill_pattern");
+
+    for (name, source) in [("background_pattern", &background), ("fill_pattern", &fill)] {
+        assert!(
+            source.contains(
+                "let offset = wrap(wrap(wrap(upper, pattern_size) * 256.0, pattern_size) \
+                 * 256.0 + lower, pattern_size);"
+            ),
+            "{name} does not bring the pixel coordinate down a byte at a time:\n{source}"
+        );
+        assert!(
+            source.contains("wrap(in.pos_a, vec2<f32>(1.0, 1.0))")
+                && source.contains("wrap(in.pos_b, vec2<f32>(1.0, 1.0))"),
+            "{name} leaves the repeat to the sampler"
+        );
+    }
+
+    assert_eq!(
+        fill.matches("drawable.tile_ratio,").count(),
+        2,
+        "the fill pattern's two sprites do not both convert to tile units:\n{fill}"
+    );
+    assert!(
+        fill.contains(
+            "let display_a = (pattern_from.zw - pattern_from.xy) / max(global.pixel_ratio, 1e-6);"
+        ) && fill.contains(
+            "let display_b = (pattern_to.zw - pattern_to.xy) / max(global.pixel_ratio, 1e-6);"
+        ) && fill.contains("props.from_scale * display_a,")
+            && fill.contains("props.to_scale * display_b,"),
+        "the fill pattern's size does not divide by the pixel ratio, or misses a scale"
+    );
+    assert!(
+        background.contains("let texsize = global_paint_params_ubo[0].pattern_atlas_texsize;")
+            && fill.contains("let texsize = tile.texsize;"),
+        "a pattern reads the other family's atlas size"
+    );
+    assert!(
+        fill.contains("let pattern_from = vec4<f32>(in.fill_pattern_from);")
+            && !fill.contains("drawable.pattern_from_t")
+            && !fill.contains("drawable.pattern_to_t"),
+        "the fill pattern interpolates a sprite name"
     );
 }
 
@@ -1154,7 +1258,7 @@ fn every_family_on_every_surface_compiles() {
         }
     }
     assert_eq!(
-        pairs, 44,
+        pairs, 50,
         "the matrix grew or shrank; look at the new pairs"
     );
 }
@@ -1342,6 +1446,19 @@ fn components_read(source: &str, field: &str) -> BTreeSet<char> {
     read
 }
 
+/// Factors a family declares and correctly does not use, as `(family, factor)`.
+///
+/// Checked against the shader text, not reasoned about: in each case mbgl's own shader declares
+/// the field in its block and never reads it.
+const UNUSED_FACTORS: &[(&str, &str)] = &[
+    // A pattern is a window into a sheet, not a number. `FillPatternDrawableUBO` carries
+    // `pattern_from_t` and `pattern_to_t` and `fill.hpp` reads neither -- halfway between two
+    // sprites' corners is a rectangle containing neither sprite. A pattern transition cross-fades
+    // the two sampled colors through `fade` instead.
+    ("fill_pattern", "pattern_from_t"),
+    ("fill_pattern", "pattern_to_t"),
+];
+
 /// Attribute and factor pairs whose names do not match, as `(attribute field, factor)`.
 ///
 /// A symbol's fill color is `idSymbolColorVertexAttribute` and its factor is `fill_color_t`: the
@@ -1385,6 +1502,9 @@ fn every_zoom_factor_is_used() {
                         let Some(stem) = factor.name.strip_suffix("_t") else {
                             continue;
                         };
+                        if UNUSED_FACTORS.contains(&(family.name, factor.name)) {
+                            continue;
+                        }
                         let aliased = FACTOR_ALIASES.contains(&(field.as_str(), factor.name));
                         if !aliased && !flat.ends_with(&stem.replace('_', "")) {
                             continue;

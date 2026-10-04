@@ -72,7 +72,10 @@
 //! against the enum so neither list can drift.
 //!
 //! [`vertices`] is the first of those stores' decisions rather than a store: what a drawable's
-//! attribute descriptors come to once they are checked against the family's own table.
+//! attribute descriptors come to once they are checked against the family's own table. [`draws`]
+//! is the other end of the same drawable: its segments as the indexed draw parameters they
+//! become, including the slot that travels as `firstInstance` because the bodies read it as
+//! `ubo_index`.
 //!
 //! Nothing here reads the stream yet, and nothing in this crate touches a GPU —
 //! `#![forbid(unsafe_code)]` is still at the top of this file, so the only `ash` calls are in the
@@ -83,6 +86,7 @@
 #![forbid(unsafe_code)]
 
 pub mod device;
+pub mod draws;
 pub mod families;
 pub mod preamble;
 pub mod residency;

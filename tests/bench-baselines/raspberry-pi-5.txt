@@ -1,4 +1,4 @@
-# `draw_cost` on a Raspberry Pi 5, against the same bench on an x86-64 desktop.
+# `draw_cost` and `first_pixel` on a Raspberry Pi 5, against the same benches on an x86-64 desktop.
 #
 # Pi 5 Model B Rev 1.0, Debian 13 trixie, kernel 6.18.33+rpt-rpi-2712, 4 cores, 8 GB,
 # Mesa V3D 7.1.7.0. Governor `performance`, clock 2400000, 59.8 C,
@@ -92,3 +92,29 @@
 #   delta      19.1 us over 1,048,576 fetches = 0.018 ns a fetch
 #
 # Free, to the limit of what this measures. The desktop's delta is zero within noise.
+
+# ---------------------------------------------------------------------------
+# `first_pixel` on the same board, 2026-10-03: 24 of 24 cases pass.
+#
+# The gating target, and every pixel is bit-identical to RADV, to lavapipe and to the
+# sa8155p's Adreno 640. Governor `performance`, `get_throttled` 0x0, 57.1 C, load 0.00.
+#
+#   fill [0,0,255,255]  background [0,0,255,255]  fill_outline [255,255,255,255]
+#   fill_extrusion [255,115,12,255]  extrusion_dim [125,125,125,255]
+#   raster [32,16,64,64]  raster_adjusted [54,37,87,255]
+#   heatmap_texture [128,64,0,128]  color_relief [10,90,55,128]
+#   symbol_sdf [200,100,50,255]  symbol_below [0,0,0,0]
+#   hillshade_prep [194,144,255,255]  hillshade [95,47,24,118]
+#   heatmap [80,255,255,255]  background_pattern [48,24,64,64]
+#   fill_pattern [48,24,64,64]  line_pattern [32,16,64,64]
+#   symbol_icon [40,20,64,64]  both_as_icon [40,20,64,64]  both_as_glyph [100,50,25,64]
+#   fill_on_globe [0,255,255,255]  fill_anchored [255,255,0,255]
+#   fill_raised [255,0,255,255]  circle [0,255,0,255]
+#
+# # The device preference
+#
+# `lvp_icd.json` is installed beside `broadcom_icd.json`, so the loader offers llvmpipe as
+# well as V3D. `device::preferred` reports `V3D 7.1.7.0 (internal)`. First board with both
+# present.
+#
+# llvmpipe would also pass all 24 cases, so a software fallback is invisible in the pixels.

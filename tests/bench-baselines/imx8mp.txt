@@ -152,3 +152,14 @@
 # vendor compiler that cannot compile them, which is the third such defect this board and
 # the sa8155p have produced between them -- after Adreno's assertion on a `mat4x4` in a
 # storage buffer and Vivante's own on constructing one from columns.
+#
+# # tessella#327 costs one of the twenty-two
+#
+# `COLOR_RELIEF_SHADER` declares two `Short2` attributes; mbgl's Vulkan shader declares one
+# and derives the coordinate from the position. That is the second trigger above.
+#
+# Rebuilt as mbgl declares it, `color_relief` compiles and draws here. The case reported a
+# wrong pixel from hacked geometry, not a failed module.
+#
+# So the over-declaration decides whether this family compiles on this driver. Noted on the
+# issue.

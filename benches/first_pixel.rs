@@ -52,7 +52,7 @@ use tessella_capture_abi::generated::ubo_layouts::{
     RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO, SYMBOL_EVALUATED_PROPS_UBO,
     SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
-use tessella_emblema::device::{preferred, vertex_format};
+use tessella_emblema::device::{check_vertex_formats, preferred, vertex_format};
 use tessella_emblema::shaders::{
     BACKGROUND_BODY, BACKGROUND_PATTERN_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY,
     FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY, FILL_PATTERN_BODY, HEATMAP_BODY, HEATMAP_TEXTURE_BODY,
@@ -2405,9 +2405,11 @@ impl Gpu {
 
         let mut bindings = Vec::new();
         let mut attributes = Vec::new();
+        let mut formats = Vec::new();
         for attribute in case.attributes {
             let format = vertex_format(attribute.declared)
                 .ok_or_else(|| format!("{} has no vertex format", attribute.name))?;
+            formats.push(format);
             let slot = u32::try_from(attribute.binding)
                 .map_err(|_| format!("{} binds at {}", attribute.name, attribute.binding))?;
             bindings.push(
@@ -2424,6 +2426,17 @@ impl Gpu {
                     .offset(0),
             );
         }
+
+        // A device that will not take one of these in a vertex buffer binds the attribute
+        // anyway and the shader reads zero, so ask before building the pipeline rather than
+        // reading the silence as a pixel. Per case, not once per device: a board missing one
+        // format can still run every family that does not declare it.
+        check_vertex_formats(&formats, |format| unsafe {
+            self.instance
+                .get_physical_device_format_properties(self.physical, format)
+                .buffer_features
+        })
+        .map_err(|why| format!("{} needs a format this device refuses: {why:?}", case.name))?;
 
         let entry_vertex = c"vertex_main";
         let entry_fragment = c"fragment_main";

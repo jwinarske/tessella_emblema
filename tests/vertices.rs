@@ -8,9 +8,10 @@ use ash::vk;
 use tessella_capture_abi::AttributeDataType;
 use tessella_capture_abi::envelope::{AttributeDesc, SlabRef};
 use tessella_capture_abi::generated::shader_attributes::{
-    COLOR_RELIEF_SHADER, FILL_SHADER, RASTER_SHADER,
+    COLOR_RELIEF_SHADER, FILL_EXTRUSION_INSTANCED_SHADER, FILL_EXTRUSION_INSTANCED_SHADER_INSTANCE,
+    FILL_SHADER, RASTER_SHADER,
 };
-use tessella_emblema::vertices::{Refused, plan};
+use tessella_emblema::vertices::{Refused, plan, plan_instanced};
 
 /// A descriptor agreeing with a table entry, which is the shape the producer sends.
 fn agreeing(
@@ -198,4 +199,69 @@ fn the_wire_decides_where_the_bytes_are() {
     assert_eq!(got.bound[0].vertex_offset, 7);
     assert_eq!(got.bound[0].source.slab, 3);
     assert_eq!(got.bound[0].source.offset, 128);
+}
+
+/// The instanced run binds alongside the vertex run, each with its own rate.
+///
+/// `FillExtrusionInstancedShader` declares its position in `attributes` and its outline, packed
+/// decimals and data-driven attributes in `instanceAttributes`, at slots that do not overlap.
+#[test]
+fn the_instanced_run_binds_with_its_own_rate() {
+    let per_vertex: Vec<AttributeDesc> = FILL_EXTRUSION_INSTANCED_SHADER
+        .iter()
+        .map(agreeing)
+        .collect();
+    let per_instance: Vec<AttributeDesc> = FILL_EXTRUSION_INSTANCED_SHADER_INSTANCE
+        .iter()
+        .map(agreeing)
+        .collect();
+    let got = plan_instanced(
+        &FILL_EXTRUSION_INSTANCED_SHADER,
+        &per_vertex,
+        &FILL_EXTRUSION_INSTANCED_SHADER_INSTANCE,
+        &per_instance,
+    )
+    .expect("the two runs agree");
+    assert_eq!(
+        got.bound.len(),
+        FILL_EXTRUSION_INSTANCED_SHADER.len() + FILL_EXTRUSION_INSTANCED_SHADER_INSTANCE.len()
+    );
+    let rates: Vec<vk::VertexInputRate> = got.bound.iter().map(|bound| bound.rate).collect();
+    assert_eq!(
+        rates[0],
+        vk::VertexInputRate::VERTEX,
+        "slot 0 is the position"
+    );
+    for rate in &rates[1..] {
+        assert_eq!(*rate, vk::VertexInputRate::INSTANCE);
+    }
+    assert_eq!(got.undeclared, [] as [(u32, i32); 0]);
+}
+
+/// A slot cannot be claimed by both runs: one binding number has one rate.
+#[test]
+fn a_slot_in_both_runs_is_refused() {
+    let shared = [FILL_EXTRUSION_INSTANCED_SHADER[0]];
+    let descs: Vec<AttributeDesc> = shared.iter().map(agreeing).collect();
+    assert_eq!(
+        plan_instanced(&shared, &descs, &shared, &descs),
+        Err(Refused::DuplicateSlot {
+            slot: shared[0].binding
+        })
+    );
+}
+
+/// `plan` is the vertex-only case of `plan_instanced`, and everything it binds is per vertex.
+#[test]
+fn the_plain_plan_is_all_per_vertex() {
+    let descs: Vec<AttributeDesc> = RASTER_SHADER.iter().map(agreeing).collect();
+    let got = plan(&RASTER_SHADER, &descs).expect("agrees");
+    for bound in &got.bound {
+        assert_eq!(bound.rate, vk::VertexInputRate::VERTEX);
+    }
+    assert_eq!(
+        got,
+        plan_instanced(&RASTER_SHADER, &descs, &[], &[]).expect("agrees"),
+        "an empty instanced run changes nothing"
+    );
 }

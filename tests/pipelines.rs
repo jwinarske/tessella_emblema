@@ -12,7 +12,7 @@ use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_capture_abi::generated::shader_attributes::{FILL_SHADER, RASTER_SHADER};
 use tessella_emblema::pipelines::key;
 use tessella_emblema::surface::Surface;
-use tessella_emblema::vertices::{Plan, plan};
+use tessella_emblema::vertices::{Plan, plan, plan_instanced};
 
 fn descs(stride: u32, offset: u32, source: SlabRef) -> Vec<AttributeDesc> {
     RASTER_SHADER
@@ -226,4 +226,25 @@ fn the_layout_records_the_format_the_table_declared() {
     for slot in &got.layout {
         assert_eq!(slot.format, ash::vk::Format::R16G16_SINT);
     }
+}
+
+/// The rate is pipeline state, so two drawables differing only in it are two pipelines.
+///
+/// Built by planning one table as the vertex run and then as the instanced run, which is the only
+/// thing that differs between the two plans.
+#[test]
+fn the_input_rate_separates_a_key() {
+    let descs = descs(12, 0, SOMEWHERE);
+    let per_vertex = plan(&RASTER_SHADER, &descs).expect("agrees");
+    let per_instance = plan_instanced(&[], &[], &RASTER_SHADER, &descs).expect("agrees");
+    assert_eq!(
+        per_vertex.bound.len(),
+        per_instance.bound.len(),
+        "the same bindings"
+    );
+    assert_ne!(
+        key(BuiltIn::RasterShader, Surface::Plane, 0, &per_vertex),
+        key(BuiltIn::RasterShader, Surface::Plane, 0, &per_instance),
+        "one advances per vertex and one per instance"
+    );
 }

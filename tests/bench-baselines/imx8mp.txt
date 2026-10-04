@@ -152,3 +152,18 @@
 # vendor compiler that cannot compile them, which is the third such defect this board and
 # the sa8155p have produced between them -- after Adreno's assertion on a `mat4x4` in a
 # storage buffer and Vivante's own on constructing one from columns.
+#
+# # One of the twenty-two would build if tessella#327 were fixed
+#
+# `COLOR_RELIEF_SHADER` declares two `Short2` attributes where mbgl's Vulkan shader
+# declares one and derives the texture coordinate from the position -- tessella#327, filed
+# as a tidiness question. The second trigger above makes it more than that.
+#
+# Rebuilt with that attribute removed from the table and the coordinate taken from the
+# position, as mbgl does, `color_relief` **compiles and draws here**: the case reported a
+# wrong pixel, because the experiment's geometry was hacked and not because the module
+# failed. One attribute, one draw, no segfault.
+#
+# So on this driver the over-declaration is the difference between a family that runs and
+# one that cannot be compiled. That is an argument for fixing the generator rather than
+# recording the disagreement, and it is on the issue.

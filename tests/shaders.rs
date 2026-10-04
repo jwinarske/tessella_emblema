@@ -7,299 +7,11 @@
 use std::collections::BTreeSet;
 
 use tessella_capture_abi::generated::mbgl_enums::AttributeDataType;
-use tessella_capture_abi::generated::shader_attributes::{
-    BACKGROUND_PATTERN_SHADER, BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER,
-    FILL_EXTRUSION_SHADER, FILL_OUTLINE_SHADER, FILL_PATTERN_SHADER, FILL_SHADER, HEATMAP_SHADER,
-    HEATMAP_TEXTURE_SHADER, HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, LINE_PATTERN_SHADER,
-    LINE_SHADER, RASTER_SHADER, SYMBOL_ICON_SHADER, SYMBOL_SDFSHADER, SYMBOL_TEXT_AND_ICON_SHADER,
-    ShaderAttribute,
-};
-use tessella_capture_abi::generated::texture_slots::{
-    BACKGROUND_PATTERN_SHADER_TEXTURES, COLOR_RELIEF_SHADER_TEXTURES, FILL_PATTERN_SHADER_TEXTURES,
-    HEATMAP_TEXTURE_SHADER_TEXTURES, HILLSHADE_PREPARE_SHADER_TEXTURES, HILLSHADE_SHADER_TEXTURES,
-    LINE_PATTERN_SHADER_TEXTURES, RASTER_SHADER_TEXTURES, SYMBOL_ICON_SHADER_TEXTURES,
-    SYMBOL_SDFSHADER_TEXTURES, SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES, ShaderTexture,
-};
-use tessella_capture_abi::generated::ubo_layouts::{
-    BACKGROUND_DRAWABLE_UBO, BACKGROUND_PATTERN_DRAWABLE_UBO, BACKGROUND_PATTERN_PROPS_UBO,
-    BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
-    COLOR_RELIEF_DRAWABLE_UBO, COLOR_RELIEF_EVALUATED_PROPS_UBO, COLOR_RELIEF_TILE_PROPS_UBO,
-    FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
-    FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, FILL_PATTERN_DRAWABLE_UBO,
-    FILL_PATTERN_TILE_PROPS_UBO, GLOBAL_PAINT_PARAMS_UBO, HEATMAP_DRAWABLE_UBO,
-    HEATMAP_EVALUATED_PROPS_UBO, HEATMAP_TEXTURE_PROPS_UBO, HILLSHADE_DRAWABLE_UBO,
-    HILLSHADE_EVALUATED_PROPS_UBO, HILLSHADE_PREPARE_DRAWABLE_UBO,
-    HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO, LINE_DRAWABLE_UBO,
-    LINE_EVALUATED_PROPS_UBO, LINE_PATTERN_DRAWABLE_UBO, LINE_PATTERN_TILE_PROPS_UBO,
-    RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO,
-    SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
-};
-use tessella_emblema::shaders::{
-    BACKGROUND_BODY, BACKGROUND_PATTERN_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY,
-    FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY, FILL_PATTERN_BODY, HEATMAP_BODY, HEATMAP_TEXTURE_BODY,
-    HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_BODY, LINE_PATTERN_BODY, RASTER_BODY,
-    SYMBOL_ICON_BODY, SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY, attribute_name, module,
-};
+use tessella_capture_abi::generated::shader_attributes::BACKGROUND_SHADER;
+use tessella_capture_abi::generated::ubo_layouts::{BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO};
+use tessella_emblema::families::ALL;
+use tessella_emblema::shaders::{BACKGROUND_BODY, attribute_name, module};
 use tessella_emblema::surface::Surface;
-
-/// A family, and the surfaces the producer can draw it on.
-struct Family {
-    name: &'static str,
-    blocks: Vec<&'static UboLayout>,
-    attributes: &'static [ShaderAttribute],
-    textures: &'static [ShaderTexture],
-    body: &'static str,
-    surfaces: &'static [Surface],
-    /// Whether this family hands `place` a height above the surface rather than zero.
-    ///
-    /// Which decides one of its surfaces: the direct bend has no height term, so a family that
-    /// leaves the surface cannot be drawn on it. See `Surface::Globe`'s placement.
-    height: bool,
-}
-
-/// Every family a plane module exists for, and which surfaces each one has.
-///
-/// A background has neither of the two surfaces that need a block of their own: it covers the
-/// viewport rather than a tile, so the producer writes it no bend block and never marks it
-/// raised. Everything else has all four.
-// A table of 31 entries once every family is here, and nothing but a table.
-#[allow(clippy::too_many_lines)]
-fn families() -> Vec<Family> {
-    let all = &[
-        Surface::Plane,
-        Surface::Globe,
-        Surface::GlobeAnchored,
-        Surface::Terrain,
-    ][..];
-    let flat_or_bent = &[Surface::Plane, Surface::Globe][..];
-    // No bend block: the producer writes one for the families whose geometry is a tile's, and a
-    // color relief is not among them -- so it has the direct bend and the raise but not the
-    // anchored one.
-    let unanchored = &[Surface::Plane, Surface::Globe, Surface::Terrain][..];
-    vec![
-        Family {
-            name: "background",
-            blocks: vec![&BACKGROUND_DRAWABLE_UBO, &BACKGROUND_PROPS_UBO],
-            attributes: &BACKGROUND_SHADER,
-            textures: &[],
-            body: BACKGROUND_BODY,
-            surfaces: flat_or_bent,
-            height: false,
-        },
-        Family {
-            name: "fill",
-            blocks: vec![&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
-            attributes: &FILL_SHADER,
-            textures: &[],
-            body: FILL_BODY,
-            surfaces: all,
-            height: false,
-        },
-        Family {
-            name: "fill_outline",
-            // Its own drawable block, which mbgl binds at the fill's slot: the layouts match but
-            // the interpolation factor is named `outline_color_t`, because the outline's color is
-            // a property of its own.
-            blocks: vec![
-                &FILL_OUTLINE_DRAWABLE_UBO,
-                &FILL_EVALUATED_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &FILL_OUTLINE_SHADER,
-            textures: &[],
-            body: FILL_OUTLINE_BODY,
-            surfaces: all,
-            height: false,
-        },
-        Family {
-            name: "line",
-            blocks: vec![
-                &LINE_DRAWABLE_UBO,
-                &LINE_EVALUATED_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &LINE_SHADER,
-            textures: &[],
-            body: LINE_BODY,
-            surfaces: all,
-            height: false,
-        },
-        Family {
-            name: "raster",
-            blocks: vec![&RASTER_DRAWABLE_UBO, &RASTER_EVALUATED_PROPS_UBO],
-            attributes: &RASTER_SHADER,
-            textures: &RASTER_SHADER_TEXTURES,
-            body: RASTER_BODY,
-            surfaces: all,
-            height: false,
-        },
-        Family {
-            name: "color_relief",
-            blocks: vec![
-                &COLOR_RELIEF_DRAWABLE_UBO,
-                &COLOR_RELIEF_TILE_PROPS_UBO,
-                &COLOR_RELIEF_EVALUATED_PROPS_UBO,
-            ],
-            attributes: &COLOR_RELIEF_SHADER,
-            textures: &COLOR_RELIEF_SHADER_TEXTURES,
-            body: COLOR_RELIEF_BODY,
-            surfaces: unanchored,
-            height: false,
-        },
-        Family {
-            name: "fill_extrusion",
-            blocks: vec![&FILL_EXTRUSION_DRAWABLE_UBO, &FILL_EXTRUSION_PROPS_UBO],
-            attributes: &FILL_EXTRUSION_SHADER,
-            textures: &[],
-            body: FILL_EXTRUSION_BODY,
-            // No direct bend: it has no height term, and this is the family with a height.
-            surfaces: &[Surface::Plane, Surface::GlobeAnchored],
-            height: true,
-        },
-        Family {
-            name: "symbol_icon",
-            blocks: vec![
-                &SYMBOL_DRAWABLE_UBO,
-                &SYMBOL_TILE_PROPS_UBO,
-                &SYMBOL_EVALUATED_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &SYMBOL_ICON_SHADER,
-            textures: &SYMBOL_ICON_SHADER_TEXTURES,
-            body: SYMBOL_ICON_BODY,
-            surfaces: all,
-            height: false,
-        },
-        Family {
-            name: "symbol_sdf",
-            blocks: vec![
-                &SYMBOL_DRAWABLE_UBO,
-                &SYMBOL_TILE_PROPS_UBO,
-                &SYMBOL_EVALUATED_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &SYMBOL_SDFSHADER,
-            textures: &SYMBOL_SDFSHADER_TEXTURES,
-            body: SYMBOL_SDF_BODY,
-            surfaces: all,
-            height: false,
-        },
-        Family {
-            name: "symbol_text_and_icon",
-            blocks: vec![
-                &SYMBOL_DRAWABLE_UBO,
-                &SYMBOL_TILE_PROPS_UBO,
-                &SYMBOL_EVALUATED_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &SYMBOL_TEXT_AND_ICON_SHADER,
-            textures: &SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES,
-            body: SYMBOL_TEXT_AND_ICON_BODY,
-            surfaces: all,
-            height: false,
-        },
-        Family {
-            name: "hillshade_prepare",
-            blocks: vec![
-                &HILLSHADE_PREPARE_DRAWABLE_UBO,
-                &HILLSHADE_PREPARE_TILE_PROPS_UBO,
-            ],
-            attributes: &HILLSHADE_PREPARE_SHADER,
-            textures: &HILLSHADE_PREPARE_SHADER_TEXTURES,
-            body: HILLSHADE_PREPARE_BODY,
-            // Draws into a texture, not onto the map: see the body's own note.
-            surfaces: &[Surface::Plane],
-            height: false,
-        },
-        Family {
-            name: "hillshade",
-            blocks: vec![
-                &HILLSHADE_DRAWABLE_UBO,
-                &HILLSHADE_TILE_PROPS_UBO,
-                &HILLSHADE_EVALUATED_PROPS_UBO,
-            ],
-            attributes: &HILLSHADE_SHADER,
-            textures: &HILLSHADE_SHADER_TEXTURES,
-            body: HILLSHADE_BODY,
-            surfaces: all,
-            height: false,
-        },
-        Family {
-            name: "background_pattern",
-            blocks: vec![
-                &BACKGROUND_PATTERN_DRAWABLE_UBO,
-                &BACKGROUND_PATTERN_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &BACKGROUND_PATTERN_SHADER,
-            textures: &BACKGROUND_PATTERN_SHADER_TEXTURES,
-            body: BACKGROUND_PATTERN_BODY,
-            surfaces: flat_or_bent,
-            height: false,
-        },
-        Family {
-            name: "fill_pattern",
-            blocks: vec![
-                &FILL_PATTERN_DRAWABLE_UBO,
-                &FILL_PATTERN_TILE_PROPS_UBO,
-                &FILL_EVALUATED_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &FILL_PATTERN_SHADER,
-            textures: &FILL_PATTERN_SHADER_TEXTURES,
-            body: FILL_PATTERN_BODY,
-            surfaces: all,
-            height: false,
-        },
-        Family {
-            name: "line_pattern",
-            blocks: vec![
-                &LINE_PATTERN_DRAWABLE_UBO,
-                &LINE_PATTERN_TILE_PROPS_UBO,
-                &LINE_EVALUATED_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &LINE_PATTERN_SHADER,
-            textures: &LINE_PATTERN_SHADER_TEXTURES,
-            body: LINE_PATTERN_BODY,
-            surfaces: all,
-            height: false,
-        },
-        Family {
-            name: "heatmap",
-            blocks: vec![&HEATMAP_DRAWABLE_UBO, &HEATMAP_EVALUATED_PROPS_UBO],
-            attributes: &HEATMAP_SHADER,
-            textures: &[],
-            body: HEATMAP_BODY,
-            // Draws into a texture, like `hillshade_prepare`.
-            surfaces: &[Surface::Plane],
-            height: false,
-        },
-        Family {
-            name: "heatmap_texture",
-            blocks: vec![&HEATMAP_TEXTURE_PROPS_UBO, &GLOBAL_PAINT_PARAMS_UBO],
-            attributes: &HEATMAP_TEXTURE_SHADER,
-            textures: &HEATMAP_TEXTURE_SHADER_TEXTURES,
-            body: HEATMAP_TEXTURE_BODY,
-            // Covers the viewport rather than a tile, like the background.
-            surfaces: flat_or_bent,
-            height: false,
-        },
-        Family {
-            name: "circle",
-            blocks: vec![
-                &CIRCLE_DRAWABLE_UBO,
-                &CIRCLE_EVALUATED_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &CIRCLE_SHADER,
-            textures: &[],
-            body: CIRCLE_BODY,
-            surfaces: all,
-            height: false,
-        },
-    ]
-}
 
 /// Compiles a module to SPIR-V, or says why not.
 fn compile(source: &str) -> Vec<u32> {
@@ -382,13 +94,14 @@ fn the_body_reads_what_the_tables_declare() {
 /// A mutation found the first: nothing else in the suite noticed the arms swapping.
 #[test]
 fn the_roof_sits_at_the_top_and_keeps_its_fraction() {
-    let extrusion = families()
+    let extrusion = ALL
+        .iter()
         .into_iter()
         .find(|family| family.name == "fill_extrusion")
         .expect("fill extrusion is in the matrix");
     let source = module(
         Surface::Plane,
-        &extrusion.blocks,
+        extrusion.blocks,
         extrusion.attributes,
         extrusion.textures,
         extrusion.body,
@@ -420,13 +133,14 @@ fn the_roof_sits_at_the_top_and_keeps_its_fraction() {
 /// All three compile, validate and draw, which is what makes them worth pinning.
 #[test]
 fn the_symbol_icon_keeps_its_placement_decisions() {
-    let icon = families()
+    let icon = ALL
+        .iter()
         .into_iter()
         .find(|family| family.name == "symbol_icon")
         .expect("symbol icon is in the matrix");
     let source = module(
         Surface::Plane,
-        &icon.blocks,
+        icon.blocks,
         icon.attributes,
         icon.textures,
         icon.body,
@@ -478,13 +192,14 @@ fn the_symbol_icon_keeps_its_placement_decisions() {
 ///   `symbol_icon` would name an attribute that does not arrive.
 #[test]
 fn the_text_and_icon_keeps_its_sheet_decisions() {
-    let both = families()
+    let both = ALL
+        .iter()
         .into_iter()
         .find(|family| family.name == "symbol_text_and_icon")
         .expect("text and icon is in the matrix");
     let source = module(
         Surface::Plane,
-        &both.blocks,
+        both.blocks,
         both.attributes,
         both.textures,
         both.body,
@@ -541,13 +256,14 @@ fn the_text_and_icon_keeps_its_sheet_decisions() {
 #[test]
 fn the_hillshade_keeps_its_slope_decisions() {
     let family = |name: &str| {
-        let found = families()
+        let found = ALL
+            .iter()
             .into_iter()
             .find(|family| family.name == name)
             .unwrap_or_else(|| panic!("{name} is in the matrix"));
         module(
             Surface::Plane,
-            &found.blocks,
+            found.blocks,
             found.attributes,
             found.textures,
             found.body,
@@ -609,13 +325,14 @@ fn the_hillshade_keeps_its_slope_decisions() {
 #[test]
 fn the_patterns_keep_their_tiling_decisions() {
     let assembled = |name: &str| {
-        let found = families()
+        let found = ALL
+            .iter()
             .into_iter()
             .find(|family| family.name == name)
             .unwrap_or_else(|| panic!("{name} is in the matrix"));
         module(
             Surface::Plane,
-            &found.blocks,
+            found.blocks,
             found.attributes,
             found.textures,
             found.body,
@@ -681,13 +398,14 @@ fn the_patterns_keep_their_tiling_decisions() {
 ///   puts the centerline at the sprite's middle rather than at its top.
 #[test]
 fn the_line_pattern_keeps_its_sprite_decisions() {
-    let pattern = families()
+    let pattern = ALL
+        .iter()
         .into_iter()
         .find(|family| family.name == "line_pattern")
         .expect("line pattern is in the matrix");
     let source = module(
         Surface::Plane,
-        &pattern.blocks,
+        pattern.blocks,
         pattern.attributes,
         pattern.textures,
         pattern.body,
@@ -739,13 +457,14 @@ fn the_line_pattern_keeps_its_sprite_decisions() {
 #[test]
 fn the_heatmap_keeps_its_kernel_decisions() {
     let assembled = |name: &str| {
-        let found = families()
+        let found = ALL
+            .iter()
             .into_iter()
             .find(|family| family.name == name)
             .unwrap_or_else(|| panic!("{name} is in the matrix"));
         module(
             Surface::Plane,
-            &found.blocks,
+            found.blocks,
             found.attributes,
             found.textures,
             found.body,
@@ -810,13 +529,14 @@ fn the_heatmap_keeps_its_kernel_decisions() {
 ///   what holds the edge feather at a constant pixel width under pitch.
 #[test]
 fn the_line_keeps_its_extrusion_decisions() {
-    let line = families()
+    let line = ALL
+        .iter()
         .into_iter()
         .find(|family| family.name == "line")
         .expect("line is in the matrix");
     let source = module(
         Surface::Plane,
-        &line.blocks,
+        line.blocks,
         line.attributes,
         line.textures,
         line.body,
@@ -867,13 +587,14 @@ fn the_line_keeps_its_extrusion_decisions() {
 ///   perspective divide the position got. Without it, pitched type blurs with distance.
 #[test]
 fn the_symbol_sdf_keeps_its_edge_decisions() {
-    let sdf = families()
+    let sdf = ALL
+        .iter()
         .into_iter()
         .find(|family| family.name == "symbol_sdf")
         .expect("symbol sdf is in the matrix");
     let source = module(
         Surface::Plane,
-        &sdf.blocks,
+        sdf.blocks,
         sdf.attributes,
         sdf.textures,
         sdf.body,
@@ -920,13 +641,14 @@ fn the_symbol_sdf_keeps_its_edge_decisions() {
 ///   what makes the fill opaque at the center and clear at the rim rather than the reverse.
 #[test]
 fn the_circle_keeps_its_extrusion_decisions() {
-    let circle = families()
+    let circle = ALL
+        .iter()
         .into_iter()
         .find(|family| family.name == "circle")
         .expect("circle is in the matrix");
     let source = module(
         Surface::Plane,
-        &circle.blocks,
+        circle.blocks,
         circle.attributes,
         circle.textures,
         circle.body,
@@ -975,13 +697,14 @@ fn the_circle_keeps_its_extrusion_decisions() {
 /// and `w` and dividing here. Without any of it an outline still draws, as a hard aliased line.
 #[test]
 fn the_fill_outline_keeps_its_feather() {
-    let outline = families()
+    let outline = ALL
+        .iter()
         .into_iter()
         .find(|family| family.name == "fill_outline")
         .expect("fill outline is in the matrix");
     let source = module(
         Surface::Plane,
-        &outline.blocks,
+        outline.blocks,
         outline.attributes,
         outline.textures,
         outline.body,
@@ -1012,13 +735,14 @@ fn the_fill_outline_keeps_its_feather() {
 /// the sampler's addressing mode gives back -- a plausible color, from the wrong elevation.
 #[test]
 fn the_color_relief_pins_the_poles() {
-    let relief = families()
+    let relief = ALL
+        .iter()
         .into_iter()
         .find(|family| family.name == "color_relief")
         .expect("color relief is in the matrix");
     let source = module(
         Surface::Plane,
-        &relief.blocks,
+        relief.blocks,
         relief.attributes,
         relief.textures,
         relief.body,
@@ -1046,7 +770,7 @@ fn the_color_relief_pins_the_poles() {
 #[test]
 fn a_family_with_a_height_skips_the_direct_bend() {
     let mut with_height = 0;
-    for family in families() {
+    for family in ALL {
         if !family.height {
             continue;
         }
@@ -1093,13 +817,14 @@ fn a_family_with_a_height_skips_the_direct_bend() {
 /// until a device renders it, which is true of every body here.
 #[test]
 fn the_color_relief_keeps_its_unpack_and_its_texel_centers() {
-    let relief = families()
+    let relief = ALL
+        .iter()
         .into_iter()
         .find(|family| family.name == "color_relief")
         .expect("color relief is in the matrix");
     let source = module(
         Surface::Plane,
-        &relief.blocks,
+        relief.blocks,
         relief.attributes,
         relief.textures,
         relief.body,
@@ -1131,7 +856,8 @@ fn the_color_relief_keeps_its_unpack_and_its_texel_centers() {
 fn a_familys_images_bind_before_the_surfaces() {
     use tessella_emblema::shaders::texture_name;
 
-    let raster = families()
+    let raster = ALL
+        .iter()
         .into_iter()
         .find(|family| family.name == "raster")
         .expect("raster is in the matrix");
@@ -1140,7 +866,7 @@ fn a_familys_images_bind_before_the_surfaces() {
     // Flat: two blocks, then the family's two images and their samplers, and nothing after.
     let flat = module(
         Surface::Plane,
-        &raster.blocks,
+        raster.blocks,
         raster.attributes,
         raster.textures,
         raster.body,
@@ -1175,7 +901,7 @@ fn a_familys_images_bind_before_the_surfaces() {
     // after them rather than among them.
     let raised = module(
         Surface::Terrain,
-        &raster.blocks,
+        raster.blocks,
         raster.attributes,
         raster.textures,
         raster.body,
@@ -1200,11 +926,11 @@ fn a_familys_images_bind_before_the_surfaces() {
 /// a change back: both spellings compile, validate and draw the same picture.
 #[test]
 fn the_slot_arrives_as_the_instance_index() {
-    for family in families() {
+    for family in ALL {
         for surface in family.surfaces {
             let source = module(
                 *surface,
-                &family.blocks,
+                family.blocks,
                 family.attributes,
                 family.textures,
                 family.body,
@@ -1304,11 +1030,11 @@ fn a_matrix_is_declared_as_four_columns() {
 /// at all, on any family or any surface.
 #[test]
 fn no_module_names_a_matrix_type() {
-    for family in families() {
+    for family in ALL {
         for surface in family.surfaces {
             let source = module(
                 *surface,
-                &family.blocks,
+                family.blocks,
                 family.attributes,
                 family.textures,
                 family.body,
@@ -1404,12 +1130,12 @@ const fn is_identifier(byte: u8) -> bool {
 #[test]
 fn every_family_on_every_surface_compiles() {
     let mut pairs = 0;
-    for family in families() {
+    for family in ALL {
         for surface in family.surfaces {
             let what = format!("{}{}", family.name, surface.suffix());
             let source = module(
                 *surface,
-                &family.blocks,
+                family.blocks,
                 family.attributes,
                 family.textures,
                 family.body,
@@ -1434,11 +1160,11 @@ fn every_family_on_every_surface_compiles() {
 /// it: an unused input is legal.
 #[test]
 fn every_attribute_is_read() {
-    for family in families() {
+    for family in ALL {
         for surface in family.surfaces {
             let source = module(
                 *surface,
-                &family.blocks,
+                family.blocks,
                 family.attributes,
                 family.textures,
                 family.body,
@@ -1539,10 +1265,10 @@ const UNREAD_COMPONENTS: &[(&str, &str, &str)] = &[
 #[test]
 fn every_component_of_an_attribute_is_read() {
     let mut short = Vec::new();
-    for family in families() {
+    for family in ALL {
         let source = module(
             Surface::Plane,
-            &family.blocks,
+            family.blocks,
             family.attributes,
             family.textures,
             family.body,
@@ -1699,11 +1425,11 @@ const FACTOR_ALIASES: &[(&str, &str)] = &[("symbol_color", "fill_color_t")];
 #[test]
 fn every_zoom_factor_is_used() {
     let mut paired = 0;
-    for family in families() {
+    for family in ALL {
         for surface in family.surfaces {
             let source = module(
                 *surface,
-                &family.blocks,
+                family.blocks,
                 family.attributes,
                 family.textures,
                 family.body,
@@ -1712,7 +1438,7 @@ fn every_zoom_factor_is_used() {
             for attribute in family.attributes {
                 let field = attribute_name(attribute.name);
                 let flat = field.replace('_', "");
-                for block in &family.blocks {
+                for block in family.blocks {
                     for factor in block.fields {
                         let Some(stem) = factor.name.strip_suffix("_t") else {
                             continue;
@@ -1721,7 +1447,7 @@ fn every_zoom_factor_is_used() {
                             continue;
                         }
                         let aliased = FACTOR_ALIASES.contains(&(field.as_str(), factor.name));
-                        if !aliased && !flat.ends_with(&stem.replace('_', "")) {
+                        if !aliased && !flat.ends_with(stem.replace('_', "").as_str()) {
                             continue;
                         }
                         paired += 1;

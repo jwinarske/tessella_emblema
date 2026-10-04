@@ -132,9 +132,14 @@
 #
 # `background` went from a wrong pixel to correct, and six families went from drawing to
 # segfaulting. That change rewrote declared types from the shader text instead of
-# `AttributeInfo`, which turned many `Float` declarations into `Float2`. Reading a `Float2`
-# attribute is the trigger bisected below, so the correction is right about mbgl and
-# expensive here. Filed on tessella.
+# `AttributeInfo`, which turned many `Float` declarations into `Float2`, so a body that read
+# a scalar attribute now reads a component of a vector one.
+#
+# Why that crashes is **not** established. The trigger below is a composite built from a
+# scalar loaded out of a *storage buffer*, and these are vertex attributes. The `fill`
+# bisection further down fails on `in.fill_opacity.y`, which is the same shape one step
+# over, so the rule plausibly covers any direct interface load -- but no rung tested a
+# vertex attribute, so that is a guess and not a measurement. Filed on tessella#330.
 #
 # # The crash
 #
@@ -146,7 +151,34 @@
 # It is in shader compilation, not in the clear, the readback or the linear attachment:
 # `background` exercises all three and passes.
 #
-# # Two bisections, and what they do not prove
+# # The trigger
+#
+# An `OpCompositeConstruct` whose operand is a scalar loaded directly out of a storage
+# buffer. Bisected 2026-10-04 with throwaway cases in the oracle, each holding the blocks,
+# textures, attributes and vertex stage fixed and varying one thing. All twelve build and
+# draw on RADV first.
+#
+#   the composite's operands                                    GC7000UL
+#   props.a, props.b, props.c, 1.0 -- direct loads              segfault
+#   vec3<f32>(props.brightness_low)                             segfault
+#   vec3<f32>(b, b, b), b a direct load                         segfault
+#   mix(v4, v4, props.fade_t) -- naga splats the scalar         segfault
+#   props.a * 1.5, props.b * 1.5, props.c * 1.5, 1.0            builds
+#   dot(c, props.spin_weights.xyz), ... -- computed             builds
+#   vec4<f32>(props.spin_weights.xyz, 1.0) -- vector member     builds
+#   vec3<f32>(0.25) -- constant                                 builds
+#   a * (1.0 - f) + b * f -- no composite at all                builds
+#
+# The scalar's provenance decides it. Any arithmetic between the load and the constructor
+# compiles, as does a vector member, as does a constant. Writing a splat out longhand does
+# not help, so it is not the splat syntax. Two hypotheses died here: a repeated operand is
+# not it -- three distinct loads crash too -- and neither is the splat.
+#
+# `mix(vecN, vecN, scalar)` is the idiom that makes this common, since naga lowers the
+# scalar to a splat. The workaround is per-expression: keep a direct scalar load out of a
+# vector constructor. Whether to apply it across 18 families is open on tessella#330.
+#
+# # What the earlier reductions were worth
 #
 # Against `fill`, before #326:
 #
@@ -155,20 +187,19 @@
 #   the `Float2` read kept (`in.fill_opacity.y`, no mix at all)        segfault
 #   neither read, `mix(0.0, 1.0, drawable.opacity_t)` instead         builds
 #
-# And `raster` reduced over six runs to one storage block holding one matrix, a body that
-# places the position, a fragment returning a constant and two `Short2` attributes --
-# still segfaulting, where `background` is the same module with one attribute and builds.
+# Those stand as measurements, but the rule drawn from them -- that reading a `Float2` or
+# `Float4` attribute is enough on its own -- does not hold: `background_pattern`,
+# `heatmap`, `line_pattern`, `fill_pattern` and `symbol_icon` read them and build. The
+# `mix` in each failing row is the composite above.
 #
-# Both reductions stand as measurements. Neither rule generalizes:
-#
-#   - two `Short2` attributes is not sufficient. `color_relief` and `hillshade` declare
-#     exactly that and build; `heatmap_texture` declares three and passes.
-#   - reading a `Float2` or `Float4` is not sufficient either. `background_pattern`,
-#     `heatmap`, `line_pattern`, `fill_pattern` and `symbol_icon` all read them and build.
-#
-# So `raster` segfaults and `color_relief` builds on identical attribute tables, and the
-# discriminator is somewhere else. The earlier claim of a third trigger -- that
-# `background_pattern` segfaults with a single `Short2` -- is withdrawn: it builds.
+# The `raster` reduction was wrong. It recorded one storage block, a minimal body and two
+# `Short2` attributes as segfaulting, with `background` as the control. Rebuilt that way,
+# it builds and draws: raster's two blocks, two textures and two `Short2` attributes with
+# a minimal body pass. The control had changed the drawable block as well as the attribute
+# count, so it isolated neither. Two `Short2` attributes are fine -- `color_relief` and
+# `hillshade` declare exactly that and build, `heatmap_texture` declares three and passes.
+# The claimed third trigger, `background_pattern` segfaulting on a single `Short2`, is
+# withdrawn: it builds.
 #
 # # tessella#327 costs nothing here
 #

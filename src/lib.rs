@@ -50,7 +50,7 @@
 //! SPIR-V, and pins the decisions that are silent when wrong. A wrong one of those still draws,
 //! which is why they are pinned at all.
 //!
-//! `benches/first_pixel.rs` *runs* them. Twenty-one cases pick inputs that make one pixel
+//! `benches/first_pixel.rs` *runs* them. Twenty-four cases pick inputs that make one pixel
 //! predictable, derive that pixel from mbgl's own arithmetic by hand, draw, and read it back. It
 //! is a bench rather than a test because it needs a GPU and CI has none; it has caught defects
 //! the pins could not, including a feather mirrored by a coordinate flip naga applies after a
@@ -58,10 +58,15 @@
 //!
 //! # What is not here yet
 //!
-//! In dependency order: the reader half (`tessella-consume`, ported once to Rust and living in
-//! the tessella workspace); the geometry, uniform-block and texture stores keyed by the ABI's
-//! ids; the pipelines those modules become; and the hand-off itself, which waits on emblema
-//! gaining `VulkanTexture::assume_layout`.
+//! In dependency order: the geometry, uniform-block and texture stores keyed by the ABI's ids;
+//! the pipelines those modules become; and the hand-off itself, which waits on emblema gaining
+//! `VulkanTexture::assume_layout`. The reader half is done and lives in the tessella workspace as
+//! `tessella-consume`, which hands this crate a `join::Drawable` -- an announcement with its
+//! attribute, segment and texture runs already read out of the payload, paired with one view's
+//! use of it.
+//!
+//! [`vertices`] is the first of those stores' decisions rather than a store: what a drawable's
+//! attribute descriptors come to once they are checked against the family's own table.
 //!
 //! Nothing here reads the stream yet, and nothing in this crate touches a GPU —
 //! `#![forbid(unsafe_code)]` is still at the top of this file, so the only `ash` calls are in the
@@ -80,6 +85,7 @@ mod spirv;
 pub mod surface;
 pub mod textures;
 pub mod uniforms;
+pub mod vertices;
 
 /// The ABI this crate consumes, re-exported so a caller pins one version of it with this crate.
 ///

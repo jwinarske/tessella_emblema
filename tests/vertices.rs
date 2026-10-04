@@ -93,24 +93,40 @@ fn a_slot_nobody_supplied_is_absent_rather_than_an_error() {
 
 /// The skirt flag. `encode_color_relief` sends three descriptors and the table declares two.
 ///
-/// Refused rather than dropped: `tessella_fluorite` reads that third attribute as `custom1` and a
-/// consumer that silently discarded it would lose the terrain curtain, which is the kind of defect
-/// that reaches a frame as a seam rather than as an error.
+/// Reported, not refused and not silently dropped. This crate has no per-layer skirt by design —
+/// `TERRAIN_PLACEMENT` says only the ground has one — so no module here will declare that
+/// attribute and refusing it would make raster and color relief undrawable. `tessella_fluorite`
+/// does read it, as `custom1`, which is why it is named rather than discarded.
 #[test]
-fn a_slot_the_table_does_not_declare_is_refused() {
+fn a_slot_the_table_does_not_declare_is_reported() {
     let mut descs: Vec<AttributeDesc> = COLOR_RELIEF_SHADER.iter().map(agreeing).collect();
     let mut skirt = agreeing(&COLOR_RELIEF_SHADER[1]);
     skirt.attr_id = 2;
     skirt.binding = 2;
     skirt.offset = 8;
     descs.push(skirt);
+    let got = plan(&COLOR_RELIEF_SHADER, &descs).expect("an extra slot is not fatal");
+    assert_eq!(got.undeclared, vec![(2, 2)]);
     assert_eq!(
-        plan(&COLOR_RELIEF_SHADER, &descs),
-        Err(Refused::UndeclaredSlot {
-            attr_id: 2,
-            slot: 2
-        })
+        got.bound.len(),
+        COLOR_RELIEF_SHADER.len(),
+        "the declared attributes still bind"
     );
+    assert_eq!(got.absent, [] as [u32; 0]);
+}
+
+/// The whole of raster's run plans, which is the family the refusal would have broken.
+#[test]
+fn a_raster_bucket_with_its_skirt_still_binds_both_declared_attributes() {
+    let mut descs: Vec<AttributeDesc> = RASTER_SHADER.iter().map(agreeing).collect();
+    let mut skirt = agreeing(&RASTER_SHADER[1]);
+    skirt.attr_id = 2;
+    skirt.binding = 2;
+    skirt.offset = 8;
+    descs.push(skirt);
+    let got = plan(&RASTER_SHADER, &descs).expect("raster plans");
+    assert_eq!(got.bound.len(), 2);
+    assert_eq!(got.undeclared, vec![(2, 2)]);
 }
 
 #[test]

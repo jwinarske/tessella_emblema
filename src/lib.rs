@@ -77,7 +77,9 @@
 //! become, including the slot that travels as `firstInstance` because the bodies read it as
 //! `ubo_index`. [`buffers`] is what those two come to on the device -- the distinct slab
 //! references behind a plan's bindings, which is fewer than the bindings whenever the producer
-//! interleaved a vertex.
+//! interleaved a vertex. [`pipelines`] is what a cache of them is keyed by, which includes the
+//! vertex input state because a `VkPipeline` bakes that in -- two drawables of one family and
+//! permutation whose strides differ are two pipelines.
 //!
 //! Nothing here reads the stream yet, and nothing in this crate touches a GPU —
 //! `#![forbid(unsafe_code)]` is still at the top of this file, so the only `ash` calls are in the
@@ -91,6 +93,7 @@ pub mod buffers;
 pub mod device;
 pub mod draws;
 pub mod families;
+pub mod pipelines;
 pub mod preamble;
 pub mod residency;
 pub mod shaders;

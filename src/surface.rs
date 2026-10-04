@@ -157,7 +157,7 @@ static NO_TEXTURES: [&str; 0] = [];
 static TERRAIN_TEXTURES: [&str; 1] = ["elevation"];
 
 /// What a vertex is placed on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Surface {
     /// Flat Mercator: the drawable's matrix reaches clip space and that is the whole of it.
     Plane,

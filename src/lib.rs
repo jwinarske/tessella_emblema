@@ -65,6 +65,12 @@
 //! attribute, segment and texture runs already read out of the payload, paired with one view's
 //! use of it.
 //!
+//! [`families`] is what a producer's `builtin_shader` resolves to: the blocks, tables, body and
+//! surfaces one family's module is assembled from, keyed by the shader rather than by a name
+//! because nothing on the wire carries a name. It also states the coverage -- eighteen of mbgl's
+//! thirty-six shader entries are drawn here and the rest are listed with the reason, pinned
+//! against the enum so neither list can drift.
+//!
 //! [`vertices`] is the first of those stores' decisions rather than a store: what a drawable's
 //! attribute descriptors come to once they are checked against the family's own table.
 //!
@@ -77,6 +83,7 @@
 #![forbid(unsafe_code)]
 
 pub mod device;
+pub mod families;
 pub mod preamble;
 pub mod residency;
 pub mod shaders;

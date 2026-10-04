@@ -17,6 +17,27 @@
 //! read back by the generated WGSL struct; and that `instance_index` reaches `ubo_index`. Each
 //! case adds whatever its own body computes on top of that.
 //!
+//! # A case has to be sensitive to what it claims to read
+//!
+//! Twice on 2026-10-04 a case drew the right pixel while being blind to one of its inputs, both
+//! times because a sampled coordinate sat on a texel boundary and two different values reached
+//! the same texel. `color_relief`'s coordinate lands 8e-6 from one; `raster_interleaved` could
+//! not tell a four-byte offset error until the bytes nothing binds were filled with a value that
+//! samples a *different* texel.
+//!
+//! So a new case is not finished when it draws the expected pixel. Nudge each input to a
+//! neighbouring value and check the pixel moves: a texel of each image, each stream, each uniform
+//! field the body reads. An input that can be changed without moving the pixel is not under test,
+//! whatever the case's comment says.
+//!
+//! Every case here was audited that way for its images, one texel at a time. Each moves on
+//! exactly the texels it should, and the three that move on more than one have reasons:
+//! `hillshade_prepare` reads a 3x3 neighbourhood to compute a slope, `color_relief` mixes two
+//! ramp stops, and a raised surface samples the DEM per vertex and interpolates, so several
+//! texels reach one pixel. The two text-and-icon cases are the sharpest result: `both_as_icon`
+//! moves only on the icon sheet and `both_as_glyph` only on the glyph atlas, which is the pair
+//! saying the family picks its atlas per vertex rather than per draw.
+//!
 //! # What a pass does not prove
 //!
 //! Anything about a family not listed, and nothing about a tiler. The device is chosen external,

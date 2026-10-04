@@ -25,19 +25,7 @@
 //! disagree; see `draw_cost.rs`.
 
 use ash::vk;
-use tessella_capture_abi::generated::shader_attributes::{
-    BACKGROUND_PATTERN_SHADER, BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER,
-    FILL_EXTRUSION_SHADER, FILL_OUTLINE_SHADER, FILL_PATTERN_SHADER, FILL_SHADER, HEATMAP_SHADER,
-    HEATMAP_TEXTURE_SHADER, HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, LINE_PATTERN_SHADER,
-    RASTER_SHADER, SYMBOL_ICON_SHADER, SYMBOL_SDFSHADER, SYMBOL_TEXT_AND_ICON_SHADER,
-    ShaderAttribute,
-};
-use tessella_capture_abi::generated::texture_slots::{
-    BACKGROUND_PATTERN_SHADER_TEXTURES, COLOR_RELIEF_SHADER_TEXTURES, FILL_PATTERN_SHADER_TEXTURES,
-    HEATMAP_TEXTURE_SHADER_TEXTURES, HILLSHADE_PREPARE_SHADER_TEXTURES, HILLSHADE_SHADER_TEXTURES,
-    LINE_PATTERN_SHADER_TEXTURES, RASTER_SHADER_TEXTURES, SYMBOL_ICON_SHADER_TEXTURES,
-    SYMBOL_SDFSHADER_TEXTURES, SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES, ShaderTexture,
-};
+use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PATTERN_DRAWABLE_UBO, BACKGROUND_PATTERN_PROPS_UBO,
     BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
@@ -53,12 +41,8 @@ use tessella_capture_abi::generated::ubo_layouts::{
     SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
 use tessella_emblema::device::{check_vertex_formats, preferred, vertex_format};
-use tessella_emblema::shaders::{
-    BACKGROUND_BODY, BACKGROUND_PATTERN_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY,
-    FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY, FILL_PATTERN_BODY, HEATMAP_BODY, HEATMAP_TEXTURE_BODY,
-    HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_PATTERN_BODY, RASTER_BODY, SYMBOL_ICON_BODY,
-    SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY, module,
-};
+use tessella_emblema::families::family;
+use tessella_emblema::shaders::module;
 use tessella_emblema::surface::{GLOBE_BEND_UBO, GLOBE_CAMERA_UBO, Surface, TERRAIN_DRAWABLE_UBO};
 
 /// The target's edge, in pixels. Small: one pixel is read and the rest is margin.
@@ -80,15 +64,16 @@ struct Case {
     /// observable through *where* geometry lands, and the families' own arithmetic is easier to
     /// read off a surface that does nothing.
     surface: Surface,
-    blocks: Vec<&'static UboLayout>,
-    attributes: &'static [ShaderAttribute],
-    body: &'static str,
+    /// Which family's module to draw, resolved through `families::family`.
+    ///
+    /// Named rather than restated: the oracle's value is that it runs the modules the library
+    /// ships, and a case carrying its own copy of a family's blocks, tables and body would
+    /// verify the copy.
+    family: BuiltIn,
     /// One stream per attribute, in the table's order, holding every vertex.
     streams: Vec<Vec<u8>>,
-    /// One block per entry in `blocks`, in the same order.
+    /// One block per entry in the family's `blocks`, in the same order.
     uniforms: Vec<Vec<u8>>,
-    /// The family's texture table, which is what names the bindings in the module.
-    textures: &'static [ShaderTexture],
     /// One image per entry in `textures`, in the same order.
     images: Vec<Image>,
     vertices: u32,
@@ -458,10 +443,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillShader,
             surface: Surface::Plane,
-            blocks: vec![&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
-            attributes: &FILL_SHADER,
-            body: FILL_BODY,
             streams: vec![
                 shorts(&COVERING),
                 per_vertex(&packed_pair([255, 0, 0, 255], [0, 0, 255, 255]), 3),
@@ -478,7 +461,6 @@ fn cases() -> Vec<Case> {
                 ),
                 block(&FILL_EVALUATED_PROPS_UBO, &[]),
             ],
-            textures: &[],
             images: Vec::new(),
             vertices: 3,
             expect: [0, 0, 255, 255],
@@ -489,10 +471,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "background",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::BackgroundShader,
             surface: Surface::Plane,
-            blocks: vec![&BACKGROUND_DRAWABLE_UBO, &BACKGROUND_PROPS_UBO],
-            attributes: &BACKGROUND_SHADER,
-            body: BACKGROUND_BODY,
             streams: vec![shorts(&COVERING)],
             uniforms: vec![
                 block(&BACKGROUND_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
@@ -504,7 +484,6 @@ fn cases() -> Vec<Case> {
                     ],
                 ),
             ],
-            textures: &[],
             images: Vec::new(),
             vertices: 3,
             expect: [0, 0, 255, 255],
@@ -525,14 +504,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill_outline",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillOutlineShader,
             surface: Surface::Plane,
-            blocks: vec![
-                &FILL_OUTLINE_DRAWABLE_UBO,
-                &FILL_EVALUATED_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &FILL_OUTLINE_SHADER,
-            body: FILL_OUTLINE_BODY,
             streams: vec![
                 shorts(&COVERING),
                 per_vertex(&packed_color([255, 255, 255, 255]), 3),
@@ -556,7 +529,6 @@ fn cases() -> Vec<Case> {
                     )],
                 ),
             ],
-            textures: &[],
             images: Vec::new(),
             vertices: 3,
             expect: [255, 255, 255, 255],
@@ -584,10 +556,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill_extrusion",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillExtrusionShader,
             surface: Surface::Plane,
-            blocks: vec![&FILL_EXTRUSION_DRAWABLE_UBO, &FILL_EXTRUSION_PROPS_UBO],
-            attributes: &FILL_EXTRUSION_SHADER,
-            body: FILL_EXTRUSION_BODY,
             streams: vec![
                 shorts(&COVERING),
                 ushorts(&[0, 0, 0, 0, 0, 0]),
@@ -616,7 +586,6 @@ fn cases() -> Vec<Case> {
                     ],
                 ),
             ],
-            textures: &[],
             images: Vec::new(),
             vertices: 3,
             expect: [255, 115, 12, 255],
@@ -636,10 +605,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "extrusion_dim",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillExtrusionShader,
             surface: Surface::Plane,
-            blocks: vec![&FILL_EXTRUSION_DRAWABLE_UBO, &FILL_EXTRUSION_PROPS_UBO],
-            attributes: &FILL_EXTRUSION_SHADER,
-            body: FILL_EXTRUSION_BODY,
             streams: vec![
                 shorts(&COVERING),
                 ushorts(&[0, 0, 0, 0, 0, 0]),
@@ -668,7 +635,6 @@ fn cases() -> Vec<Case> {
                     ],
                 ),
             ],
-            textures: &[],
             images: Vec::new(),
             vertices: 3,
             expect: [125, 125, 125, 255],
@@ -703,10 +669,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "raster",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::RasterShader,
             surface: Surface::Plane,
-            blocks: vec![&RASTER_DRAWABLE_UBO, &RASTER_EVALUATED_PROPS_UBO],
-            attributes: &RASTER_SHADER,
-            body: RASTER_BODY,
             streams: vec![shorts(&COVERING), shorts(&[819, 819, 819, 819, 819, 819])],
             uniforms: vec![
                 block(&RASTER_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
@@ -728,7 +692,6 @@ fn cases() -> Vec<Case> {
                     ],
                 ),
             ],
-            textures: &RASTER_SHADER_TEXTURES,
             images: vec![
                 // Every channel a different function of the texel, so no two are equal: with
                 // `r` and `g` alike, rotating one of the spin's three rows draws the same pixel
@@ -769,10 +732,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "raster_adjusted",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::RasterShader,
             surface: Surface::Plane,
-            blocks: vec![&RASTER_DRAWABLE_UBO, &RASTER_EVALUATED_PROPS_UBO],
-            attributes: &RASTER_SHADER,
-            body: RASTER_BODY,
             streams: vec![shorts(&COVERING), shorts(&[819, 819, 819, 819, 819, 819])],
             uniforms: vec![
                 block(&RASTER_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
@@ -792,7 +753,6 @@ fn cases() -> Vec<Case> {
                     ],
                 ),
             ],
-            textures: &RASTER_SHADER_TEXTURES,
             images: vec![
                 Image::new(4, |x, y| {
                     [
@@ -831,10 +791,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "heatmap_texture",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::HeatmapTextureShader,
             surface: Surface::Plane,
-            blocks: vec![&HEATMAP_TEXTURE_PROPS_UBO, &GLOBAL_PAINT_PARAMS_UBO],
-            attributes: &HEATMAP_TEXTURE_SHADER,
-            body: HEATMAP_TEXTURE_BODY,
             streams: vec![shorts(&UNIT)],
             uniforms: vec![
                 block(
@@ -847,7 +805,6 @@ fn cases() -> Vec<Case> {
                     &[("world_size", At::F(&[2.0, 2.0]))],
                 ),
             ],
-            textures: &HEATMAP_TEXTURE_SHADER_TEXTURES,
             images: vec![
                 // The density, in red, as the first pass writes it. Every texel distinct, so the
                 // pixel says which was read.
@@ -899,14 +856,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "color_relief",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::ColorReliefShader,
             surface: Surface::Plane,
-            blocks: vec![
-                &COLOR_RELIEF_DRAWABLE_UBO,
-                &COLOR_RELIEF_TILE_PROPS_UBO,
-                &COLOR_RELIEF_EVALUATED_PROPS_UBO,
-            ],
-            attributes: &COLOR_RELIEF_SHADER,
-            body: COLOR_RELIEF_BODY,
             streams: vec![
                 shorts(&COVERING),
                 shorts(&[2458, 2458, 2458, 2458, 2458, 2458]),
@@ -928,7 +879,6 @@ fn cases() -> Vec<Case> {
                     &[("opacity", At::F(&[0.5]))],
                 ),
             ],
-            textures: &COLOR_RELIEF_SHADER_TEXTURES,
             images: vec![
                 // The DEM. Red and green both carry signal, so the unpack's first two weights are
                 // both under test; blue is zero because its weight is.
@@ -980,18 +930,10 @@ fn cases() -> Vec<Case> {
         Case {
             name: "symbol_sdf",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::SymbolSDFShader,
             surface: Surface::Plane,
-            blocks: vec![
-                &SYMBOL_DRAWABLE_UBO,
-                &SYMBOL_TILE_PROPS_UBO,
-                &SYMBOL_EVALUATED_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &SYMBOL_SDFSHADER,
-            body: SYMBOL_SDF_BODY,
             streams: symbol_streams(5),
             uniforms: symbol_blocks(symbol_drawable()),
-            textures: &SYMBOL_SDFSHADER_TEXTURES,
             images: vec![glyph_atlas()],
             vertices: 3,
             expect: [200, 100, 50, 255],
@@ -1010,18 +952,10 @@ fn cases() -> Vec<Case> {
         Case {
             name: "symbol_below",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::SymbolSDFShader,
             surface: Surface::Plane,
-            blocks: vec![
-                &SYMBOL_DRAWABLE_UBO,
-                &SYMBOL_TILE_PROPS_UBO,
-                &SYMBOL_EVALUATED_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &SYMBOL_SDFSHADER,
-            body: SYMBOL_SDF_BODY,
             streams: symbol_streams(6),
             uniforms: symbol_blocks(symbol_drawable()),
-            textures: &SYMBOL_SDFSHADER_TEXTURES,
             images: vec![glyph_atlas()],
             vertices: 3,
             expect: [0, 0, 0, 0],
@@ -1045,13 +979,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "hillshade_prep",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::HillshadePrepareShader,
             surface: Surface::Plane,
-            blocks: vec![
-                &HILLSHADE_PREPARE_DRAWABLE_UBO,
-                &HILLSHADE_PREPARE_TILE_PROPS_UBO,
-            ],
-            attributes: &HILLSHADE_PREPARE_SHADER,
-            body: HILLSHADE_PREPARE_BODY,
             streams: vec![
                 shorts(&COVERING),
                 shorts(&[4096, 4096, 4096, 4096, 4096, 4096]),
@@ -1070,7 +999,6 @@ fn cases() -> Vec<Case> {
                     ],
                 ),
             ],
-            textures: &HILLSHADE_PREPARE_SHADER_TEXTURES,
             images: vec![Image::new(4, |x, y| {
                 [u8::try_from(x * 20 + y * 5).unwrap_or(255), 0, 0, 255]
             })],
@@ -1101,14 +1029,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "hillshade",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::HillshadeShader,
             surface: Surface::Plane,
-            blocks: vec![
-                &HILLSHADE_DRAWABLE_UBO,
-                &HILLSHADE_TILE_PROPS_UBO,
-                &HILLSHADE_EVALUATED_PROPS_UBO,
-            ],
-            attributes: &HILLSHADE_SHADER,
-            body: HILLSHADE_BODY,
             streams: vec![
                 shorts(&COVERING),
                 shorts(&[3072, 3072, 3072, 3072, 3072, 3072]),
@@ -1142,7 +1064,6 @@ fn cases() -> Vec<Case> {
                     ],
                 ),
             ],
-            textures: &HILLSHADE_SHADER_TEXTURES,
             images: vec![Image::new(4, |x, y| match (x, y) {
                 (1, 2) => [144, 128, 0, 255],
                 (1, 1) => [200, 200, 0, 255],
@@ -1194,10 +1115,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "heatmap",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::HeatmapShader,
             surface: Surface::Plane,
-            blocks: vec![&HEATMAP_DRAWABLE_UBO, &HEATMAP_EVALUATED_PROPS_UBO],
-            attributes: &HEATMAP_SHADER,
-            body: HEATMAP_BODY,
             streams: vec![
                 shorts(&CORNERED_QUAD_AT_ONE),
                 per_vertex(&[2.0, 2.0], 6),
@@ -1218,7 +1137,6 @@ fn cases() -> Vec<Case> {
                     &[("intensity", At::F(&[1.0]))],
                 ),
             ],
-            textures: &[],
             images: Vec::new(),
             vertices: 6,
             expect: [80, 255, 255, 255],
@@ -1265,14 +1183,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "background_pattern",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::BackgroundPatternShader,
             surface: Surface::Plane,
-            blocks: vec![
-                &BACKGROUND_PATTERN_DRAWABLE_UBO,
-                &BACKGROUND_PATTERN_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &BACKGROUND_PATTERN_SHADER,
-            body: BACKGROUND_PATTERN_BODY,
             streams: vec![shorts(&COVERING)],
             uniforms: vec![
                 block(
@@ -1304,7 +1216,6 @@ fn cases() -> Vec<Case> {
                     &[("pattern_atlas_texsize", At::F(&[16.0, 16.0]))],
                 ),
             ],
-            textures: &BACKGROUND_PATTERN_SHADER_TEXTURES,
             images: vec![Image::new(16, |x, y| {
                 [
                     u8::try_from(x * 16).unwrap_or(255),
@@ -1341,15 +1252,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill_pattern",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillPatternShader,
             surface: Surface::Plane,
-            blocks: vec![
-                &FILL_PATTERN_DRAWABLE_UBO,
-                &FILL_PATTERN_TILE_PROPS_UBO,
-                &FILL_EVALUATED_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &FILL_PATTERN_SHADER,
-            body: FILL_PATTERN_BODY,
             streams: vec![
                 shorts(&COVERING),
                 ushorts(&[0, 0, 8, 8, 0, 0, 8, 8, 0, 0, 8, 8]),
@@ -1383,7 +1287,6 @@ fn cases() -> Vec<Case> {
                 ),
                 block(&GLOBAL_PAINT_PARAMS_UBO, &[("pixel_ratio", At::F(&[2.0]))]),
             ],
-            textures: &FILL_PATTERN_SHADER_TEXTURES,
             images: vec![Image::new(16, |x, y| {
                 [
                     u8::try_from(x * 16).unwrap_or(255),
@@ -1438,15 +1341,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "line_pattern",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::LinePatternShader,
             surface: Surface::Plane,
-            blocks: vec![
-                &LINE_PATTERN_DRAWABLE_UBO,
-                &LINE_PATTERN_TILE_PROPS_UBO,
-                &LINE_EVALUATED_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &LINE_PATTERN_SHADER,
-            body: LINE_PATTERN_BODY,
             streams: vec![
                 // Two triangles: the centerline at -4 and +4, the normal bit low.
                 shorts(&[-8, 0, 8, 0, 8, 1, -8, 0, 8, 1, -8, 1]),
@@ -1501,7 +1397,6 @@ fn cases() -> Vec<Case> {
                     ],
                 ),
             ],
-            textures: &LINE_PATTERN_SHADER_TEXTURES,
             images: vec![Image::new(16, |x, y| {
                 [
                     u8::try_from(x * 16).unwrap_or(255),
@@ -1530,15 +1425,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "symbol_icon",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::SymbolIconShader,
             surface: Surface::Plane,
-            blocks: vec![
-                &SYMBOL_DRAWABLE_UBO,
-                &SYMBOL_TILE_PROPS_UBO,
-                &SYMBOL_EVALUATED_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &SYMBOL_ICON_SHADER,
-            body: SYMBOL_ICON_BODY,
             streams: vec![
                 shorts(&[0, 0, -1, -1, 0, 0, 3, -1, 0, 0, -1, 3]),
                 ushorts(&[5, 5, 0, 0, 5, 5, 0, 0, 5, 5, 0, 0]),
@@ -1548,7 +1436,6 @@ fn cases() -> Vec<Case> {
                 per_vertex(&[0.0, 0.5], 3),
             ],
             uniforms: symbol_blocks(symbol_drawable()),
-            textures: &SYMBOL_ICON_SHADER_TEXTURES,
             images: vec![sprite_sheet(16)],
             vertices: 3,
             expect: [40, 20, 64, 64],
@@ -1569,18 +1456,10 @@ fn cases() -> Vec<Case> {
         Case {
             name: "both_as_icon",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::SymbolTextAndIconShader,
             surface: Surface::Plane,
-            blocks: vec![
-                &SYMBOL_DRAWABLE_UBO,
-                &SYMBOL_TILE_PROPS_UBO,
-                &SYMBOL_EVALUATED_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &SYMBOL_TEXT_AND_ICON_SHADER,
-            body: SYMBOL_TEXT_AND_ICON_BODY,
             streams: text_and_icon_streams(5, 0),
             uniforms: symbol_blocks(symbol_drawable_sized(768.0, 32.0, 16.0)),
-            textures: &SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES,
             images: vec![
                 Image::red(32, 32, |x, y| if x == 5 && y == 5 { 255 } else { 0 }),
                 sprite_sheet(16),
@@ -1603,18 +1482,10 @@ fn cases() -> Vec<Case> {
         Case {
             name: "both_as_glyph",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::SymbolTextAndIconShader,
             surface: Surface::Plane,
-            blocks: vec![
-                &SYMBOL_DRAWABLE_UBO,
-                &SYMBOL_TILE_PROPS_UBO,
-                &SYMBOL_EVALUATED_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &SYMBOL_TEXT_AND_ICON_SHADER,
-            body: SYMBOL_TEXT_AND_ICON_BODY,
             streams: text_and_icon_streams(5, 1),
             uniforms: symbol_blocks(symbol_drawable_sized(768.0, 32.0, 16.0)),
-            textures: &SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES,
             images: vec![
                 Image::red(32, 32, |x, y| if x == 5 && y == 5 { 255 } else { 0 }),
                 sprite_sheet(16),
@@ -1663,10 +1534,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill_on_globe",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillShader,
             surface: Surface::Globe,
-            blocks: vec![&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
-            attributes: &FILL_SHADER,
-            body: FILL_BODY,
             streams: vec![
                 shorts(&COVERING),
                 per_vertex(&packed_color([0, 255, 255, 255]), 3),
@@ -1709,7 +1578,6 @@ fn cases() -> Vec<Case> {
                     )],
                 ),
             ],
-            textures: &[],
             images: Vec::new(),
             vertices: 3,
             expect: [0, 255, 255, 255],
@@ -1741,10 +1609,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill_anchored",
             at: (25, 22),
+            family: BuiltIn::FillShader,
             surface: Surface::GlobeAnchored,
-            blocks: vec![&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
-            attributes: &FILL_SHADER,
-            body: FILL_BODY,
             streams: vec![
                 // 4096 plus and minus 3072, which a `Short2` holds.
                 shorts(&[1024, 1024, 7168, 1024, 1024, 7168]),
@@ -1770,7 +1636,6 @@ fn cases() -> Vec<Case> {
                     ],
                 ),
             ],
-            textures: &[],
             images: Vec::new(),
             vertices: 3,
             expect: [255, 255, 0, 255],
@@ -1803,10 +1668,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill_raised",
             at: (8, 13),
+            family: BuiltIn::FillShader,
             surface: Surface::Terrain,
-            blocks: vec![&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
-            attributes: &FILL_SHADER,
-            body: FILL_BODY,
             streams: vec![
                 shorts(&COVERING),
                 per_vertex(&packed_color([255, 0, 255, 255]), 3),
@@ -1846,7 +1709,6 @@ fn cases() -> Vec<Case> {
                     ],
                 ),
             ],
-            textures: &[],
             images: vec![Image::new(4, |x, y| {
                 [
                     u8::try_from(x * 40).unwrap_or(255),
@@ -1867,14 +1729,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "circle",
             at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::CircleShader,
             surface: Surface::Plane,
-            blocks: vec![
-                &CIRCLE_DRAWABLE_UBO,
-                &CIRCLE_EVALUATED_PROPS_UBO,
-                &GLOBAL_PAINT_PARAMS_UBO,
-            ],
-            attributes: &CIRCLE_SHADER,
-            body: CIRCLE_BODY,
             streams: vec![
                 shorts(&CORNERED_QUAD),
                 per_vertex(&packed_color([0, 255, 0, 255]), 6),
@@ -1908,7 +1764,6 @@ fn cases() -> Vec<Case> {
                     ],
                 ),
             ],
-            textures: &[],
             images: Vec::new(),
             vertices: 6,
             expect: [0, 255, 0, 255],
@@ -2255,12 +2110,14 @@ impl Gpu {
 
     /// Draws one case and reads its pixel.
     fn run(&self, case: &Case) -> Result<[u8; 4], String> {
+        let family = family(case.family)
+            .ok_or_else(|| format!("{}: {:?} is not a drawn family", case.name, case.family))?;
         let source = module(
             case.surface,
-            &case.blocks,
-            case.attributes,
-            case.textures,
-            case.body,
+            family.blocks,
+            family.attributes,
+            family.textures,
+            family.body,
         )
         .map_err(|why| format!("{} does not assemble: {why:?}", case.name))?;
         let words = compile(&source).map_err(|why| format!("{}: {why}", case.name))?;
@@ -2406,7 +2263,10 @@ impl Gpu {
         let mut bindings = Vec::new();
         let mut attributes = Vec::new();
         let mut formats = Vec::new();
-        for attribute in case.attributes {
+        let table = family(case.family)
+            .ok_or_else(|| format!("{}: {:?} is not a drawn family", case.name, case.family))?
+            .attributes;
+        for attribute in table {
             let format = vertex_format(attribute.declared)
                 .ok_or_else(|| format!("{} has no vertex format", attribute.name))?;
             formats.push(format);

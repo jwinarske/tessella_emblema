@@ -48,6 +48,29 @@ use tessella_emblema::surface::{GLOBE_BEND_UBO, GLOBE_CAMERA_UBO, Surface, TERRA
 /// The target's edge, in pixels. Small: one pixel is read and the rest is margin.
 const SIDE: u32 = 32;
 
+/// How a case's vertex data is laid out in memory.
+///
+/// Both forms draw the same picture from the same numbers, which is what makes the interleaved
+/// case worth having: it is the layout the producer actually sends for the raster families, and
+/// until it was drawn here the oracle only ever bound one buffer per attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    /// One buffer per attribute, each at offset zero with its own width as the stride.
+    PerAttribute,
+    /// One buffer for every attribute, each at its own offset within a vertex of `stride`.
+    ///
+    /// What `encode_raster`, `encode_hillshade` and `encode_color_relief` send: the position at 0,
+    /// the texture coordinate at 4 and the skirt flag at 8, over a stride of 12. The offsets are
+    /// per declared attribute in table order; bytes no attribute names are skipped, which is how
+    /// the skirt's four travel without being bound.
+    Interleaved {
+        /// Bytes between consecutive vertices.
+        stride: u32,
+        /// Byte offset of each declared attribute within a vertex, in table order.
+        offsets: &'static [u32],
+    },
+}
+
 /// A family, the inputs that make one pixel predictable, and that pixel.
 struct Case {
     name: &'static str,
@@ -70,7 +93,9 @@ struct Case {
     /// ships, and a case carrying its own copy of a family's blocks, tables and body would
     /// verify the copy.
     family: BuiltIn,
-    /// One stream per attribute, in the table's order, holding every vertex.
+    /// How `streams` is laid out: one buffer per attribute, or one shared interleaved buffer.
+    layout: Layout,
+    /// One stream per attribute in the table's order, or one interleaved stream.
     streams: Vec<Vec<u8>>,
     /// One block per entry in the family's `blocks`, in the same order.
     uniforms: Vec<Vec<u8>>,
@@ -445,6 +470,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::FillShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
                 per_vertex(&packed_pair([255, 0, 0, 255], [0, 0, 255, 255]), 3),
@@ -473,6 +499,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::BackgroundShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: vec![shorts(&COVERING)],
             uniforms: vec![
                 block(&BACKGROUND_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
@@ -506,6 +533,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::FillOutlineShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
                 per_vertex(&packed_color([255, 255, 255, 255]), 3),
@@ -558,6 +586,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::FillExtrusionShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
                 ushorts(&[0, 0, 0, 0, 0, 0]),
@@ -607,6 +636,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::FillExtrusionShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
                 ushorts(&[0, 0, 0, 0, 0, 0]),
@@ -671,7 +701,69 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::RasterShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: vec![shorts(&COVERING), shorts(&[819, 819, 819, 819, 819, 819])],
+            uniforms: vec![
+                block(&RASTER_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
+                block(
+                    &RASTER_EVALUATED_PROPS_UBO,
+                    &[
+                        // `dot(rgb, spin.xyz)`, `dot(rgb, spin.zxy)`, `dot(rgb, spin.yzx)`, which
+                        // leaves every channel alone exactly when the weights are (1, 0, 0).
+                        ("spin_weights", At::F(&[1.0, 0.0, 0.0, 0.0])),
+                        ("buffer_scale", At::F(&[2.0])),
+                        ("scale_parent", At::F(&[1.0])),
+                        ("tl_parent", At::F(&[0.0, 0.0])),
+                        ("fade_t", At::F(&[0.0])),
+                        ("opacity", At::F(&[0.5])),
+                        ("brightness_low", At::F(&[0.0])),
+                        ("brightness_high", At::F(&[1.0])),
+                        ("saturation_factor", At::F(&[0.0])),
+                        ("contrast_factor", At::F(&[1.0])),
+                    ],
+                ),
+            ],
+            images: vec![
+                // Every channel a different function of the texel, so no two are equal: with
+                // `r` and `g` alike, rotating one of the spin's three rows draws the same pixel
+                // and that mutation survives.
+                Image::new(4, |x, y| {
+                    [
+                        u8::try_from(x * 64).unwrap_or(255),
+                        u8::try_from(y * 32).unwrap_or(255),
+                        128,
+                        128,
+                    ]
+                }),
+                // The parent tile, which `fade_t` of zero mixes none of. Bound because the shader
+                // declares it and a pipeline with an unbound sampler is undefined, not because
+                // anything reads it -- so it is painted differently, and a case that mixed the
+                // two would say so.
+                Image::new(4, |_, _| [255, 0, 255, 255]),
+            ],
+            vertices: 3,
+            expect: [32, 16, 64, 64],
+        },
+        // The same picture from the same numbers, in the layout the producer actually sends.
+        //
+        // `encode_raster` writes one interleaved buffer -- `RasterVertex` is a position, a texture
+        // coordinate and a skirt flag over a stride of 12 -- and gives each attribute its own
+        // offset into it. Every other case here binds one buffer per attribute at offset zero, so
+        // until this one that layout had never been drawn.
+        //
+        // It expects `raster`'s pixel exactly. A stride or an offset read wrong does not fail,
+        // it samples another vertex's bytes, and the two cases disagreeing is what says so. The
+        // skirt's four bytes are present and bound by nothing, which is how they travel.
+        Case {
+            name: "raster_interleaved",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::RasterShader,
+            surface: Surface::Plane,
+            layout: Layout::Interleaved {
+                stride: 12,
+                offsets: &[0, 4],
+            },
+            streams: vec![interleaved(&COVERING, 819)],
             uniforms: vec![
                 block(&RASTER_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
                 block(
@@ -734,6 +826,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::RasterShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: vec![shorts(&COVERING), shorts(&[819, 819, 819, 819, 819, 819])],
             uniforms: vec![
                 block(&RASTER_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
@@ -793,6 +886,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::HeatmapTextureShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: vec![shorts(&UNIT)],
             uniforms: vec![
                 block(
@@ -858,6 +952,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::ColorReliefShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
                 shorts(&[2458, 2458, 2458, 2458, 2458, 2458]),
@@ -932,6 +1027,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::SymbolSDFShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: symbol_streams(5),
             uniforms: symbol_blocks(symbol_drawable()),
             images: vec![glyph_atlas()],
@@ -954,6 +1050,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::SymbolSDFShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: symbol_streams(6),
             uniforms: symbol_blocks(symbol_drawable()),
             images: vec![glyph_atlas()],
@@ -981,6 +1078,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::HillshadePrepareShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
                 shorts(&[4096, 4096, 4096, 4096, 4096, 4096]),
@@ -1031,6 +1129,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::HillshadeShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
                 shorts(&[3072, 3072, 3072, 3072, 3072, 3072]),
@@ -1117,6 +1216,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::HeatmapShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&CORNERED_QUAD_AT_ONE),
                 per_vertex(&[2.0, 2.0], 6),
@@ -1185,6 +1285,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::BackgroundPatternShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: vec![shorts(&COVERING)],
             uniforms: vec![
                 block(
@@ -1254,6 +1355,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::FillPatternShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
                 ushorts(&[0, 0, 8, 8, 0, 0, 8, 8, 0, 0, 8, 8]),
@@ -1343,6 +1445,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::LinePatternShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: vec![
                 // Two triangles: the centerline at -4 and +4, the normal bit low.
                 shorts(&[-8, 0, 8, 0, 8, 1, -8, 0, 8, 1, -8, 1]),
@@ -1427,6 +1530,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::SymbolIconShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&[0, 0, -1, -1, 0, 0, 3, -1, 0, 0, -1, 3]),
                 ushorts(&[5, 5, 0, 0, 5, 5, 0, 0, 5, 5, 0, 0]),
@@ -1458,6 +1562,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::SymbolTextAndIconShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: text_and_icon_streams(5, 0),
             uniforms: symbol_blocks(symbol_drawable_sized(768.0, 32.0, 16.0)),
             images: vec![
@@ -1484,6 +1589,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::SymbolTextAndIconShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: text_and_icon_streams(5, 1),
             uniforms: symbol_blocks(symbol_drawable_sized(768.0, 32.0, 16.0)),
             images: vec![
@@ -1536,6 +1642,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::FillShader,
             surface: Surface::Globe,
+            layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
                 per_vertex(&packed_color([0, 255, 255, 255]), 3),
@@ -1611,6 +1718,7 @@ fn cases() -> Vec<Case> {
             at: (25, 22),
             family: BuiltIn::FillShader,
             surface: Surface::GlobeAnchored,
+            layout: Layout::PerAttribute,
             streams: vec![
                 // 4096 plus and minus 3072, which a `Short2` holds.
                 shorts(&[1024, 1024, 7168, 1024, 1024, 7168]),
@@ -1670,6 +1778,7 @@ fn cases() -> Vec<Case> {
             at: (8, 13),
             family: BuiltIn::FillShader,
             surface: Surface::Terrain,
+            layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
                 per_vertex(&packed_color([255, 0, 255, 255]), 3),
@@ -1731,6 +1840,7 @@ fn cases() -> Vec<Case> {
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::CircleShader,
             surface: Surface::Plane,
+            layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&CORNERED_QUAD),
                 per_vertex(&packed_color([0, 255, 0, 255]), 6),
@@ -1799,6 +1909,105 @@ fn per_vertex(values: &[f32], vertices: usize) -> Vec<u8> {
     (0..vertices)
         .flat_map(|_| values.iter().flat_map(|value| value.to_le_bytes()))
         .collect()
+}
+
+/// A case's vertex input state: its bindings, its attributes and the formats to check.
+type VertexInput = (
+    Vec<vk::VertexInputBindingDescription>,
+    Vec<vk::VertexInputAttributeDescription>,
+    Vec<vk::Format>,
+);
+
+/// The vertex input state for a case: one binding per declared attribute, with the stride and
+/// offset its layout gives.
+///
+/// Lifted out of `pipeline` because that function is at `clippy::too_many_lines` and this is the
+/// part of it that is about the ABI rather than about Vulkan plumbing.
+fn vertex_input(case: &Case) -> Result<VertexInput, String> {
+    let mut bindings = Vec::new();
+    let mut attributes = Vec::new();
+    let mut formats = Vec::new();
+    let table = family(case.family)
+        .ok_or_else(|| format!("{}: {:?} is not a drawn family", case.name, case.family))?
+        .attributes;
+    for attribute in table {
+        let format = vertex_format(attribute.declared)
+            .ok_or_else(|| format!("{} has no vertex format", attribute.name))?;
+        formats.push(format);
+        let slot = u32::try_from(attribute.binding)
+            .map_err(|_| format!("{} binds at {}", attribute.name, attribute.binding))?;
+        let (stride, offset) = strided(case, format, bindings.len(), table.len())?;
+        bindings.push(
+            vk::VertexInputBindingDescription::default()
+                .binding(slot)
+                .stride(stride)
+                .input_rate(vk::VertexInputRate::VERTEX),
+        );
+        attributes.push(
+            vk::VertexInputAttributeDescription::default()
+                .location(slot)
+                .binding(slot)
+                .format(format)
+                .offset(offset),
+        );
+    }
+
+    Ok((bindings, attributes, formats))
+}
+
+/// One attribute's stride and offset, from the case's layout.
+///
+/// `at` is its place in the family's table, which is also its place in an interleaved layout's
+/// offsets.
+fn strided(
+    case: &Case,
+    format: vk::Format,
+    at: usize,
+    declared: usize,
+) -> Result<(u32, u32), String> {
+    match case.layout {
+        Layout::PerAttribute => Ok((stride_of(format), 0)),
+        Layout::Interleaved { stride, offsets } => {
+            let offset = *offsets.get(at).ok_or_else(|| {
+                format!(
+                    "{}: interleaved layout gives {} offsets for {declared} attributes",
+                    case.name,
+                    offsets.len()
+                )
+            })?;
+            Ok((stride, offset))
+        }
+    }
+}
+
+/// The value in the skirt's four bytes, which nothing binds.
+///
+/// Not zero, and not a value that samples the same texel as the texture coordinate does. An
+/// attribute offset read four bytes late lands here, and with a zero the case could not tell:
+/// `819` and `0` both reach texel one of a four-texel image once the buffer scale is applied, so
+/// the two layouts would draw the same pixel and a wrong offset would pass. `6144` reaches texel
+/// two.
+const SKIRT_FILLER: u16 = 6144;
+
+/// One interleaved raster stream: a position, a texture coordinate and a skirt flag per vertex.
+///
+/// Laid out as `RasterVertex` is -- `[i16; 2]`, `[u16; 2]`, `u16` and a pad to twelve -- so the
+/// offsets a case names are the producer's own.
+fn interleaved(positions: &[i16], texture: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(positions.len() / 2 * 12);
+    // Stepped rather than chunked: `chunks_exact` with a constant draws a stable-only lint and
+    // its suggested `as_chunks` is newer than the pinned toolchain, so neither form passes both.
+    for at in (0..positions.len() - 1).step_by(2) {
+        out.extend(positions[at].to_le_bytes());
+        out.extend(positions[at + 1].to_le_bytes());
+        out.extend(texture.to_le_bytes());
+        out.extend(texture.to_le_bytes());
+        // The skirt flag and the pad that aligns the next vertex. Bound by nothing, and filled
+        // with something a misread offset would show.
+        out.extend(SKIRT_FILLER.to_le_bytes());
+        out.extend(SKIRT_FILLER.to_le_bytes());
+    }
+    out
 }
 
 /// A stream of sixteen-bit positions.
@@ -2214,7 +2423,9 @@ impl Gpu {
                     &[held.descriptors],
                     &[],
                 );
-                let streams = held.streams();
+                // One binding per declared attribute, which is what the pipeline was built with.
+                let bindings = family(case.family).map_or(0, |found| found.attributes.len());
+                let streams = held.bound(case, bindings);
                 let zeros = vec![0u64; streams.len()];
                 self.device
                     .cmd_bind_vertex_buffers(self.command, 0, &streams, &zeros);
@@ -2260,33 +2471,7 @@ impl Gpu {
         let vertex = self.shader(words)?;
         let fragment = self.shader(words)?;
 
-        let mut bindings = Vec::new();
-        let mut attributes = Vec::new();
-        let mut formats = Vec::new();
-        let table = family(case.family)
-            .ok_or_else(|| format!("{}: {:?} is not a drawn family", case.name, case.family))?
-            .attributes;
-        for attribute in table {
-            let format = vertex_format(attribute.declared)
-                .ok_or_else(|| format!("{} has no vertex format", attribute.name))?;
-            formats.push(format);
-            let slot = u32::try_from(attribute.binding)
-                .map_err(|_| format!("{} binds at {}", attribute.name, attribute.binding))?;
-            bindings.push(
-                vk::VertexInputBindingDescription::default()
-                    .binding(slot)
-                    .stride(stride_of(format))
-                    .input_rate(vk::VertexInputRate::VERTEX),
-            );
-            attributes.push(
-                vk::VertexInputAttributeDescription::default()
-                    .location(slot)
-                    .binding(slot)
-                    .format(format)
-                    .offset(0),
-            );
-        }
-
+        let (bindings, attributes, formats) = vertex_input(case)?;
         // A device that will not take one of these in a vertex buffer binds the attribute
         // anyway and the shader reads zero, so ask before building the pipeline rather than
         // reading the silence as a pixel. Per case, not once per device: a board missing one
@@ -2792,6 +2977,18 @@ impl<'a> Held<'a> {
 
     fn streams(&self) -> Vec<vk::Buffer> {
         self.buffers[..self.streams].to_vec()
+    }
+
+    /// The buffers to bind, one per binding.
+    ///
+    /// The interleaved form has one buffer and several bindings, so the same buffer is bound to
+    /// each: a binding's stride and a declared attribute's offset within it are pipeline state,
+    /// and only the buffer itself is bound here.
+    fn bound(&self, case: &Case, bindings: usize) -> Vec<vk::Buffer> {
+        match case.layout {
+            Layout::PerAttribute => self.streams(),
+            Layout::Interleaved { .. } => vec![self.buffers[0]; bindings],
+        }
     }
 }
 

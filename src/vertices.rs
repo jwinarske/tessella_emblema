@@ -41,6 +41,13 @@ pub struct Bound {
     pub vertex_offset: u32,
     /// Where the bytes are.
     pub source: SlabRef,
+    /// Whether the binding advances per vertex or per instance.
+    ///
+    /// Pipeline state, so two drawables that differ only here are two pipelines. It comes from
+    /// *which run* the descriptor arrived in rather than from anything in the descriptor: the ABI
+    /// splits a geometry's `attrs` from its `instance_attrs`, and an instanced family's wall
+    /// outline is in the second.
+    pub rate: vk::VertexInputRate,
 }
 
 /// What a drawable's descriptors came to.
@@ -118,61 +125,96 @@ pub enum Refused {
 /// [`Refused`], naming the attribute. The first disagreement rather than all of them: they are
 /// resolved one at a time and a list is no more actionable than its head.
 pub fn plan(table: &[ShaderAttribute], descs: &[AttributeDesc]) -> Result<Plan, Refused> {
+    planned(&[(table, descs, vk::VertexInputRate::VERTEX)])
+}
+
+/// As [`plan`], with the instanced run as well.
+///
+/// The two runs have their own tables — `attributes` and `instance_attributes` for the same
+/// shader — and their own slots, so they are planned together and the slots must still not
+/// collide. An instanced family declares its position in the first and its outline, packed
+/// decimals and data-driven attributes in the second.
+///
+/// # Errors
+///
+/// As [`plan`], and [`Refused::DuplicateSlot`] for a slot claimed by both runs.
+pub fn plan_instanced(
+    table: &[ShaderAttribute],
+    descs: &[AttributeDesc],
+    instance_table: &[ShaderAttribute],
+    instance_descs: &[AttributeDesc],
+) -> Result<Plan, Refused> {
+    planned(&[
+        (table, descs, vk::VertexInputRate::VERTEX),
+        (
+            instance_table,
+            instance_descs,
+            vk::VertexInputRate::INSTANCE,
+        ),
+    ])
+}
+
+fn planned(
+    runs: &[(&[ShaderAttribute], &[AttributeDesc], vk::VertexInputRate)],
+) -> Result<Plan, Refused> {
     let mut out = Plan::default();
-    let mut seen: Vec<i32> = Vec::with_capacity(descs.len());
+    let mut seen: Vec<i32> = Vec::new();
 
-    for desc in descs {
-        if desc.binding < 0 {
-            out.dropped.push(desc.attr_id);
-            continue;
-        }
-        if seen.contains(&desc.binding) {
-            return Err(Refused::DuplicateSlot { slot: desc.binding });
-        }
-        seen.push(desc.binding);
+    for (table, descs, rate) in runs {
+        for desc in *descs {
+            if desc.binding < 0 {
+                out.dropped.push(desc.attr_id);
+                continue;
+            }
+            if seen.contains(&desc.binding) {
+                return Err(Refused::DuplicateSlot { slot: desc.binding });
+            }
+            seen.push(desc.binding);
 
-        let Some(entry) = table.iter().find(|entry| entry.binding == desc.binding) else {
-            out.undeclared.push((desc.attr_id, desc.binding));
-            continue;
-        };
-        let Some(wire) = desc.declared_data_type() else {
-            return Err(Refused::BadDataType {
-                attr_id: desc.attr_id,
-                raw: desc.declared_data_type,
-            });
-        };
-        if wire != entry.declared {
-            return Err(Refused::DeclaredDisagrees {
-                attr_id: desc.attr_id,
-                wire,
-                table: entry.declared,
+            let Some(entry) = table.iter().find(|entry| entry.binding == desc.binding) else {
+                out.undeclared.push((desc.attr_id, desc.binding));
+                continue;
+            };
+            let Some(wire) = desc.declared_data_type() else {
+                return Err(Refused::BadDataType {
+                    attr_id: desc.attr_id,
+                    raw: desc.declared_data_type,
+                });
+            };
+            if wire != entry.declared {
+                return Err(Refused::DeclaredDisagrees {
+                    attr_id: desc.attr_id,
+                    wire,
+                    table: entry.declared,
+                });
+            }
+            let Some(format) = vertex_format(entry.declared) else {
+                return Err(Refused::NoFormat {
+                    attr_id: desc.attr_id,
+                    declared: entry.declared,
+                });
+            };
+            // The table's own binding, which generation keeps equal to the module's `@location`.
+            // Negative is unreachable -- `desc.binding` was checked non-negative and the two are
+            // equal -- so a table that said otherwise is reported rather than bound.
+            let Ok(slot) = u32::try_from(entry.binding) else {
+                out.undeclared.push((desc.attr_id, entry.binding));
+                continue;
+            };
+            out.bound.push(Bound {
+                slot,
+                format,
+                stride: desc.stride,
+                offset: desc.offset,
+                vertex_offset: desc.vertex_offset,
+                source: desc.source,
+                rate: *rate,
             });
         }
-        let Some(format) = vertex_format(entry.declared) else {
-            return Err(Refused::NoFormat {
-                attr_id: desc.attr_id,
-                declared: entry.declared,
-            });
-        };
-        // The table's own binding, which generation keeps equal to the module's `@location`.
-        // Negative is unreachable -- `desc.binding` was checked non-negative and the two are
-        // equal -- so a table that said otherwise is reported rather than bound.
-        let Ok(slot) = u32::try_from(entry.binding) else {
-            out.undeclared.push((desc.attr_id, entry.binding));
-            continue;
-        };
-        out.bound.push(Bound {
-            slot,
-            format,
-            stride: desc.stride,
-            offset: desc.offset,
-            vertex_offset: desc.vertex_offset,
-            source: desc.source,
-        });
     }
 
     out.bound.sort_unstable_by_key(|bound| bound.slot);
-    for entry in table {
+    for entry in runs.iter().flat_map(|(table, _, _)| table.iter()) {
         // `try_from` is also the `binding >= 0` check: a table entry cannot be bound at a
         // negative slot, and one that said so would be skipped rather than panicked over.
         if let Ok(slot) = u32::try_from(entry.binding)

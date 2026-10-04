@@ -13,13 +13,12 @@
 //! wrong pipeline — the same class of defect, found by nobody, at a rate nobody can reproduce. The
 //! key holds the slots instead and compares them. There are at most ten per family.
 //!
-//! # What is not in the key yet
+//! # The input rate is in the key
 //!
-//! The per-binding input rate. An instanced family binds some attributes per instance rather than
-//! per vertex, and that is pipeline state too. [`crate::vertices::plan`] reads a drawable's `attrs`
-//! and not its `instance_attrs`, so no instanced family reaches here at all; adding them is what
-//! adds the rate. Noted rather than guessed, because a rate field that nothing sets is a field that
-//! is wrong the first time something does.
+//! An instanced family binds its wall outline per instance and its position per vertex, and that
+//! is pipeline state: two drawables differing only in a binding's rate are two pipelines.
+//! [`crate::vertices::plan_instanced`] sets it from which run a descriptor arrived in, so the
+//! field has a source rather than being a placeholder.
 
 use ash::vk;
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
@@ -42,6 +41,8 @@ pub struct Slot {
     pub offset: u32,
     /// Bytes between consecutive vertices.
     pub stride: u32,
+    /// Whether the binding advances per vertex or per instance.
+    pub rate: vk::VertexInputRate,
 }
 
 /// What a pipeline is cached by.
@@ -77,6 +78,7 @@ pub fn key(shader: BuiltIn, surface: Surface, permutation: u64, plan: &Plan) -> 
                 format: bound.format,
                 offset: bound.offset,
                 stride: bound.stride,
+                rate: bound.rate,
             })
             .collect(),
     }

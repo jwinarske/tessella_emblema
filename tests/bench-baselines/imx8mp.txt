@@ -201,6 +201,57 @@
 # The claimed third trigger, `background_pattern` segfaulting on a single `Short2`, is
 # withdrawn: it builds.
 #
+# # Float vertex attributes read zero
+#
+# Not a capability gap, not an offset or stride error, and not a varying artifact. One
+# measurement rules out each.
+#
+# `vkGetPhysicalDeviceFormatProperties` on the board, for every format the ABI's declared
+# types map to -- all ten report `VERTEX_BUFFER`:
+#
+#   Short2 -> R16G16_SINT          Float2 -> R32G32_SFLOAT
+#   Short4 -> R16G16B16A16_SINT    Float3 -> R32G32B32_SFLOAT
+#   UShort2 -> R16G16_UINT         Float4 -> R32G32B32A32_SFLOAT
+#   UShort4 -> R16G16B16A16_UINT   Float -> R32_SFLOAT
+#   UByte4 -> R8G8B8A8_UINT        Int -> R32_SINT
+#
+# So the driver claims the format and then returns nothing. The probe never calls
+# `device::check_vertex_formats`, which is its own gap, but it would not have caught this.
+#
+# Next, offset and stride. A rung whose every float in the stream is the same value, so any
+# wrong offset or stride *inside* the buffer still reads it:
+#
+#   vec4<f32>(in.heatmap_weight.x, in.heatmap_weight.y, 0.2, 0.6), stream all 0.75
+#
+#   RADV       [191, 191, 51, 153]
+#   GC7000UL   [  0,   0, 51, 153]
+#
+# Both constants land and both attribute components are zero, so the fetch did not happen.
+#
+# Last, the stage. A rung where the attribute decides geometry rather than travelling
+# through a varying -- at 0.75 the triangle leaves the viewport, so the sampled pixel is
+# the clear:
+#
+#   if in.heatmap_weight.x > 0.5 { p = p + 10000.0; }
+#
+#   RADV       pass, the pixel is the clear and the triangle moved
+#   GC7000UL   [255, 255, 255, 255], the triangle stayed
+#
+# The comparison was false, so the attribute was zero before any interpolation. Nothing in
+# the fragment stage is involved. The `Short2` position in the same module arrives -- the
+# geometry is placed correctly, which is why there is a pixel to read. Integer vertex
+# attributes fetch and float ones do not.
+#
+# This is what most of the wrong pixels are. Five of the eight families that build and draw
+# wrong read a `Float2` or `Float4`: `background_pattern`, `heatmap`, `line_pattern`,
+# `fill_pattern`, `symbol_icon`. It does not cover `color_relief`, `hillshade` or
+# `hillshade_prep`, which declare only `Short2` and still draw wrong; those are separate and
+# uninvestigated.
+#
+# It does not explain #326's six regressions either. Those went from drawing to
+# *segfaulting*, and the three rungs above all build -- a direct scalar load from a vertex
+# attribute into a composite compiles, where the same shape from a storage buffer does not.
+#
 # # tessella#327 costs nothing here
 #
 # Rebuilding `color_relief` with the texture coordinate omitted from the vertex input and

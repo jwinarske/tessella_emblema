@@ -112,7 +112,7 @@ fn a_slot_the_table_does_not_declare_is_reported() {
         COLOR_RELIEF_SHADER.len(),
         "the declared attributes still bind"
     );
-    assert!(got.absent.is_empty());
+    assert_eq!(got.absent, [] as [u32; 0]);
 }
 
 /// The whole of raster's run plans, which is the family the refusal would have broken.

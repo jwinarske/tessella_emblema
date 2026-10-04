@@ -75,7 +75,9 @@
 //! attribute descriptors come to once they are checked against the family's own table. [`draws`]
 //! is the other end of the same drawable: its segments as the indexed draw parameters they
 //! become, including the slot that travels as `firstInstance` because the bodies read it as
-//! `ubo_index`.
+//! `ubo_index`. [`buffers`] is what those two come to on the device -- the distinct slab
+//! references behind a plan's bindings, which is fewer than the bindings whenever the producer
+//! interleaved a vertex.
 //!
 //! Nothing here reads the stream yet, and nothing in this crate touches a GPU —
 //! `#![forbid(unsafe_code)]` is still at the top of this file, so the only `ash` calls are in the
@@ -85,6 +87,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod buffers;
 pub mod device;
 pub mod draws;
 pub mod families;

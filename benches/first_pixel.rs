@@ -1525,7 +1525,8 @@ fn cases() -> Vec<Case> {
         // Two of this family's own decisions are *not* reachable from this pixel, and both were
         // real fixes: the minimum font scale in the spare half of the pixel offset, and that same
         // offset's division by 16. Each moves the quad rather than the coordinate it samples, so
-        // a center pixel inside the quad reads the same texel either way. #15 pins both textually.
+        // a center pixel inside the quad reads the same texel either way. Both stay pinned by
+        // `the_symbol_icon_keeps_its_placement_decisions`.
         Case {
             name: "symbol_icon",
             at: (SIDE / 2, SIDE / 2),

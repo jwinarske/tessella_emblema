@@ -115,12 +115,35 @@
 # the `mix`, and it is not the unpacking: the bare component read fails too. A `Short2`
 # attribute is fine -- `background` reads one, and so does the passing form of `fill`.
 #
-# # And at least one more, not yet bisected
+# # A second trigger, bisected down to a minimal module
 #
-# `raster` declares two `Short2` attributes and no float ones, and still segfaults. So
-# there is a second trigger in the bodies that `background` and `heatmap_texture` avoid.
-# Both of those are the two simplest bodies in the crate, which is consistent with almost
-# anything; the next step is to bisect `raster` the same way `fill` was.
+# `raster` declares two `Short2` attributes and no float ones, and still segfaults. Six
+# runs on the board reduced it, each removing one thing and re-testing:
+#
+#   raster, fragment returning a constant                            segfault
+#   raster, the uv varying replaced by a constant                    segfault
+#   raster, body replaced by the background's shape                  segfault
+#   the same, with the texture table emptied                         segfault
+#   the same, with only the drawable block declared                  segfault
+#   the same, with both attributes read rather than one              segfault
+#
+# What is left is about as small as a vertex shader gets: one storage block holding one
+# matrix, a body that places the position and nothing else, a fragment returning a
+# constant -- and **two** `Short2` vertex attributes. `background` is the same module with
+# **one** attribute and it builds. So the second attribute alone is enough.
+#
+# That eliminates, by measurement rather than by argument: the bodies' arithmetic, the
+# textures and their samplers, the second uniform block, the number of attributes a module
+# *declares* (`fill` builds with three declared and one read), and whether the extra
+# attribute is read at all.
+#
+# # And a third, still open
+#
+# `background_pattern` declares a single `Short2` attribute -- the same one `background`
+# does -- and segfaults. So neither trigger above explains it, and something in the
+# prelude's `pattern_pos` or `wrap` is a third. Not pursued further: six cycles of
+# cross-build, push and run bought the two rules above, and the third wants a smaller
+# harness than this probe.
 #
 # # What this does not say
 #

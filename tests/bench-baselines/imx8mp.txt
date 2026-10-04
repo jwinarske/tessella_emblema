@@ -85,81 +85,104 @@
 # is the board where moving the raise off the vertex stage would actually pay.
 
 # ---------------------------------------------------------------------------
-# `first_pixel` on the same board, 2026-10-03: 2 of 24 cases build.
+# `first_pixel` on the same board, re-measured 2026-10-04 per case.
 #
-# The readback oracle was taken to both boards. On the sa8155p's Adreno 640 all 24 cases
-# pass and every pixel is bit-identical to RADV and to lavapipe. Here, the driver's SPIR-V
-# front end segfaults for 22 of them, in the same place the matrix defect was found:
+# Counts depend on which tessella ABI the crate was built against, so both are recorded.
+# emblema at 69cb797 both times, weston and weston.socket stopped, board idle.
+#
+#                                        pass  drew  segfault
+#   tessella ac4dc38, before #326           1    15         8
+#   tessella 66e77ad, after #326            2     8        14
+#
+# `drew` is a module that built and produced a pixel, right or wrong. The earlier figure
+# in this file -- 2 of 24 build, 22 segfault -- does not reproduce against either ABI and
+# described some other build; the board is deterministic, two full enumerations of the
+# same binary agreeing character for character.
+#
+#   case              before #326   after #326
+#   background              drew          pass
+#   background_pattern      drew          drew
+#   both_as_glyph           drew      segfault
+#   both_as_icon            drew      segfault
+#   circle              segfault      segfault
+#   color_relief            drew          drew
+#   extrusion_dim           drew      segfault
+#   fill                segfault      segfault
+#   fill_anchored       segfault      segfault
+#   fill_extrusion          drew      segfault
+#   fill_on_globe       segfault      segfault
+#   fill_outline        segfault      segfault
+#   fill_pattern            drew          drew
+#   fill_raised         segfault      segfault
+#   heatmap                 drew          drew
+#   heatmap_texture         pass          pass
+#   hillshade               drew          drew
+#   hillshade_prep          drew          drew
+#   line_pattern            drew          drew
+#   raster              segfault      segfault
+#   raster_adjusted     segfault      segfault
+#   symbol_below            drew      segfault
+#   symbol_icon             drew          drew
+#   symbol_sdf              drew      segfault
+#
+# Enumerate per case with `TSL_ONLY`. A full run dies at the first segfault and loses
+# every buffered line before it, so it reports nothing and undercounts everything.
+#
+# # #326 fixed one pixel and cost six modules
+#
+# `background` went from a wrong pixel to correct, and six families went from drawing to
+# segfaulting. That change rewrote declared types from the shader text instead of
+# `AttributeInfo`, which turned many `Float` declarations into `Float2`. Reading a `Float2`
+# attribute is the trigger bisected below, so the correction is right about mbgl and
+# expensive here. Filed on tessella.
+#
+# # The crash
 #
 #   #0  libVSC.so
 #   #1  VIR_Shader_CompositeConstruct   libVSC.so
 #   #2..4  gcSPV_Decode                 libSPIRV_viv.so
 #   #5..7  libvulkan_VSI.so.1           (pipeline creation)
 #
-# `background` and `heatmap_texture` build and draw correctly. Everything else dies before
-# its first draw, so the crash is in shader compilation and not in the clear, the readback
-# or the linear attachment -- `background` exercises all three and passes.
+# It is in shader compilation, not in the clear, the readback or the linear attachment:
+# `background` exercises all three and passes.
 #
-# # One trigger, bisected on the board
+# # Two bisections, and what they do not prove
 #
-# `TSL_ONLY` runs a single case, which is what makes this findable: the probe prints a
-# case's name only after it has drawn, so a crash names the case and nothing inside it.
-# Against `fill`:
+# Against `fill`, before #326:
 #
 #   both attribute reads replaced by constants                        builds
 #   the `Float4` read kept (`mix_color(in.fill_color, ...)`)           segfault
 #   the `Float2` read kept (`in.fill_opacity.y`, no mix at all)        segfault
 #   neither read, `mix(0.0, 1.0, drawable.opacity_t)` instead         builds
 #
-# So **reading a `Float2` or `Float4` vertex attribute is enough on its own**. It is not
-# the `mix`, and it is not the unpacking: the bare component read fails too. A `Short2`
-# attribute is fine -- `background` reads one, and so does the passing form of `fill`.
+# And `raster` reduced over six runs to one storage block holding one matrix, a body that
+# places the position, a fragment returning a constant and two `Short2` attributes --
+# still segfaulting, where `background` is the same module with one attribute and builds.
 #
-# # A second trigger, bisected down to a minimal module
+# Both reductions stand as measurements. Neither rule generalizes:
 #
-# `raster` declares two `Short2` attributes and no float ones, and still segfaults. Six
-# runs on the board reduced it, each removing one thing and re-testing:
+#   - two `Short2` attributes is not sufficient. `color_relief` and `hillshade` declare
+#     exactly that and build; `heatmap_texture` declares three and passes.
+#   - reading a `Float2` or `Float4` is not sufficient either. `background_pattern`,
+#     `heatmap`, `line_pattern`, `fill_pattern` and `symbol_icon` all read them and build.
 #
-#   raster, fragment returning a constant                            segfault
-#   raster, the uv varying replaced by a constant                    segfault
-#   raster, body replaced by the background's shape                  segfault
-#   the same, with the texture table emptied                         segfault
-#   the same, with only the drawable block declared                  segfault
-#   the same, with both attributes read rather than one              segfault
+# So `raster` segfaults and `color_relief` builds on identical attribute tables, and the
+# discriminator is somewhere else. The earlier claim of a third trigger -- that
+# `background_pattern` segfaults with a single `Short2` -- is withdrawn: it builds.
 #
-# What is left is about as small as a vertex shader gets: one storage block holding one
-# matrix, a body that places the position and nothing else, a fragment returning a
-# constant -- and **two** `Short2` vertex attributes. `background` is the same module with
-# **one** attribute and it builds. So the second attribute alone is enough.
+# # tessella#327 costs nothing here
 #
-# That eliminates, by measurement rather than by argument: the bodies' arithmetic, the
-# textures and their samplers, the second uniform block, the number of attributes a module
-# *declares* (`fill` builds with three declared and one read), and whether the extra
-# attribute is read at all.
+# Rebuilding `color_relief` with the texture coordinate omitted from the vertex input and
+# derived from the position, as mbgl's Vulkan shader does, changes neither the build nor
+# the pixel: `[128, 128, 128, 128]` against `[10, 90, 55, 128]` either way. The family
+# already compiles on this driver. The earlier note here that the over-declaration decides
+# whether it compiles was wrong.
 #
-# # And a third, still open
-#
-# `background_pattern` declares a single `Short2` attribute -- the same one `background`
-# does -- and segfaults. So neither trigger above explains it, and something in the
-# prelude's `pattern_pos` or `wrap` is a third. Not pursued further: six cycles of
-# cross-build, push and run bought the two rules above, and the third wants a smaller
-# harness than this probe.
+# Its wrong pixel is a separate defect. `[128, 128, 128, 128]` is ramp texel 0, white, at
+# the case's half opacity, which is what an elevation at or below the first stop selects --
+# so the DEM sample reads as zero here and as texel (1, 1) on RADV from the same binary.
 #
 # # What this does not say
 #
 # That the shaders are wrong. The same modules draw 24 for 24 on Adreno and on two desktop
-# drivers, bit-identical, and the pixels are derived from mbgl's own arithmetic. This is a
-# vendor compiler that cannot compile them, which is the third such defect this board and
-# the sa8155p have produced between them -- after Adreno's assertion on a `mat4x4` in a
-# storage buffer and Vivante's own on constructing one from columns.
-#
-# # tessella#327 costs one of the twenty-two
-#
-# `COLOR_RELIEF_SHADER` declares two `Short2` attributes; mbgl's Vulkan shader declares one
-# and derives the coordinate from the position. That is the second trigger above.
-#
-# Rebuilt as mbgl declares it, `color_relief` compiles and draws here. The case reported a
-# wrong pixel from hacked geometry, not a failed module.
-#
-# So the over-declaration decides whether this family compiles on this driver. Noted on the
-# issue.
+# drivers, bit-identical, and the pixels are derived from mbgl's own arithmetic.

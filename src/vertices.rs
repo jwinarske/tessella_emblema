@@ -59,6 +59,21 @@ pub struct Plan {
     /// module reads a uniform instead and the location goes unbound. Reported rather than
     /// resolved, because which permutation is in force is not this module's to decide.
     pub absent: Vec<u32>,
+    /// Descriptors at a positive slot the family's table does not declare, as `(attr_id, slot)`.
+    ///
+    /// The terrain skirt flag is the case that exists: `encode_color_relief` and `encode_raster`
+    /// each send a third descriptor and their tables declare two.
+    ///
+    /// Reported rather than refused, because the two consumers disagree on purpose and both are
+    /// right. `tessella_fluorite` assigns slots in wire order, so the flag arrives as `custom1`
+    /// and its material drops a curtain with it. This crate has no per-layer skirt by design —
+    /// `TERRAIN_PLACEMENT` says only the ground has one, a layer standing on the ground being a
+    /// surface on a surface — so no module here will ever declare that attribute, and refusing it
+    /// would make raster and color relief permanently undrawable.
+    ///
+    /// So it is the caller's to drop, knowingly. What the ABI should say about an attribute that
+    /// is tessella's rather than mbgl's is tessella#331.
+    pub undeclared: Vec<(u32, i32)>,
 }
 
 /// Why a drawable's descriptors cannot be bound.
@@ -89,19 +104,6 @@ pub enum Refused {
         /// The type that has no mapping.
         declared: AttributeDataType,
     },
-    /// A descriptor bound at a slot the family's table does not declare.
-    ///
-    /// Distinct from a `-1` binding, which the ABI defines. This is a positive slot the table has
-    /// no entry for, so there is no declared type to bind it with and no `@location` to receive
-    /// it. Refused rather than dropped: a dropped attribute the producer meant to send draws a
-    /// wrong picture, and the terrain curtain's skirt flag is exactly that case —
-    /// `encode_color_relief` sends a third descriptor and `COLOR_RELIEF_SHADER` declares two.
-    UndeclaredSlot {
-        /// The attribute's id.
-        attr_id: u32,
-        /// The slot it asked for.
-        slot: i32,
-    },
     /// Two descriptors for the same slot.
     DuplicateSlot {
         /// The slot named twice.
@@ -130,10 +132,8 @@ pub fn plan(table: &[ShaderAttribute], descs: &[AttributeDesc]) -> Result<Plan, 
         seen.push(desc.binding);
 
         let Some(entry) = table.iter().find(|entry| entry.binding == desc.binding) else {
-            return Err(Refused::UndeclaredSlot {
-                attr_id: desc.attr_id,
-                slot: desc.binding,
-            });
+            out.undeclared.push((desc.attr_id, desc.binding));
+            continue;
         };
         let Some(wire) = desc.declared_data_type() else {
             return Err(Refused::BadDataType {
@@ -154,13 +154,13 @@ pub fn plan(table: &[ShaderAttribute], descs: &[AttributeDesc]) -> Result<Plan, 
                 declared: entry.declared,
             });
         };
-        // The slot is the table's own `binding`, which generation keeps equal to the `@location`
-        // the module declares. Taken from the entry rather than the descriptor so the two cannot
-        // drift: they were compared above, and this is the one the module will read.
-        let slot = u32::try_from(entry.binding).map_err(|_| Refused::UndeclaredSlot {
-            attr_id: desc.attr_id,
-            slot: entry.binding,
-        })?;
+        // The table's own binding, which generation keeps equal to the module's `@location`.
+        // Negative is unreachable -- `desc.binding` was checked non-negative and the two are
+        // equal -- so a table that said otherwise is reported rather than bound.
+        let Ok(slot) = u32::try_from(entry.binding) else {
+            out.undeclared.push((desc.attr_id, entry.binding));
+            continue;
+        };
         out.bound.push(Bound {
             slot,
             format,

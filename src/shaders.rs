@@ -845,6 +845,20 @@ fn vertex_main(in: In) -> Out {
     // so the interior spans `1/stride` to `(dim + 1)/stride`.
     let epsilon = 1.0 / tile.dimension;
     let scale = (tile.dimension.x - 2.0) / tile.dimension.x;
+    // From the texture attribute, where mbgl's Vulkan shader derives this from `in_position` and
+    // declares no input at location 1 at all. A deliberate departure, not an unfinished port.
+    //
+    // The two agree against this producer -- `RasterBucket::add_quad_on` fills position and
+    // texture from one `x` and `y` on every path -- so the choice is free of consequence for
+    // what is drawn, and the attribute is the honest source because it is what the producer
+    // sends for this coordinate.
+    //
+    // Reading the position instead was tried and rejected. It would not clear the i.MX8M Plus
+    // shader-compiler crash it was proposed for: color relief already builds there, and a probe
+    // with the attribute neither declared nor read drew the same wrong pixel, so the attribute
+    // was never the trigger. And it would cost the oracle its case -- `COVERING` is in clip
+    // units, so a position-derived coordinate over it collapses to a 1.2e-4 window on a texel
+    // boundary, which two drivers landed on opposite sides of. See the closed issue #44.
     out.uv = (vec2<f32>(in.color_relief_texture_pos) / 8192.0) * scale + epsilon;
 
     // A tile covering a pole carries a sentinel `y` at the end of the signed range rather than a

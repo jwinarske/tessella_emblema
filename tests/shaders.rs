@@ -1230,6 +1230,69 @@ fn each_surface_displaces_its_own_way() {
     }
 }
 
+/// Each surface hangs its own curtain, and three of the four hang none.
+///
+/// CI has no GPU, so `benches/first_pixel.rs::raster_raised_skirt` -- which draws the thing and is
+/// what caught every mutation of it -- cannot run there. This is the part a text can hold: that the
+/// terrain's curtain is the producer's `skirt.z` subtracted from the height, and that no other
+/// surface moves a vertex for a flag at all.
+///
+/// A plane's tiles are coplanar and a sphere's meet on the sphere, so there is no crack to cover
+/// off the terrain. Were one of those to start returning a depth, a flagged raster vertex would
+/// sink into a map with no relief -- which is the defect tessella's `terrain_flat_p` row measured
+/// from the other side: an unconditional curtain moved it from 0 to 547 gross pixels.
+#[test]
+fn each_surface_hangs_its_own_curtain() {
+    for surface in Surface::ALL {
+        let placement = surface.placement();
+        assert!(
+            placement.contains("fn curtain(flag: f32) -> f32 {"),
+            "{} has no curtain at all, so a raster body calling one will not assemble",
+            surface.suffix()
+        );
+        match surface {
+            Surface::Terrain => assert!(
+                placement.contains("return -flag * terrain_drawable_ubo[ubo_index].skirt.z;"),
+                "the terrain does not hang the producer's own curtain depth, negated"
+            ),
+            Surface::Plane | Surface::Globe | Surface::GlobeAnchored => assert!(
+                placement.contains("fn curtain(flag: f32) -> f32 {\n    return 0.0;\n}"),
+                "{} hangs a curtain over a surface with no crack in it",
+                surface.suffix()
+            ),
+        }
+    }
+}
+
+/// And only the families the producer sends a flag for read one.
+///
+/// Three of them, which is the set `PRODUCER_ATTRIBUTES` declares in tessella's generated tables:
+/// raster, hillshade and color relief. `hillshade_prepare` shares their attribute *names* and is
+/// not one of them -- it renders a slope field into a texture, the producer never emits it, and its
+/// table has no skirt row to bind.
+#[test]
+fn only_the_flagged_families_read_a_curtain() {
+    for family in ALL {
+        let reads = family.body.contains("curtain(");
+        let declares = family
+            .attributes
+            .iter()
+            .any(|attribute| attribute.name == "tessellaSkirtVertexAttribute");
+        assert_eq!(
+            reads,
+            declares,
+            "{} {} a curtain and {} the skirt attribute",
+            family.name,
+            if reads { "reads" } else { "does not read" },
+            if declares {
+                "declares"
+            } else {
+                "does not declare"
+            }
+        );
+    }
+}
+
 /// Components a family declares and correctly does not read, as `(family, attribute, components)`.
 ///
 /// Each one is checked against the shader mbgl generates for that family, not reasoned about: an
@@ -1247,6 +1310,13 @@ const UNREAD_COMPONENTS: &[(&str, &str, &str)] = &[
     // shader reads `.xy` and `.z` and stops; the GL one computes a `v_linesofar` its own fragment
     // stage then ignores.
     ("line", "line_data", "w"),
+    // `tessella_skirt.y` is two bytes of padding the producer writes as zero. The flag is one
+    // `i16` and the pair is declared `Short2` because Filament draws nothing at all from a single
+    // short -- the same reason `encode_terrain` puts the ground's flag beside its position. See
+    // `alloc_raster`, which writes `0u16` there in as many words.
+    ("raster", "tessella_skirt", "y"),
+    ("hillshade", "tessella_skirt", "y"),
+    ("color_relief", "tessella_skirt", "y"),
 ];
 
 /// Every component of every attribute is read, not just the identifier.

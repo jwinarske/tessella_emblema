@@ -768,7 +768,10 @@ fn vertex_main(in: In) -> Out {
     let parent = own * props.scale_parent + props.tl_parent;
     out.uv = vec4<f32>(own, parent);
 
-    out.clip = place(vec3<f32>(vec2<f32>(in.raster_pos), 0.0), drawable.matrix);
+    // The curtain, over the crack between two tiles of raised ground. Zero on every surface
+    // but the terrain, and zero there for an unraised one -- see `curtain`.
+    let drop = curtain(f32(in.tessella_skirt.x));
+    out.clip = place(vec3<f32>(vec2<f32>(in.raster_pos), drop), drawable.matrix);
     return out;
 }
 
@@ -870,7 +873,9 @@ fn vertex_main(in: In) -> Out {
         out.uv.y = 1.0;
     }
 
-    out.clip = place(vec3<f32>(vec2<f32>(in.color_relief_pos), 0.0), drawable.matrix);
+    // The curtain, as the raster has one.
+    let drop = curtain(f32(in.tessella_skirt.x));
+    out.clip = place(vec3<f32>(vec2<f32>(in.color_relief_pos), drop), drawable.matrix);
     return out;
 }
 
@@ -1561,7 +1566,9 @@ fn vertex_main(in: In) -> Out {
     let drawable = hillshade_drawable_ubo[ubo_index];
     var out: Out;
 
-    out.clip = place(vec3<f32>(vec2<f32>(in.hillshade_pos), 0.0), drawable.matrix);
+    // The curtain, as the raster has one: this is the same quad over the same raised ground.
+    let drop = curtain(f32(in.tessella_skirt.x));
+    out.clip = place(vec3<f32>(vec2<f32>(in.hillshade_pos), drop), drawable.matrix);
     // Flipped, because the slope field was rendered into a texture whose rows run the other way.
     let uv = vec2<f32>(in.hillshade_texture_pos) / 8192.0;
     out.uv = vec2<f32>(uv.x, 1.0 - uv.y);

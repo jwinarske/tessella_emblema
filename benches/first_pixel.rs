@@ -262,6 +262,15 @@ const CLIP: [f32; 16] = [
     0.0, 0.0, 0.0, 1.0,
 ];
 
+/// Three unflagged vertices' skirt attribute, as `Short2` pairs.
+///
+/// Every raster-family case on a plane carries this: the producer sends the flag for every bucket
+/// of those families and the table declares it, so the pipeline has an input for it whether the
+/// surface hangs anything from it or not. Zero because an unraised tile has no crack to cover --
+/// `curtain` on a plane returns nought regardless, which is what `raster_raised_skirt` and these
+/// cases together say.
+const FLAT_SKIRT: [u8; 12] = [0; 12];
+
 /// A triangle covering the viewport, in tile units that the identity makes clip units.
 const COVERING: [i16; 6] = [-1, -1, 3, -1, -1, 3];
 
@@ -723,7 +732,11 @@ fn cases() -> Vec<Case> {
             family: BuiltIn::RasterShader,
             surface: Surface::Plane,
             layout: Layout::PerAttribute,
-            streams: vec![shorts(&COVERING), shorts(&[819, 819, 819, 819, 819, 819])],
+            streams: vec![
+                shorts(&COVERING),
+                shorts(&[819, 819, 819, 819, 819, 819]),
+                FLAT_SKIRT.to_vec(),
+            ],
             uniforms: vec![
                 block(&RASTER_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
                 block(
@@ -782,7 +795,7 @@ fn cases() -> Vec<Case> {
             surface: Surface::Plane,
             layout: Layout::Interleaved {
                 stride: 12,
-                offsets: &[0, 4],
+                offsets: &[0, 4, 8],
             },
             streams: vec![interleaved(&COVERING, 819)],
             uniforms: vec![
@@ -848,7 +861,11 @@ fn cases() -> Vec<Case> {
             family: BuiltIn::RasterShader,
             surface: Surface::Plane,
             layout: Layout::PerAttribute,
-            streams: vec![shorts(&COVERING), shorts(&[819, 819, 819, 819, 819, 819])],
+            streams: vec![
+                shorts(&COVERING),
+                shorts(&[819, 819, 819, 819, 819, 819]),
+                FLAT_SKIRT.to_vec(),
+            ],
             uniforms: vec![
                 block(&RASTER_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
                 block(
@@ -977,6 +994,7 @@ fn cases() -> Vec<Case> {
             streams: vec![
                 shorts(&COVERING),
                 shorts(&[2458, 2458, 2458, 2458, 2458, 2458]),
+                FLAT_SKIRT.to_vec(),
             ],
             uniforms: vec![
                 block(&COLOR_RELIEF_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
@@ -1154,6 +1172,7 @@ fn cases() -> Vec<Case> {
             streams: vec![
                 shorts(&COVERING),
                 shorts(&[3072, 3072, 3072, 3072, 3072, 3072]),
+                FLAT_SKIRT.to_vec(),
             ],
             uniforms: vec![
                 block(&HILLSHADE_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
@@ -1849,6 +1868,96 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             expect: [255, 0, 255, 255],
+        },
+        // The curtain: a raster quad on raised ground, with every vertex flagged.
+        //
+        // What it draws is coverage rather than color. The texture coordinate is constant over the
+        // triangle, so every covered pixel reads the same texel as `raster` above -- the question
+        // is only *where* the triangle went, and the curtain is the one thing moving it.
+        //
+        // Isolated on purpose: `unpack` is zero, so the DEM contributes no height and the only
+        // thing reaching `position.z` is `curtain`. `fill_raised` above is where the height path
+        // is under test; here it would be a second variable.
+        //
+        //   drop  = -flag * skirt.z = -0.2,  and the matrix's third column is (3, 3)
+        //   clip  = (0.2x - 0.6, -(0.2y - 0.6))
+        //   so the three vertices land at (3.2, 28.8), (16, 28.8), (3.2, 16) in pixels
+        //
+        // Pixel (5, 25) is inside that and inside none of the wrong triangles: with no curtain the
+        // quad sits at cols 13 to 26 and rows 6 to 19; with the sign flipped it goes off the top
+        // right; with the drop scaled by the exaggeration it moves a hundredth as far; and reading
+        // `skirt.x` instead of `.z` -- 0.6 rather than 0.2, which is why it is not zero -- takes it
+        // off the screen to the left. `skirt.y` is nought here, so reading that draws the
+        // uncurtained triangle.
+        Case {
+            name: "raster_raised_skirt",
+            at: (5, 25),
+            family: BuiltIn::RasterShader,
+            surface: Surface::Terrain,
+            layout: Layout::PerAttribute,
+            streams: vec![
+                shorts(&COVERING),
+                shorts(&[819, 819, 819, 819, 819, 819]),
+                // Flagged, which is what `add_skirt` sets on the vertices it adds.
+                shorts(&[1, 0, 1, 0, 1, 0]),
+            ],
+            uniforms: vec![
+                block(
+                    &RASTER_DRAWABLE_UBO,
+                    &[(
+                        "matrix",
+                        At::F(&[
+                            0.2, 0.0, 0.0, 0.0, //
+                            0.0, 0.2, 0.0, 0.0, //
+                            3.0, 3.0, 0.0, 0.0, //
+                            0.0, 0.0, 0.0, 1.0,
+                        ]),
+                    )],
+                ),
+                block(
+                    &RASTER_EVALUATED_PROPS_UBO,
+                    &[
+                        ("spin_weights", At::F(&[1.0, 0.0, 0.0, 0.0])),
+                        ("buffer_scale", At::F(&[2.0])),
+                        ("scale_parent", At::F(&[1.0])),
+                        ("tl_parent", At::F(&[0.0, 0.0])),
+                        ("fade_t", At::F(&[0.0])),
+                        ("opacity", At::F(&[0.5])),
+                        ("brightness_low", At::F(&[0.0])),
+                        ("brightness_high", At::F(&[1.0])),
+                        ("saturation_factor", At::F(&[0.0])),
+                        ("contrast_factor", At::F(&[1.0])),
+                    ],
+                ),
+                block(
+                    &TERRAIN_DRAWABLE_UBO,
+                    &[
+                        // No height from the DEM at all: this case is the curtain alone.
+                        ("unpack", At::F(&[0.0, 0.0, 0.0, 0.0])),
+                        ("params", At::F(&[0.1, 0.3, 0.3, 0.01])),
+                        // The ground skirt in `x` -- which only the ground family reads, and which
+                        // is three times the curtain so that reading it instead is visible -- then
+                        // the center height, then the curtain this hangs from.
+                        ("skirt", At::F(&[0.6, 0.0, 0.2, 0.0])),
+                    ],
+                ),
+            ],
+            images: vec![
+                Image::new(4, |x, y| {
+                    [
+                        u8::try_from(x * 64).unwrap_or(255),
+                        u8::try_from(y * 32).unwrap_or(255),
+                        128,
+                        128,
+                    ]
+                }),
+                Image::new(4, |_, _| [255, 0, 255, 255]),
+                // The DEM, which `unpack` weights at nothing. Bound because the surface samples it
+                // and an unbound sampler is undefined rather than zero.
+                Image::new(4, |_, _| [128, 128, 128, 255]),
+            ],
+            vertices: 3,
+            expect: [32, 16, 64, 64],
         },
         // A circle, read at its own center: the extrusion interpolates to zero there, which is
         // inside the fill and nowhere near the stroke. With no stroke width the stroke's own

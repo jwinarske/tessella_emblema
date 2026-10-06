@@ -68,18 +68,18 @@ pub struct Plan {
     pub absent: Vec<u32>,
     /// Descriptors at a positive slot the family's table does not declare, as `(attr_id, slot)`.
     ///
-    /// The terrain skirt flag is the case that exists: `encode_color_relief` and `encode_raster`
-    /// each send a third descriptor and their tables declare two.
+    /// Empty for every family this producer sends today, and the one case that filled it is worth
+    /// keeping in mind: the skirt flag rode the wire at binding 2 for the raster, hillshade and
+    /// relief families while their tables declared two attributes each. This crate reported it
+    /// here and drew without it, which loses the curtain over a crack between two tiles of raised
+    /// ground -- up to 2382 holes of 1,620,000 at a high-pitch camera, which no gross-pixel count
+    /// can see. tessella#331 put it in the tables, so it binds like anything else.
     ///
-    /// Reported rather than refused, because the two consumers disagree on purpose and both are
-    /// right. `tessella_fluorite` assigns slots in wire order, so the flag arrives as `custom1`
-    /// and its material drops a curtain with it. This crate has no per-layer skirt by design —
-    /// `TERRAIN_PLACEMENT` says only the ground has one, a layer standing on the ground being a
-    /// surface on a surface — so no module here will ever declare that attribute, and refusing it
-    /// would make raster and color relief permanently undrawable.
-    ///
-    /// So it is the caller's to drop, knowingly. What the ABI should say about an attribute that
-    /// is tessella's rather than mbgl's is tessella#331.
+    /// Reported rather than refused, because that is the useful end to fail at. The next attribute
+    /// this producer adds will arrive before the table describes it too, and a refusal would make
+    /// the whole family undrawable over one attribute where this leaves the caller drawing without
+    /// it and knowing that it did. `-1` is the other thing entirely: that is the ABI asking for a
+    /// drop, and it goes in [`Self::dropped`].
     pub undeclared: Vec<(u32, i32)>,
 }
 

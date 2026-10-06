@@ -228,6 +228,11 @@ fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
 fn displace(at: vec2<f32>, delta: vec2<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
     return columns[0] * delta.x + columns[1] * delta.y;
 }
+
+// Nothing to hang a curtain over: a plane's tiles are coplanar and their shared edges meet.
+fn curtain(flag: f32) -> f32 {
+    return 0.0;
+}
 ";
 
 /// A sphere, bent in the vertex stage.
@@ -282,6 +287,12 @@ fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
 fn displace(at: vec2<f32>, delta: vec2<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
     return place(vec3<f32>(at + delta, 0.0), columns) - place(vec3<f32>(at, 0.0), columns);
 }
+
+// A sphere's tiles meet on the sphere, as a plane's meet on the plane. And `place` above reads
+// no z at all, so a curtain here would be dropped on the floor rather than drawn.
+fn curtain(flag: f32) -> f32 {
+    return 0.0;
+}
 ";
 
 /// A sphere, by the quadratic the producer expanded about the tile's center.
@@ -333,6 +344,11 @@ fn displace(at: vec2<f32>, delta: vec2<f32>, columns: array<vec4<f32>, 4>) -> ve
     let j_v = bend.d_v + bend.d_vv * d.y + bend.d_uv * d.x;
     return j_u * delta.x + j_v * delta.y;
 }
+
+// The direct bend's answer, for the direct bend's reason: the tiles meet.
+fn curtain(flag: f32) -> f32 {
+    return 0.0;
+}
 ";
 
 /// A DEM, with the height read per vertex.
@@ -351,8 +367,29 @@ fn displace(at: vec2<f32>, delta: vec2<f32>, columns: array<vec4<f32>, 4>) -> ve
 /// cannot. Subtracted before the exaggeration rather than after, so stretching the relief leaves
 /// the center where it is.
 ///
-/// The skirt is not here. Only the ground has one — a layer standing on the ground is a surface on
-/// a surface — and the ground is its own family rather than a surface variant.
+/// # The curtain, which a layer on the ground does need
+///
+/// The ground's own skirt is not here: it is a fifth of a tile deep and belongs to the mesh the
+/// ground family draws, which this crate does not have. What is here is the *layer's* curtain,
+/// which is a different thing at a different depth and was argued away twice before it was
+/// measured.
+///
+/// Two tiles agree on a shared edge's world position and reach it through different matrices, so
+/// the two land a fraction of a pixel apart and the boundary pixels are claimed by neither. On the
+/// ground that is a crack; on a picture drawn over raised ground it is the ground showing through.
+/// A flagged vertex takes the surface's height and then drops below it, so the layer's own edge
+/// hangs down far enough to be behind its neighbor rather than beside it.
+///
+/// The producer's `seam_at_camera` is the depth -- two pixels of a crack, in meters -- and it
+/// arrives in `skirt.z` already zeroed for the cases that do not need it: an unraised terrain,
+/// whose tiles are coplanar, and a tile that is not at the edge of the cover. So this reads the
+/// uniform rather than deciding anything, and the flag is the producer's own vertex attribute
+/// (`tessellaSkirtVertexAttribute`, tessella#331).
+///
+/// Measured, because the argument went the other way: with the per-layer curtain not emitted,
+/// every `gross` row of tessella's parity sweep is identical to the pixel while `terrain_cover_p`
+/// counts up to 2382 holes of 1,620,000 at the high-pitch cameras. The gross counter cannot see
+/// it -- what shows through a crack is the ground, which takes the background's color.
 const TERRAIN_PLACEMENT: &str = r"
 fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
     let terrain = terrain_drawable_ubo[ubo_index];
@@ -372,5 +409,12 @@ fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
 // already read -- which the displacement does not carry anyway.
 fn displace(at: vec2<f32>, delta: vec2<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
     return columns[0] * delta.x + columns[1] * delta.y;
+}
+
+// How far below the surface a flagged vertex hangs, in the meters `place` adds to a height. Not
+// scaled by the exaggeration: the crack it covers is a fraction of a *pixel* wide however much the
+// relief is stretched, and `skirt.z` is already in those terms.
+fn curtain(flag: f32) -> f32 {
+    return -flag * terrain_drawable_ubo[ubo_index].skirt.z;
 }
 ";

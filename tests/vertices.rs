@@ -92,22 +92,25 @@ fn a_slot_nobody_supplied_is_absent_rather_than_an_error() {
     assert_eq!(got.absent, want);
 }
 
-/// The skirt flag. `encode_color_relief` sends three descriptors and the table declares two.
+/// A descriptor at a positive slot the table does not declare is reported, not refused.
 ///
-/// Reported, not refused and not silently dropped. This crate has no per-layer skirt by design —
-/// `TERRAIN_PLACEMENT` says only the ground has one — so no module here will declare that
-/// attribute and refusing it would make raster and color relief undrawable. `tessella_fluorite`
-/// does read it, as `custom1`, which is why it is named rather than discarded.
+/// The skirt flag was this case until tessella#331 declared it. The mechanism stays, because the
+/// next attribute this producer adds will arrive before the table describes it: refusing would
+/// make the whole family undrawable over one attribute, where reporting leaves the caller to draw
+/// without it and to know that it did.
+///
+/// Synthetic now rather than borrowed from a real family, which is the point -- a fixture that is
+/// some real attribute goes stale the moment that attribute is declared, as this one did.
 #[test]
 fn a_slot_the_table_does_not_declare_is_reported() {
     let mut descs: Vec<AttributeDesc> = COLOR_RELIEF_SHADER.iter().map(agreeing).collect();
-    let mut skirt = agreeing(&COLOR_RELIEF_SHADER[1]);
-    skirt.attr_id = 2;
-    skirt.binding = 2;
-    skirt.offset = 8;
-    descs.push(skirt);
+    let mut stranger = agreeing(&COLOR_RELIEF_SHADER[1]);
+    stranger.attr_id = 9;
+    stranger.binding = 7;
+    stranger.offset = 12;
+    descs.push(stranger);
     let got = plan(&COLOR_RELIEF_SHADER, &descs).expect("an extra slot is not fatal");
-    assert_eq!(got.undeclared, vec![(2, 2)]);
+    assert_eq!(got.undeclared, vec![(9, 7)]);
     assert_eq!(
         got.bound.len(),
         COLOR_RELIEF_SHADER.len(),
@@ -116,18 +119,21 @@ fn a_slot_the_table_does_not_declare_is_reported() {
     assert_eq!(got.absent, [] as [u32; 0]);
 }
 
-/// The whole of raster's run plans, which is the family the refusal would have broken.
+/// The whole of raster's run binds, the skirt included.
+///
+/// Three descriptors and three table entries since tessella#331. The skirt is the producer's own
+/// attribute rather than mbgl's, and nothing here treats it differently for that: it is in the
+/// table, so it binds at the slot the table gives it.
 #[test]
-fn a_raster_bucket_with_its_skirt_still_binds_both_declared_attributes() {
-    let mut descs: Vec<AttributeDesc> = RASTER_SHADER.iter().map(agreeing).collect();
-    let mut skirt = agreeing(&RASTER_SHADER[1]);
-    skirt.attr_id = 2;
-    skirt.binding = 2;
-    skirt.offset = 8;
-    descs.push(skirt);
+fn a_raster_bucket_binds_its_skirt_with_the_rest() {
+    let descs: Vec<AttributeDesc> = RASTER_SHADER.iter().map(agreeing).collect();
     let got = plan(&RASTER_SHADER, &descs).expect("raster plans");
-    assert_eq!(got.bound.len(), 2);
-    assert_eq!(got.undeclared, vec![(2, 2)]);
+    assert_eq!(got.bound.len(), 3);
+    assert!(got.undeclared.is_empty(), "{got:?}");
+    assert_eq!(
+        got.bound.iter().map(|bound| bound.slot).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
 }
 
 #[test]

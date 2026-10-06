@@ -55,22 +55,32 @@ fn attributes_sharing_one_buffer_need_it_once() {
     assert_eq!(vertex_bytes(&got), 144, "counted once");
 }
 
-/// And the skirt descriptor shares it too, so color relief's whole run is one buffer.
+/// And the skirt shares it too, so color relief's whole run of three is one buffer.
+///
+/// It binds rather than being reported undeclared, which is what tessella#331 changed: the skirt
+/// is the producer's own attribute and it is now in the generated table, so this crate reaches it
+/// through the table like any other.
 #[test]
 fn the_skirt_shares_the_interleaved_buffer_as_well() {
-    let mut descs = vec![
+    let descs = [
         from(&COLOR_RELIEF_SHADER[0], INTERLEAVED, 0),
         from(&COLOR_RELIEF_SHADER[1], INTERLEAVED, 4),
+        from(&COLOR_RELIEF_SHADER[2], INTERLEAVED, 8),
     ];
-    let mut skirt = from(&COLOR_RELIEF_SHADER[1], INTERLEAVED, 8);
-    skirt.attr_id = 2;
-    skirt.binding = 2;
-    descs.push(skirt);
     let planned = plan(&COLOR_RELIEF_SHADER, &descs).expect("agrees");
-    assert_eq!(planned.undeclared, vec![(2, 2)], "the skirt is not bound");
+    assert!(planned.undeclared.is_empty(), "{planned:?}");
+    assert_eq!(
+        planned
+            .bound
+            .iter()
+            .map(|bound| bound.slot)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "the skirt binds at the slot the table declares"
+    );
     let got = needs(&planned, INDEXES);
     assert_eq!(got.vertices, vec![INTERLEAVED]);
-    assert_eq!(vertex_bytes(&got), 144);
+    assert_eq!(vertex_bytes(&got), 144, "counted once for all three");
 }
 
 #[test]

@@ -9,6 +9,12 @@ authors = ["Joel Winarske <joel.winarske@gmail.com>"]
 repository = "https://github.com/jwinarske/tessella_emblema"
 description = "The map pass of tessella's capture stream, drawn with Vulkan on emblema's device."
 
+# A workspace, so the safe Vulkan wrapper below is built and tested by the same commands as this
+# crate. The root package is a member of its own workspace automatically; only the extra one needs
+# naming.
+[workspace]
+members = ["crates/tessella-vk"]
+
 [dependencies]
 # The port boundary. This crate's whole reason to exist is to consume what this describes, so it
 # is a dependency from the first commit even where the consuming code is not written yet.
@@ -22,6 +28,9 @@ tessella-consume = { path = "../tessella/crates/tessella-consume" }
 # Loaded at run time through `libvulkan`, so no C toolchain at build -- the pure-Rust rule both
 # neighboring trees hold to. Pinned to emblema's own `ash`, so a graph containing both has one.
 ash = "0.38"
+# Where every `unsafe` call into Vulkan lives, so this crate has none. See its own docs for what
+# "thin" is meant to exclude.
+tessella-vk = { path = "crates/tessella-vk" }
 
 [lints.rust]
 missing_docs = "deny"
@@ -32,6 +41,10 @@ pedantic = { level = "deny", priority = -1 }
 # Every Vulkan enum is a `u32` newtype and every size is a `usize`; the casts between them are
 # the API's, not this crate's judgment to second-guess.
 cast_possible_truncation = "allow"
+
+[[bench]]
+name = "geometry_store"
+harness = false
 
 [[bench]]
 name = "draw_cost"

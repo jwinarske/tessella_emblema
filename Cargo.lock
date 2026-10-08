@@ -197,6 +197,14 @@ dependencies = [
  "naga",
  "tessella-capture-abi",
  "tessella-consume",
+ "tessella-vk",
+]
+
+[[package]]
+name = "tessella-vk"
+version = "0.0.0"
+dependencies = [
+ "ash",
 ]
 
 [[package]]

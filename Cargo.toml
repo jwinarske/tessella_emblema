@@ -47,6 +47,10 @@ name = "geometry_store"
 harness = false
 
 [[bench]]
+name = "block_buffers"
+harness = false
+
+[[bench]]
 name = "draw_cost"
 harness = false
 

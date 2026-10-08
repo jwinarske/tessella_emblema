@@ -559,3 +559,115 @@ impl core::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// The depth and stencil state a clip mask is drawn with.
+///
+/// The other half of [`depth_stencil`]. A content draw tests `EQUAL` and never writes; a mask
+/// writes and never tests. So this is `compare_op: ALWAYS` with `pass_op: REPLACE` and a full write
+/// mask, and the value written is the dynamic stencil reference -- which is why the reference is
+/// dynamic state rather than baked: one pipeline draws every tile's mask and
+/// `vkCmdSetStencilReference` is what distinguishes them.
+///
+/// Depth is off in both directions. A mask has no depth of its own and must not occlude anything:
+/// writing depth here would put a surface at the tile's plane that every later draw tests against.
+pub fn depth_stencil_write() -> vk::PipelineDepthStencilStateCreateInfo<'static> {
+    let replace = vk::StencilOpState {
+        fail_op: vk::StencilOp::REPLACE,
+        pass_op: vk::StencilOp::REPLACE,
+        depth_fail_op: vk::StencilOp::REPLACE,
+        compare_op: vk::CompareOp::ALWAYS,
+        compare_mask: 0xFF,
+        write_mask: 0xFF,
+        reference: 0,
+    };
+    vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(false)
+        .depth_write_enable(false)
+        .stencil_test_enable(true)
+        .front(replace)
+        .back(replace)
+}
+
+/// A color blend state that writes no color at all.
+///
+/// What a mask wants. The quad exists to put a number in the stencil buffer, and a mask that wrote
+/// color would paint a tile-sized rectangle over the frame -- once per tile, under every layer. An
+/// empty write mask is how a draw says it is only here for its side effects.
+pub fn no_color() -> vk::PipelineColorBlendAttachmentState {
+    vk::PipelineColorBlendAttachmentState::default()
+        .blend_enable(false)
+        .color_write_mask(vk::ColorComponentFlags::empty())
+}
+
+/// The reference is set per draw, not baked.
+///
+/// Appended to [`DYNAMIC`] for a mask pipeline: one pipeline draws every tile's mask and the
+/// reference is the only thing that differs between them, so baking it would mean a pipeline per
+/// tile -- 255 of them, remade whenever the counter resets.
+const DYNAMIC_WITH_STENCIL: [vk::DynamicState; 3] = [
+    vk::DynamicState::VIEWPORT,
+    vk::DynamicState::SCISSOR,
+    vk::DynamicState::STENCIL_REFERENCE,
+];
+
+/// Builds the pipeline that draws clip masks.
+///
+/// Takes the module rather than assembling it, as [`build`] does. There is no vertex input at all:
+/// the quad comes from `vertex_index`, so there are no bindings and no attributes, and a key would
+/// have nothing to carry.
+///
+/// # Errors
+///
+/// [`Error::Device`] when the device refuses the pipeline.
+pub fn build_mask<'d>(
+    gpu: Gpu<'d>,
+    layout: &Layout<'_>,
+    module: &tessella_vk::ShaderModule<'_>,
+    targets: Targets,
+) -> Result<tessella_vk::Pipeline<'d>, Error> {
+    let empty = vk::PipelineVertexInputStateCreateInfo::default();
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(module.raw())
+            .name(VERTEX_ENTRY),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(module.raw())
+            .name(FRAGMENT_ENTRY),
+    ];
+    let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let viewport = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+    let dynamic =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&DYNAMIC_WITH_STENCIL);
+    let raster = rasterization();
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let depth = depth_stencil_write();
+    let attachments = [no_color()];
+    let blending = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
+
+    let colors = [targets.color];
+    let mut rendering = vk::PipelineRenderingCreateInfo::default()
+        .color_attachment_formats(&colors)
+        .depth_attachment_format(targets.depth_stencil)
+        .stencil_attachment_format(targets.depth_stencil);
+
+    let create = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&empty)
+        .input_assembly_state(&assembly)
+        .viewport_state(&viewport)
+        .rasterization_state(&raster)
+        .multisample_state(&multisample)
+        .depth_stencil_state(&depth)
+        .color_blend_state(&blending)
+        .dynamic_state(&dynamic)
+        .layout(layout.pipeline())
+        .push_next(&mut rendering);
+
+    Ok(gpu.graphics_pipeline(&create)?)
+}

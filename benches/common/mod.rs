@@ -21,6 +21,7 @@ pub struct Open {
     instance: ash::Instance,
     handle: ash::Device,
     memory: vk::PhysicalDeviceMemoryProperties,
+    pub limits: vk::PhysicalDeviceLimits,
 }
 
 impl Open {
@@ -56,6 +57,7 @@ impl Open {
         );
         // SAFETY: as above.
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
+        let limits = properties.limits;
 
         let priorities = [1.0f32];
         let queues = [vk::DeviceQueueCreateInfo::default()
@@ -77,6 +79,7 @@ impl Open {
             instance,
             handle: device,
             memory,
+            limits,
         })
     }
 

@@ -252,6 +252,95 @@ impl<'d> Gpu<'d> {
         })
     }
 
+    /// Creates a shader module from SPIR-V words, destroyed when dropped.
+    ///
+    /// Takes `u32` words rather than bytes, which is what `vkCreateShaderModule` wants and what
+    /// naga produces -- a byte slice would need an alignment cast, and that is the one place a
+    /// wrapper like this would have to reach for `unsafe` on the caller's behalf.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Call`] if `vkCreateShaderModule` fails. Note what it does *not* catch: on the
+    /// `VeriSilicon` `GC7000UL` a module whose SPIR-V the compiler cannot digest is accepted here
+    /// and segfaults later, in `vkCreateGraphicsPipelines`.
+    pub fn shader(self, words: &[u32]) -> Result<ShaderModule<'d>, Error> {
+        // SAFETY: the create info is fully initialized and borrows the words only for the call; the
+        // device outlives the returned module by the lifetime on `Gpu`.
+        let raw = unsafe {
+            self.device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None)
+        }
+        .map_err(|result| Error::Call {
+            call: "vkCreateShaderModule",
+            result,
+        })?;
+        Ok(ShaderModule {
+            device: self.device,
+            raw,
+        })
+    }
+
+    /// Creates a descriptor set layout from bindings the caller describes.
+    ///
+    /// The bindings are the caller's, because which descriptors a family declares is
+    /// `tessella_emblema::pipelines::bindings` and this crate chooses nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Call`] if `vkCreateDescriptorSetLayout` fails, which is what asking for more
+    /// descriptors of a kind than the device's per-stage limit allows produces.
+    pub fn set_layout(
+        self,
+        bindings: &[vk::DescriptorSetLayoutBinding<'_>],
+    ) -> Result<DescriptorSetLayout<'d>, Error> {
+        // SAFETY: the create info is fully initialized and borrows the bindings only for the call.
+        let raw = unsafe {
+            self.device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(bindings),
+                None,
+            )
+        }
+        .map_err(|result| Error::Call {
+            call: "vkCreateDescriptorSetLayout",
+            result,
+        })?;
+        Ok(DescriptorSetLayout {
+            device: self.device,
+            raw,
+        })
+    }
+
+    /// Creates a pipeline layout over one descriptor set and no push constants.
+    ///
+    /// One set because that is what the modules declare -- group zero and nothing else -- and no
+    /// push constants because nothing in the map pass uses them: a drawable's state is a block in
+    /// its layer's consolidated buffer, indexed by the order entry.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Call`] if `vkCreatePipelineLayout` fails.
+    pub fn pipeline_layout(
+        self,
+        set: &DescriptorSetLayout<'_>,
+    ) -> Result<PipelineLayout<'d>, Error> {
+        let sets = [set.raw];
+        // SAFETY: the create info is fully initialized and names a layout made by this device.
+        let raw = unsafe {
+            self.device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&sets),
+                None,
+            )
+        }
+        .map_err(|result| Error::Call {
+            call: "vkCreatePipelineLayout",
+            result,
+        })?;
+        Ok(PipelineLayout {
+            device: self.device,
+            raw,
+        })
+    }
+
     /// Allocates memory able to back every one of `requirements`, with the properties given.
     ///
     /// The returned allocation is `size` bytes, which the caller chooses: it is laying the buffers out
@@ -805,5 +894,92 @@ impl<'c> Recorder<'c> {
                 &[region],
             );
         }
+    }
+}
+
+/// A shader module, destroyed when dropped.
+pub struct ShaderModule<'d> {
+    device: &'d ash::Device,
+    raw: vk::ShaderModule,
+}
+
+impl core::fmt::Debug for ShaderModule<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("ShaderModule").field(&self.raw).finish()
+    }
+}
+
+impl ShaderModule<'_> {
+    /// The handle, for a pipeline's stage.
+    #[must_use]
+    pub fn raw(&self) -> vk::ShaderModule {
+        self.raw
+    }
+}
+
+impl Drop for ShaderModule<'_> {
+    fn drop(&mut self) {
+        // SAFETY: made by this device, which outlives this, and destroyed exactly once. A module may
+        // be destroyed as soon as the pipelines built from it exist, so this needs no further order.
+        unsafe { self.device.destroy_shader_module(self.raw, None) };
+    }
+}
+
+/// A descriptor set layout, destroyed when dropped.
+pub struct DescriptorSetLayout<'d> {
+    device: &'d ash::Device,
+    raw: vk::DescriptorSetLayout,
+}
+
+impl core::fmt::Debug for DescriptorSetLayout<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("DescriptorSetLayout")
+            .field(&self.raw)
+            .finish()
+    }
+}
+
+impl DescriptorSetLayout<'_> {
+    /// The handle, for allocating a set or making a pipeline layout.
+    #[must_use]
+    pub fn raw(&self) -> vk::DescriptorSetLayout {
+        self.raw
+    }
+}
+
+impl Drop for DescriptorSetLayout<'_> {
+    fn drop(&mut self) {
+        // SAFETY: made by this device, which outlives this, and destroyed exactly once.
+        unsafe {
+            self.device.destroy_descriptor_set_layout(self.raw, None);
+        }
+    }
+}
+
+/// A pipeline layout, destroyed when dropped.
+pub struct PipelineLayout<'d> {
+    device: &'d ash::Device,
+    raw: vk::PipelineLayout,
+}
+
+impl core::fmt::Debug for PipelineLayout<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("PipelineLayout").field(&self.raw).finish()
+    }
+}
+
+impl PipelineLayout<'_> {
+    /// The handle, for creating a pipeline or binding descriptors.
+    #[must_use]
+    pub fn raw(&self) -> vk::PipelineLayout {
+        self.raw
+    }
+}
+
+impl Drop for PipelineLayout<'_> {
+    fn drop(&mut self) {
+        // SAFETY: made by this device, which outlives this, and destroyed exactly once. A pipeline
+        // built with it may outlive it, which Vulkan allows.
+        unsafe { self.device.destroy_pipeline_layout(self.raw, None) };
     }
 }

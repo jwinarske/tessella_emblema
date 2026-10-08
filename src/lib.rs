@@ -81,11 +81,29 @@
 //! vertex input state because a `VkPipeline` bakes that in -- two drawables of one family and
 //! permutation whose strides differ are two pipelines.
 //!
-//! Nothing here reads the stream yet, and nothing in this crate touches a GPU —
-//! `#![forbid(unsafe_code)]` is still at the top of this file, so the only `ash` calls are in the
-//! benches. [`tessella_capture_abi`] is a dependency from the first commit regardless, because it
-//! is the boundary this crate exists to sit on and its types are what every store above will be
-//! keyed by.
+//! [`store`] is the first module that puts anything on a device -- and this crate still has no
+//! `unsafe` in it.
+//!
+//! # How it keeps the forbid
+//!
+//! `ash` is an unsafe FFI binding -- `vkCreateBuffer`, `vkBindBufferMemory` and `vkMapMemory` are all
+//! `unsafe fn` -- so a crate that forbids `unsafe` cannot call Vulkan. The way to put a buffer on a
+//! device from here was either to drop the forbid or to put the `unsafe` somewhere with a boundary
+//! around it.
+//!
+//! It went into [`tessella_vk`], a thin safe layer in this workspace. Every object there borrows the
+//! device it was made from, so the compiler refuses one that outlives the device rather than a doc
+//! comment asking nicely, and a write through a mapping is bounds-checked. What this crate gets is
+//! RAII: [`store`] creates buffers and an allocation, and a `?` part-way through frees whatever was
+//! made because the types own it.
+//!
+//! That is the second reason to prefer the wrapper over the forbid: the unwinding. Between the first
+//! buffer and the last bind there are five fallible calls and each leaves more to undo than the one
+//! before, so writing it by hand means the error paths outnumber the happy one and the leak lives in
+//! whichever was not written.
+//!
+//! [`tessella_capture_abi`] is a dependency from the first commit regardless, because it is the
+//! boundary this crate exists to sit on and its types are what every store above is keyed by.
 
 #![forbid(unsafe_code)]
 
@@ -99,6 +117,7 @@ pub mod residency;
 pub mod shaders;
 pub mod spec;
 mod spirv;
+pub mod store;
 pub mod surface;
 pub mod textures;
 pub mod uniforms;

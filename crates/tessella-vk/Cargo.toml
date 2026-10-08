@@ -1,0 +1,24 @@
+[package]
+name = "tessella-vk"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94.1"
+license = "BSD-2-Clause"
+authors = ["Joel Winarske <joel.winarske@gmail.com>"]
+repository = "https://github.com/jwinarske/tessella_emblema"
+description = "The thin safe layer over the Vulkan calls tessella_emblema's map pass makes."
+
+[dependencies]
+# Pinned to the version both neighboring trees hold, so a graph containing all of them has one.
+ash = "0.38"
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+# Every Vulkan enum is a `u32` newtype and every size a `usize`; the casts between them are the
+# API's rather than this crate's judgment to second-guess.
+cast_possible_truncation = "allow"

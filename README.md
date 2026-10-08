@@ -84,11 +84,19 @@ Every family has at least one pixel behind it. The readback has caught defects t
 not, including an outline's feather mirrored by a coordinate flip naga applies *after* a body
 runs, and it has corrected several comments that were confidently wrong.
 
-Not here yet, in dependency order: `tessella-consume` (the reader, draw list and stencil
-partition, living once in the tessella workspace), the geometry and uniform stores, the pipelines
-those modules become, and the hand-off that waits on `assume_layout`. Nothing in the library
-touches a GPU — `#![forbid(unsafe_code)]` is still at the top of `lib.rs`, so every `ash` call is
-in a bench.
+The geometry store is now here, which is the first part of the frame half: `store` creates a
+geometry's buffers, binds them into one allocation and writes its bytes.
+
+Still to come, in dependency order: `tessella-consume` (the reader, draw list and stencil partition,
+living once in the tessella workspace), the uniform store, the pipelines those modules become, and the
+hand-off.
+
+`#![forbid(unsafe_code)]` is still at the top of `lib.rs`, and the store does not contradict it: the
+`unsafe` lives in `crates/tessella-vk`, a thin safe layer over the Vulkan calls the map pass makes.
+Every object there borrows the device it was made from, so the compiler refuses one that outlives it,
+and a write through a mapping is bounds-checked. See that crate's own docs for what "thin" excludes --
+it chooses no suballocator and no staging policy, because both want a measurement and the pass is what
+can take one.
 
 ## Targets
 

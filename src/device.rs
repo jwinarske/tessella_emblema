@@ -16,7 +16,9 @@
 //! `vkGetPhysicalDeviceFormatProperties`; these decide what to do with it.
 
 use ash::vk;
-use tessella_capture_abi::generated::mbgl_enums::AttributeDataType;
+use tessella_capture_abi::generated::mbgl_enums::{
+    AttributeDataType, TextureChannelDataType, TexturePixelType,
+};
 
 /// Whether a view's pass needs depth, or only stencil.
 ///
@@ -45,6 +47,79 @@ pub enum Unsupported {
     /// Carries the first one found, because the fix is per format and a list of every failure is
     /// no more actionable than the first.
     VertexFormat(vk::Format),
+    /// A texture format the producer can send cannot be sampled or written here.
+    ///
+    /// The first one found, as for [`Self::VertexFormat`]. A device without one of these cannot
+    /// draw a layer that samples it -- a glyph atlas missing is a map with no labels -- so it is
+    /// an error at creation rather than a layer quietly skipped.
+    TextureFormat(vk::Format),
+}
+
+/// Which `VkFormat` a texture of this pixel and channel type is, as mbgl's Vulkan backend decides.
+///
+/// Transcribed from `Texture2D::vulkanFormat` in `src/mbgl/vulkan/texture2d.cpp`, which is the
+/// backend whose tables this crate's shaders come from. `setFormat` takes both halves and so does
+/// this: a color relief's elevation stops are `RGBA` and `Float` together, and the pixel type alone
+/// would make them bytes.
+///
+/// `None` where mbgl returns `eUndefined`, which is two cases and both deliberate:
+///
+/// - `Depth`, which it refuses outright -- a depth texture is an attachment this crate selects
+///   through [`depth_stencil_format`], not something the producer uploads.
+/// - `Luminance`, which falls past both of its `if`s to the final `return`. The ABI can describe a
+///   luminance texture and mbgl's Vulkan backend cannot make one, so this says so rather than
+///   inventing `R8_UNORM` for it. Nothing on this wire sends one.
+///
+/// `Stencil` is `S8_UINT` whatever the channel type says, which is mbgl's own early return. It
+/// disagrees with the texel size the channel type implies, and the disagreement is unreachable:
+/// the producer sends `Alpha` and `RGBA` only.
+#[must_use]
+pub const fn texture_format(
+    pixel: TexturePixelType,
+    channel: TextureChannelDataType,
+) -> Option<vk::Format> {
+    match pixel {
+        // Packed, and before the channel type is looked at -- mbgl returns early here.
+        TexturePixelType::Stencil => Some(vk::Format::S8_UINT),
+        TexturePixelType::Alpha => Some(match channel {
+            TextureChannelDataType::UnsignedByte => vk::Format::R8_UNORM,
+            TextureChannelDataType::HalfFloat => vk::Format::R16_SFLOAT,
+            TextureChannelDataType::Float => vk::Format::R32_SFLOAT,
+        }),
+        TexturePixelType::RGBA => Some(match channel {
+            TextureChannelDataType::UnsignedByte => vk::Format::R8G8B8A8_UNORM,
+            TextureChannelDataType::HalfFloat => vk::Format::R16G16B16A16_SFLOAT,
+            TextureChannelDataType::Float => vk::Format::R32G32B32A32_SFLOAT,
+        }),
+        TexturePixelType::Depth | TexturePixelType::Luminance => None,
+    }
+}
+
+/// What a sampled texture needs of its format: to be read by a shader, and to be written into.
+///
+/// `SAMPLED_IMAGE` because every one of these is read by a fragment shader, and `TRANSFER_DST`
+/// because every one is filled by `vkCmdCopyBufferToImage` rather than rendered into.
+const TEXTURE_FEATURES: vk::FormatFeatureFlags = vk::FormatFeatureFlags::from_raw(
+    vk::FormatFeatureFlags::SAMPLED_IMAGE.as_raw() | vk::FormatFeatureFlags::TRANSFER_DST.as_raw(),
+);
+
+/// Checks that every texture format the producer can send is usable here.
+///
+/// Asked of `optimalTilingFeatures`, because a sampled texture is optimally tiled -- a linear one
+/// would be legal and slow, and on a tiler the difference is the whole point of the copy.
+///
+/// # Errors
+///
+/// [`Unsupported::TextureFormat`] naming the first format the device will not take.
+pub fn check_texture_formats(
+    formats: &[vk::Format],
+    optimal_features: impl Fn(vk::Format) -> vk::FormatFeatureFlags,
+) -> Result<(), Unsupported> {
+    formats
+        .iter()
+        .copied()
+        .find(|format| !optimal_features(*format).contains(TEXTURE_FEATURES))
+        .map_or(Ok(()), |format| Err(Unsupported::TextureFormat(format)))
 }
 
 /// The depth-stencil formats this crate will accept, in the order it prefers them.

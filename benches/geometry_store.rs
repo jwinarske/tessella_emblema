@@ -26,6 +26,16 @@ use common::Open;
 /// One checked behavior, named in the summary line.
 type Case = fn(&Open) -> Result<(), String>;
 
+/// One segment over a whole index buffer, which is what a bucket with no sub-ranges sends.
+fn segments() -> Vec<tessella_capture_abi::envelope::Segment> {
+    vec![tessella_capture_abi::envelope::Segment {
+        vertex_offset: 0,
+        index_offset: 0,
+        vertex_length: 4,
+        index_length: 12,
+    }]
+}
+
 const fn at(slab: u32, offset: u32, length: u32) -> SlabRef {
     SlabRef {
         slab,
@@ -73,7 +83,7 @@ fn round_trip(device: &Open) -> Result<(), String> {
     let mut store = Store::new();
     let geometry = GeometryId(1);
     store
-        .upload(device.gpu(), geometry, &needs, &resolve)
+        .upload(device.gpu(), geometry, &needs, &segments(), &resolve)
         .map_err(|why| format!("upload: {why}"))?;
 
     if !store.holds(geometry) {
@@ -141,7 +151,7 @@ fn dedup(device: &Open) -> Result<(), String> {
     let mut store = Store::new();
     let geometry = GeometryId(2);
     store
-        .upload(device.gpu(), geometry, &needs, &resolve)
+        .upload(device.gpu(), geometry, &needs, &segments(), &resolve)
         .map_err(|why| format!("upload: {why}"))?;
 
     // Three bindings, one buffer: the whole point of the dedup, and visible only through the handles.
@@ -163,6 +173,70 @@ fn dedup(device: &Open) -> Result<(), String> {
     Ok(())
 }
 
+/// The bind list is one entry per binding, with a handle repeated for an interleaved buffer.
+///
+/// What `vkCmdBindVertexBuffers` is handed, and the thing a draw would otherwise rebuild from
+/// `Needs::reads` every time. The dedup is what makes it worth checking: three descriptors over one
+/// twelve-byte vertex are *three* bindings naming *one* handle, so a bind list built by walking the
+/// buffers rather than the reads would be one entry long and leave two bindings unbound.
+fn the_bind_list_follows_the_reads(device: &Open) -> Result<(), String> {
+    let interleaved = at(3, 0, 120);
+    let bound = |slot: u32, offset: u32| Bound {
+        slot,
+        format: vk::Format::R32_SFLOAT,
+        stride: 12,
+        offset,
+        vertex_offset: 0,
+        source: interleaved,
+        rate: vk::VertexInputRate::VERTEX,
+    };
+    let plan = Plan {
+        bound: vec![bound(0, 0), bound(1, 4), bound(2, 8)],
+        ..Plan::default()
+    };
+    let needs = buffers::needs(&plan, at(0, 0, 0));
+    let bytes: Vec<u8> = (0..120u8).collect();
+    let pairs = [(interleaved, bytes.as_slice())];
+    let resolve = resolver(&pairs);
+
+    let mut store = Store::new();
+    let geometry = GeometryId(5);
+    store
+        .upload(device.gpu(), geometry, &needs, &segments(), &resolve)
+        .map_err(|why| format!("upload: {why}"))?;
+
+    let (handles, offsets) = store.bindings(geometry).ok_or("no bindings")?;
+    if handles.len() != 3 {
+        return Err(format!(
+            "{} bindings for three descriptors: a draw would leave {} unbound",
+            handles.len(),
+            3 - handles.len()
+        ));
+    }
+    if offsets.len() != handles.len() {
+        return Err("the offsets are not parallel to the handles".into());
+    }
+    if handles.iter().any(|handle| *handle != handles[0]) {
+        return Err(format!(
+            "three bindings over one interleaved buffer got {handles:?}"
+        ));
+    }
+    if offsets.iter().any(|offset| *offset != 0) {
+        return Err("a binding offset is not zero, so it is being read twice".into());
+    }
+
+    // And the segments came back, which is the other thing a draw needs and the store used to drop.
+    let held = store.segments(geometry);
+    if held.len() != 1 || held[0].index_length != 12 {
+        return Err(format!("the segments did not survive the upload: {held:?}"));
+    }
+    if !store.segments(GeometryId(404)).is_empty() {
+        return Err("a geometry the store does not hold claimed segments".into());
+    }
+    println!("  the bind list         ok   3 bindings, 1 handle, 1 segment of 12 indices");
+    Ok(())
+}
+
 fn refusals(device: &Open) -> Result<(), String> {
     let needs = Needs {
         vertices: vec![at(9, 0, 32)],
@@ -173,7 +247,7 @@ fn refusals(device: &Open) -> Result<(), String> {
 
     // Nothing resolves it.
     let nothing = |_: SlabRef| None;
-    let unresolved = store.upload(device.gpu(), GeometryId(3), &needs, &nothing);
+    let unresolved = store.upload(device.gpu(), GeometryId(3), &needs, &segments(), &nothing);
     if unresolved.is_ok() {
         return Err("an unresolved reference was accepted".into());
     }
@@ -185,7 +259,7 @@ fn refusals(device: &Open) -> Result<(), String> {
     let short_bytes = vec![0u8; 8];
     let pairs = [(needs.vertices[0], short_bytes.as_slice())];
     let resolve = resolver(&pairs);
-    let short = store.upload(device.gpu(), GeometryId(4), &needs, &resolve);
+    let short = store.upload(device.gpu(), GeometryId(4), &needs, &segments(), &resolve);
     if short.is_ok() {
         return Err("a reference resolving short was accepted".into());
     }
@@ -212,6 +286,7 @@ fn main() {
     for (name, case) in [
         ("round_trip", round_trip as Case),
         ("dedup", dedup),
+        ("bind_list", the_bind_list_follows_the_reads),
         ("refusals", refusals),
     ] {
         if let Err(why) = case(&device) {

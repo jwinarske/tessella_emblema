@@ -403,6 +403,74 @@ impl<'d> Gpu<'d> {
         })
     }
 
+    /// Creates a sampler, destroyed when dropped.
+    ///
+    /// `CLAMP_TO_EDGE` on every axis is not a parameter, because every texture on this wire wants
+    /// it. An atlas is a shared sheet and a sprite is a window into it, so a repeating address mode
+    /// would walk into the neighboring sprite -- which is why a pattern's own body wraps its
+    /// coordinate by hand instead. mbgl's `SamplerState` defaults to `Clamp` on both axes for the
+    /// same reason.
+    ///
+    /// No mipmaps: nothing here is mipmapped, and `maxLod` of zero says so.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Call`] if `vkCreateSampler` fails.
+    pub fn sampler(self, filter: vk::Filter) -> Result<Sampler<'d>, Error> {
+        // SAFETY: the create info is fully initialized and borrowed only for the call.
+        let raw = unsafe {
+            self.device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(filter)
+                    .min_filter(filter)
+                    .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .min_lod(0.0)
+                    .max_lod(0.0),
+                None,
+            )
+        }
+        .map_err(|result| Error::Call {
+            call: "vkCreateSampler",
+            result,
+        })?;
+        Ok(Sampler {
+            device: self.device,
+            raw,
+        })
+    }
+
+    /// Creates a descriptor pool able to hold `sets` sets of `sizes` descriptors.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Call`] if `vkCreateDescriptorPool` fails.
+    pub fn descriptor_pool(
+        self,
+        sets: u32,
+        sizes: &[vk::DescriptorPoolSize],
+    ) -> Result<DescriptorPool<'d>, Error> {
+        // SAFETY: the create info is fully initialized and borrows the sizes only for the call.
+        let raw = unsafe {
+            self.device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(sets.max(1))
+                    .pool_sizes(sizes),
+                None,
+            )
+        }
+        .map_err(|result| Error::Call {
+            call: "vkCreateDescriptorPool",
+            result,
+        })?;
+        Ok(DescriptorPool {
+            device: self.device,
+            raw,
+        })
+    }
+
     /// Allocates memory able to back every one of `requirements`, with the properties given.
     ///
     /// The returned allocation is `size` bytes, which the caller chooses: it is laying the buffers out
@@ -1192,5 +1260,123 @@ impl Drop for Pipeline<'_> {
     fn drop(&mut self) {
         // SAFETY: made by this device, which outlives this, and destroyed exactly once.
         unsafe { self.device.destroy_pipeline(self.raw, None) };
+    }
+}
+
+/// A sampler, destroyed when dropped.
+pub struct Sampler<'d> {
+    device: &'d ash::Device,
+    raw: vk::Sampler,
+}
+
+impl core::fmt::Debug for Sampler<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Sampler").field(&self.raw).finish()
+    }
+}
+
+impl Sampler<'_> {
+    /// The handle, for a descriptor write.
+    #[must_use]
+    pub fn raw(&self) -> vk::Sampler {
+        self.raw
+    }
+}
+
+impl Drop for Sampler<'_> {
+    fn drop(&mut self) {
+        // SAFETY: made by this device, which outlives this, and destroyed exactly once.
+        unsafe { self.device.destroy_sampler(self.raw, None) };
+    }
+}
+
+/// A descriptor pool, destroyed when dropped.
+///
+/// # Why a set has no type of its own
+///
+/// `VkDescriptorSet` is not individually destroyed here. Sets allocated from a pool are freed by
+/// resetting or destroying the pool, so a `DescriptorSet` with a `Drop` would either free something
+/// twice or need the pool to outlive it in a way the pool cannot promise. A set is therefore a bare
+/// handle whose life is the pool's, which is what [`Self::reset`] exists to make explicit.
+pub struct DescriptorPool<'d> {
+    device: &'d ash::Device,
+    raw: vk::DescriptorPool,
+}
+
+impl core::fmt::Debug for DescriptorPool<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("DescriptorPool").field(&self.raw).finish()
+    }
+}
+
+impl DescriptorPool<'_> {
+    /// Allocates one set of the given layout.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Call`] if `vkAllocateDescriptorSets` fails, which is what asking for more sets or
+    /// more descriptors than the pool was sized for produces.
+    pub fn allocate(&self, layout: vk::DescriptorSetLayout) -> Result<vk::DescriptorSet, Error> {
+        let layouts = [layout];
+        // SAFETY: the pool and the layout belong to this device, and the info is fully initialized.
+        let sets = unsafe {
+            self.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.raw)
+                    .set_layouts(&layouts),
+            )
+        }
+        .map_err(|result| Error::Call {
+            call: "vkAllocateDescriptorSets",
+            result,
+        })?;
+        Ok(sets[0])
+    }
+
+    /// Frees every set allocated from this pool at once.
+    ///
+    /// # Correctness, which this cannot check
+    ///
+    /// Every frame that bound one of them must have completed. The same obligation
+    /// `tessella_emblema::store::Store::free` carries, and the same reason: only the caller knows
+    /// when its queue is done. A set freed while a submitted command buffer still names it is use
+    /// after free inside the driver.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Call`] if `vkResetDescriptorPool` fails.
+    pub fn reset(&self) -> Result<(), Error> {
+        // SAFETY: the pool belongs to this device. Whether its sets are still in flight is the
+        // caller's obligation, stated above and not checkable here.
+        unsafe {
+            self.device
+                .reset_descriptor_pool(self.raw, vk::DescriptorPoolResetFlags::empty())
+        }
+        .map_err(|result| Error::Call {
+            call: "vkResetDescriptorPool",
+            result,
+        })
+    }
+
+    /// Writes descriptors into sets allocated from this pool.
+    ///
+    /// Takes the whole write list, because one `vkUpdateDescriptorSets` for a set is one call where
+    /// a write per binding is five -- and the writes borrow the buffer and image infos they point
+    /// at, which only the caller can keep alive across the call.
+    pub fn write(&self, writes: &[vk::WriteDescriptorSet<'_>]) {
+        if writes.is_empty() {
+            return;
+        }
+        // SAFETY: every write names a set from this pool and resources of this device, and the
+        // slices are read only for the call.
+        unsafe { self.device.update_descriptor_sets(writes, &[]) };
+    }
+}
+
+impl Drop for DescriptorPool<'_> {
+    fn drop(&mut self) {
+        // SAFETY: made by this device, which outlives this, and destroyed exactly once. Destroying
+        // it frees its sets, which carries the same in-flight obligation as `reset`.
+        unsafe { self.device.destroy_descriptor_pool(self.raw, None) };
     }
 }

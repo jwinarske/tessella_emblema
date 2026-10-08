@@ -67,6 +67,10 @@ name = "hand_off"
 harness = false
 
 [[bench]]
+name = "descriptor_sets"
+harness = false
+
+[[bench]]
 name = "draw_cost"
 harness = false
 

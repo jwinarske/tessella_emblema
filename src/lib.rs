@@ -109,6 +109,7 @@
 
 pub mod blocks;
 pub mod buffers;
+pub mod descriptors;
 pub mod device;
 pub mod draws;
 pub mod families;

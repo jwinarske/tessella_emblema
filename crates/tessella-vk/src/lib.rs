@@ -168,6 +168,90 @@ impl<'d> Gpu<'d> {
         })
     }
 
+    /// Creates a two-dimensional image, destroyed when the returned value is dropped.
+    ///
+    /// Optimally tiled and `EXCLUSIVE`, one mip level and one array layer -- which is every texture
+    /// the producer sends. Optimal rather than linear because the image is sampled and a tiler's
+    /// whole advantage is in the swizzle; a linear sampled image is legal and slow.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Call`] if `vkCreateImage` fails, which is what an unsupported format or an extent
+    /// past `maxImageDimension2D` produces.
+    pub fn image(
+        self,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<Image<'d>, Error> {
+        // SAFETY: the create info is fully initialized, and the device outlives the returned image by
+        // the lifetime on `Gpu`.
+        let raw = unsafe {
+            self.device.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(format)
+                    .extent(vk::Extent3D {
+                        // A zero extent is rejected by `vkCreateImage`, and a texture of no pixels is
+                        // not something to allocate for -- but the caller should not have to know
+                        // which call refuses it, so this is the one place it is raised.
+                        width: width.max(1),
+                        height: height.max(1),
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(usage)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED),
+                None,
+            )
+        }
+        .map_err(|result| Error::Call {
+            call: "vkCreateImage",
+            result,
+        })?;
+        Ok(Image {
+            device: self.device,
+            raw,
+        })
+    }
+
+    /// Creates a color-aspect view of a whole image, destroyed when dropped.
+    ///
+    /// The image must already be bound to memory: `vkCreateImageView` of an unbound image is
+    /// undefined, and this cannot check it -- a `Memory::bind_image` has no handle to leave behind.
+    /// Binding before viewing is the order [`crate::Memory::bind_image`] documents.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Call`] if `vkCreateImageView` fails.
+    pub fn view(self, image: &Image<'_>, format: vk::Format) -> Result<ImageView<'d>, Error> {
+        // SAFETY: the create info is fully initialized and names an image made by this device; the
+        // device outlives the returned view by the lifetime on `Gpu`.
+        let raw = unsafe {
+            self.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image.raw)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(WHOLE_COLOR),
+                None,
+            )
+        }
+        .map_err(|result| Error::Call {
+            call: "vkCreateImageView",
+            result,
+        })?;
+        Ok(ImageView {
+            device: self.device,
+            raw,
+        })
+    }
+
     /// Allocates memory able to back every one of `requirements`, with the properties given.
     ///
     /// The returned allocation is `size` bytes, which the caller chooses: it is laying the buffers out
@@ -214,6 +298,92 @@ impl<'d> Gpu<'d> {
             raw,
             size: size.max(1),
         })
+    }
+}
+
+/// Every color level and layer of an image, which is all any texture here has.
+///
+/// One mip level and one array layer, matching what [`Gpu::image`] creates. Named once because a
+/// barrier, a view and a copy all have to agree about it, and three spellings of the same range is
+/// three chances to disagree.
+const WHOLE_COLOR: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
+    aspect_mask: vk::ImageAspectFlags::COLOR,
+    base_mip_level: 0,
+    level_count: 1,
+    base_array_layer: 0,
+    layer_count: 1,
+};
+
+/// An image, destroyed when dropped.
+pub struct Image<'d> {
+    device: &'d ash::Device,
+    raw: vk::Image,
+}
+
+impl core::fmt::Debug for Image<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Image").field(&self.raw).finish()
+    }
+}
+
+impl Image<'_> {
+    /// The handle, for recording a copy or a barrier.
+    ///
+    /// Copying it out does not extend its life, as for [`Buffer::raw`].
+    #[must_use]
+    pub fn raw(&self) -> vk::Image {
+        self.raw
+    }
+
+    /// What binding this image requires.
+    ///
+    /// An image's requirements are its own, not its extent times its texel size: a driver pads rows
+    /// and planes to suit its swizzle, and on V3D the answer is routinely larger than the arithmetic.
+    #[must_use]
+    pub fn requirements(&self) -> Requirements {
+        // SAFETY: the image was made by this device and is alive.
+        let need = unsafe { self.device.get_image_memory_requirements(self.raw) };
+        Requirements {
+            size: need.size,
+            alignment: need.alignment,
+            types: need.memory_type_bits,
+        }
+    }
+}
+
+impl Drop for Image<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the handle was made by this device, which outlives this by the struct's lifetime,
+        // and is destroyed exactly once.
+        unsafe { self.device.destroy_image(self.raw, None) };
+    }
+}
+
+/// A view of an image, destroyed when dropped.
+pub struct ImageView<'d> {
+    device: &'d ash::Device,
+    raw: vk::ImageView,
+}
+
+impl core::fmt::Debug for ImageView<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("ImageView").field(&self.raw).finish()
+    }
+}
+
+impl ImageView<'_> {
+    /// The handle, for a descriptor write.
+    #[must_use]
+    pub fn raw(&self) -> vk::ImageView {
+        self.raw
+    }
+}
+
+impl Drop for ImageView<'_> {
+    fn drop(&mut self) {
+        // SAFETY: made by this device, which outlives this, and destroyed exactly once. A descriptor
+        // still referring to it is the pass's obligation, as for `Buffer::raw`.
+        unsafe { self.device.destroy_image_view(self.raw, None) };
     }
 }
 
@@ -281,6 +451,26 @@ impl Memory<'_> {
     #[must_use]
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Binds `image` to this allocation at `offset`.
+    ///
+    /// Must happen before a view of it is made or a copy into it recorded. Nothing here can check
+    /// that order -- an unbound image has the same handle as a bound one -- so it is stated.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Call`] if `vkBindImageMemory` fails, which is what an offset not satisfying the
+    /// image's alignment produces.
+    pub fn bind_image(&self, image: &Image<'_>, offset: u64) -> Result<(), Error> {
+        // SAFETY: both handles belong to this device, and an `Image` is bound once because this is
+        // the only thing that binds one.
+        unsafe { self.device.bind_image_memory(image.raw, self.raw, offset) }.map_err(|result| {
+            Error::Call {
+                call: "vkBindImageMemory",
+                result,
+            }
+        })
     }
 
     /// Binds `buffer` to this allocation at `offset`.
@@ -434,5 +624,186 @@ impl Drop for Mapping<'_> {
         // SAFETY: mapped by `Memory::map`, which is the only thing that constructs this, and unmapped
         // exactly once because the borrow kept anything else from mapping it meanwhile.
         unsafe { self.memory.device.unmap_memory(self.memory.raw) };
+    }
+}
+
+/// Commands recorded into a command buffer somebody else owns.
+///
+/// Borrowed, never owned — the same arrangement as [`Gpu`], and for the same reason. This crate owns
+/// no command pool, so a `Recorder` is a handle the pass was given plus the device to record through.
+/// Beginning the buffer, ending it, submitting it and knowing when it completed all stay with
+/// whoever owns the pool.
+///
+/// # What recording does and does not promise
+///
+/// Each method appends one command. None of them submits, and none of them waits. A recorded command
+/// names handles it does not keep alive, so every object it refers to has to outlive the submission —
+/// which is the obligation [`Buffer::raw`] states and which no borrow here can express, because the
+/// lifetime that matters is the queue's and not the compiler's.
+#[derive(Clone, Copy)]
+pub struct Recorder<'c> {
+    device: &'c ash::Device,
+    raw: vk::CommandBuffer,
+}
+
+impl core::fmt::Debug for Recorder<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Recorder").field(&self.raw).finish()
+    }
+}
+
+impl<'c> Recorder<'c> {
+    /// Records into a command buffer the caller owns and has already begun.
+    #[must_use]
+    pub fn new(device: &'c ash::Device, raw: vk::CommandBuffer) -> Self {
+        Self { device, raw }
+    }
+
+    /// Moves a whole image from one layout to another.
+    ///
+    /// The access masks and stages are derived from the pair rather than taken as arguments, because
+    /// there are only three transitions a texture upload makes and each has one right answer:
+    ///
+    /// | from | to | why |
+    /// | --- | --- | --- |
+    /// | `UNDEFINED` | `TRANSFER_DST_OPTIMAL` | a new image, before its first copy |
+    /// | `SHADER_READ_ONLY_OPTIMAL` | `TRANSFER_DST_OPTIMAL` | an existing image, before a repaint |
+    /// | `TRANSFER_DST_OPTIMAL` | `SHADER_READ_ONLY_OPTIMAL` | after the copy, before it is sampled |
+    ///
+    /// Taking them as arguments would move the decision to every call site, and a barrier with the
+    /// wrong source stage is the defect that does not reproduce: it is a race, so it draws correctly
+    /// until the driver schedules the copy and the sample close enough together.
+    ///
+    /// An unrecognized pair gets `ALL_COMMANDS` both sides with both access masks, which is correct
+    /// and slow — the conservative answer rather than a silently narrow one.
+    pub fn transition(&self, image: &Image<'_>, from: vk::ImageLayout, to: vk::ImageLayout) {
+        use vk::{AccessFlags as A, ImageLayout as L, PipelineStageFlags as S};
+        let (src_stage, src_access, dst_stage, dst_access) = match (from, to) {
+            (L::UNDEFINED, L::TRANSFER_DST_OPTIMAL) => {
+                (S::TOP_OF_PIPE, A::empty(), S::TRANSFER, A::TRANSFER_WRITE)
+            }
+            (L::SHADER_READ_ONLY_OPTIMAL, L::TRANSFER_DST_OPTIMAL) => (
+                S::FRAGMENT_SHADER,
+                A::SHADER_READ,
+                S::TRANSFER,
+                A::TRANSFER_WRITE,
+            ),
+            (L::TRANSFER_DST_OPTIMAL, L::SHADER_READ_ONLY_OPTIMAL) => (
+                S::TRANSFER,
+                A::TRANSFER_WRITE,
+                S::FRAGMENT_SHADER,
+                A::SHADER_READ,
+            ),
+            _ => (
+                S::ALL_COMMANDS,
+                A::MEMORY_READ | A::MEMORY_WRITE,
+                S::ALL_COMMANDS,
+                A::MEMORY_READ | A::MEMORY_WRITE,
+            ),
+        };
+        let barrier = vk::ImageMemoryBarrier::default()
+            .src_access_mask(src_access)
+            .dst_access_mask(dst_access)
+            .old_layout(from)
+            .new_layout(to)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image.raw)
+            .subresource_range(WHOLE_COLOR);
+        // SAFETY: the command buffer is in the recording state -- `Recorder::new` says the caller has
+        // begun it -- and the barrier is fully initialized and names an image of this device.
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                self.raw,
+                src_stage,
+                dst_stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+    }
+
+    /// Clears a whole image in `TRANSFER_DST_OPTIMAL` to zero.
+    ///
+    /// For a newly created image, before anything is copied into it. `vkCreateImage` says nothing
+    /// about what the memory holds and `vkAllocateMemory` says nothing either -- measured on three
+    /// drivers for buffers, where the `VeriSilicon` `GC7000UL` returned a previously exited process's
+    /// bytes. An image written only where the producer reported damage leaves the rest of itself at
+    /// whatever the allocation arrived holding, and that part is still sampled.
+    pub fn clear(&self, image: &Image<'_>) {
+        let zero = vk::ClearColorValue { float32: [0.0; 4] };
+        // SAFETY: the command buffer is recording, the image belongs to this device and is in the
+        // layout named, and the range is one this crate's images all have.
+        unsafe {
+            self.device.cmd_clear_color_image(
+                self.raw,
+                image.raw,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &zero,
+                &[WHOLE_COLOR],
+            );
+        }
+    }
+
+    /// Copies regions of a buffer into an image already in `TRANSFER_DST_OPTIMAL`.
+    ///
+    /// The regions are the caller's, because deciding them is the layout arithmetic that
+    /// `tessella_emblema::textures::staging` owns and this crate chooses nothing. An empty list
+    /// records nothing rather than a command with no regions, which some drivers reject.
+    pub fn copy_to_image(
+        &self,
+        buffer: &Buffer<'_>,
+        image: &Image<'_>,
+        regions: &[vk::BufferImageCopy],
+    ) {
+        if regions.is_empty() {
+            return;
+        }
+        // SAFETY: the command buffer is recording, both handles belong to this device, and the
+        // regions are a slice this call only reads.
+        unsafe {
+            self.device.cmd_copy_buffer_to_image(
+                self.raw,
+                buffer.raw,
+                image.raw,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                regions,
+            );
+        }
+    }
+
+    /// Copies a whole image in `TRANSFER_SRC_OPTIMAL` back into a buffer.
+    ///
+    /// For reading a texture back, which is how a bench checks that the pixels arrived — the same job
+    /// `Store::read_vertex_bytes` does for geometry, and the only way to look at an image without
+    /// drawing it.
+    pub fn copy_to_buffer(&self, image: &Image<'_>, buffer: &Buffer<'_>, width: u32, height: u32) {
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(width)
+            .buffer_image_height(height)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            });
+        // SAFETY: as `copy_to_image`; the image is in the layout named and belongs to this device.
+        unsafe {
+            self.device.cmd_copy_image_to_buffer(
+                self.raw,
+                image.raw,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buffer.raw,
+                &[region],
+            );
+        }
     }
 }

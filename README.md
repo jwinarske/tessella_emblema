@@ -90,11 +90,15 @@ buffer and brings it level from `uniforms`' shadow a dirty range at a time. And 
 texture's `VkFormat` from both halves of mbgl's two-part format, and packs an update's regions into
 one staging buffer at offsets `vkCmdCopyBufferToImage` will accept.
 
-Still to come, in dependency order: the texture store's device half -- images, views and the
-recorded copy, which is the first part of this crate to need a command buffer -- then the pipelines
-these modules become, and the hand-off. `tessella-consume` (the reader, draw list and stencil
-partition) lives once in the tessella workspace and now carries a texture update's channel type and
-payload shape, which this crate's format and staging decisions both read.
+`images` completes it: a texture's image, its view, and the staged copy that fills it. It is the
+first part of this crate to need a command buffer, because an optimally tiled image cannot be mapped
+-- so `tessella-vk` gained `Image`, `ImageView` and a `Recorder` that records into a command buffer
+somebody else owns. This module records and never submits; the queue stays with the host.
+
+Still to come, in dependency order: the pipelines these modules become, and the hand-off.
+`tessella-consume` (the reader, draw list and stencil partition) lives once in the tessella
+workspace and carries a texture update's channel type and payload shape, which the format and
+staging decisions both read.
 
 `#![forbid(unsafe_code)]` is still at the top of `lib.rs`, and the store does not contradict it: the
 `unsafe` lives in `crates/tessella-vk`, a thin safe layer over the Vulkan calls the map pass makes.

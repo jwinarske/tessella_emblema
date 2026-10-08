@@ -84,12 +84,17 @@ Every family has at least one pixel behind it. The readback has caught defects t
 not, including an outline's feather mirrored by a coordinate flip naga applies *after* a body
 runs, and it has corrected several comments that were confidently wrong.
 
-The geometry store is now here, which is the first part of the frame half: `store` creates a
-geometry's buffers, binds them into one allocation and writes its bytes.
+Three parts of the frame half are now here. `store` creates a geometry's buffers, binds them into
+one allocation and writes its bytes. `blocks` gives each `(view, layer)` its consolidated storage
+buffer and brings it level from `uniforms`' shadow a dirty range at a time. And `textures` decides a
+texture's `VkFormat` from both halves of mbgl's two-part format, and packs an update's regions into
+one staging buffer at offsets `vkCmdCopyBufferToImage` will accept.
 
-Still to come, in dependency order: `tessella-consume` (the reader, draw list and stencil partition,
-living once in the tessella workspace), the uniform store, the pipelines those modules become, and the
-hand-off.
+Still to come, in dependency order: the texture store's device half -- images, views and the
+recorded copy, which is the first part of this crate to need a command buffer -- then the pipelines
+these modules become, and the hand-off. `tessella-consume` (the reader, draw list and stencil
+partition) lives once in the tessella workspace and now carries a texture update's channel type and
+payload shape, which this crate's format and staging decisions both read.
 
 `#![forbid(unsafe_code)]` is still at the top of `lib.rs`, and the store does not contradict it: the
 `unsafe` lives in `crates/tessella-vk`, a thin safe layer over the Vulkan calls the map pass makes.

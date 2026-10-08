@@ -114,6 +114,7 @@ pub mod device;
 pub mod draws;
 pub mod families;
 pub mod images;
+pub mod masks;
 pub mod pipelines;
 pub mod preamble;
 pub mod residency;

@@ -23,6 +23,7 @@
 use ash::vk;
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 
+use crate::families::Family;
 use crate::surface::Surface;
 use crate::vertices::Plan;
 
@@ -82,4 +83,100 @@ pub fn key(shader: BuiltIn, surface: Surface, permutation: u64, plan: &Plan) -> 
             })
             .collect(),
     }
+}
+
+/// What one descriptor in a family's set is.
+///
+/// Three kinds, because that is what the assembled modules declare: a block is
+/// `var<storage, read>`, and a sampled texture is a `texture_2d<f32>` and a `sampler` as two
+/// separate bindings rather than one combined. Separate because naga emits WGSL's two objects as
+/// two descriptors, and a layout offering `COMBINED_IMAGE_SAMPLER` where the module declares a pair
+/// does not match -- which `vkCreateGraphicsPipelines` rejects, loudly, so this one at least fails
+/// rather than draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Kind {
+    /// A uniform block, read as a storage buffer.
+    StorageBuffer,
+    /// A texture a placement or a body samples.
+    SampledImage,
+    /// The sampler that reads it.
+    Sampler,
+}
+
+impl Kind {
+    /// The Vulkan descriptor type.
+    #[must_use]
+    pub const fn descriptor_type(self) -> vk::DescriptorType {
+        match self {
+            Self::StorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
+            Self::SampledImage => vk::DescriptorType::SAMPLED_IMAGE,
+            Self::Sampler => vk::DescriptorType::SAMPLER,
+        }
+    }
+}
+
+/// One entry of a family's descriptor set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Binding {
+    /// The `@binding(n)` the module declares, in group zero.
+    pub binding: u32,
+    /// What is bound there.
+    pub kind: Kind,
+}
+
+/// The descriptor set a module for this family and surface declares.
+///
+/// Group zero, in the order [`crate::shaders::module`] writes them, and derived by *counting* the
+/// same sequence rather than by an index formula. That module says why:
+///
+/// > Counted rather than computed from the index, because the count differs by family and by
+/// > surface and an index formula would be arithmetic no test could distinguish from a wrong one.
+///
+/// The same reasoning applies here with more force, because this is the half that has to agree with
+/// the other. A descriptor set layout that disagrees with what the module declares is rejected by
+/// `vkCreateGraphicsPipelines` when the types differ -- and when only the *counts* differ it is a
+/// set whose later bindings are all one place out, which binds one block's bytes where another's
+/// were meant and draws.
+///
+/// So `tests/descriptors.rs` checks this against the assembled text for every family and surface
+/// rather than against a table, which is the only check that can catch the two drifting apart.
+#[must_use]
+pub fn bindings(family: &Family, surface: Surface) -> Vec<Binding> {
+    let mut out = Vec::new();
+    // The family's blocks first, then the surface's, exactly as the module declares them.
+    for _ in family.blocks.iter().chain(surface.blocks()) {
+        out.push(Binding {
+            binding: out.len() as u32,
+            kind: Kind::StorageBuffer,
+        });
+    }
+    // Then two bindings for every texture, the family's own first and the surface's after -- a
+    // family's samplers are a property of the shader rather than of what it is drawn on.
+    // The two counts rather than the two iterators, which have different item types. The binding
+    // number is still `out.len()`, which is the part that must not become a formula.
+    for _ in 0..family.textures.len() + surface.textures().len() {
+        for kind in [Kind::SampledImage, Kind::Sampler] {
+            out.push(Binding {
+                binding: out.len() as u32,
+                kind,
+            });
+        }
+    }
+    out
+}
+
+/// How many descriptors of each kind a set needs, for sizing a pool.
+///
+/// Returned in a fixed order rather than a map, because a pool wants a list and there are three
+/// kinds. A kind with no descriptors is left out: `vkCreateDescriptorPool` takes a zero count, but
+/// a pool sized for something nothing declares is a pool that hides a layout gone wrong.
+#[must_use]
+pub fn pool_sizes(bindings: &[Binding]) -> Vec<(Kind, u32)> {
+    [Kind::StorageBuffer, Kind::SampledImage, Kind::Sampler]
+        .into_iter()
+        .filter_map(|kind| {
+            let count = bindings.iter().filter(|b| b.kind == kind).count() as u32;
+            (count > 0).then_some((kind, count))
+        })
+        .collect()
 }

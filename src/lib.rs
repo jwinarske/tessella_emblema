@@ -107,6 +107,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod blocks;
 pub mod buffers;
 pub mod device;
 pub mod draws;

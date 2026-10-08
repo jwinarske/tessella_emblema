@@ -13,94 +13,18 @@
 //!
 //! Run with `cargo bench --bench geometry_store`.
 
+mod common;
+
 use ash::vk;
 use tessella_capture_abi::envelope::{GeometryId, SlabRef};
 use tessella_emblema::buffers::{self, Needs, Reads};
 use tessella_emblema::store::Store;
 use tessella_emblema::vertices::{Bound, Plan};
-use tessella_vk::Gpu;
 
-/// A device, open for as long as this lives.
-struct Open {
-    name: String,
-    _entry: ash::Entry,
-    instance: ash::Instance,
-    handle: ash::Device,
-    memory: vk::PhysicalDeviceMemoryProperties,
-}
+use common::Open;
 
-impl Open {
-    /// Opens the first device that enumerates, or says why not.
-    ///
-    /// Named for what it picks rather than what it does, because `Open::open` reads as a repeat.
-    ///
-    /// No queue is used and none is submitted to: a store creates buffers, binds them and maps the
-    /// allocation, and not one of those touches a queue. One is requested anyway because
-    /// `vkCreateDevice` requires at least one queue family.
-    fn first() -> Result<Self, String> {
-        // SAFETY: the loader is linked at run time and this is the documented entry point.
-        let entry = unsafe { ash::Entry::load() }.map_err(|why| format!("no loader: {why}"))?;
-        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
-        // SAFETY: the info is fully initialized and borrowed only for the call.
-        let instance = unsafe {
-            entry.create_instance(
-                &vk::InstanceCreateInfo::default().application_info(&app),
-                None,
-            )
-        }
-        .map_err(|why| format!("create_instance: {why}"))?;
-
-        // SAFETY: the instance is live.
-        let devices = unsafe { instance.enumerate_physical_devices() }
-            .map_err(|why| format!("enumerate: {why}"))?;
-        let physical = *devices.first().ok_or("no physical device")?;
-        // SAFETY: as above.
-        let properties = unsafe { instance.get_physical_device_properties(physical) };
-        let name = properties.device_name_as_c_str().map_or_else(
-            |_| "unnamed".to_owned(),
-            |raw| raw.to_string_lossy().into_owned(),
-        );
-        // SAFETY: as above.
-        let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
-
-        let priorities = [1.0f32];
-        let queues = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(0)
-            .queue_priorities(&priorities)];
-        // SAFETY: the info is fully initialized; family zero exists on every conformant device.
-        let device = unsafe {
-            instance.create_device(
-                physical,
-                &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
-                None,
-            )
-        }
-        .map_err(|why| format!("create_device: {why}"))?;
-
-        Ok(Self {
-            name,
-            _entry: entry,
-            instance,
-            handle: device,
-            memory,
-        })
-    }
-
-    fn gpu(&self) -> Gpu<'_> {
-        Gpu::new(&self.handle, &self.memory)
-    }
-}
-
-impl Drop for Open {
-    fn drop(&mut self) {
-        // SAFETY: every store built on this has been dropped by now -- they borrow the device, so the
-        // compiler will not let one outlive this.
-        unsafe {
-            self.handle.destroy_device(None);
-            self.instance.destroy_instance(None);
-        }
-    }
-}
+/// One checked behavior, named in the summary line.
+type Case = fn(&Open) -> Result<(), String>;
 
 const fn at(slab: u32, offset: u32, length: u32) -> SlabRef {
     SlabRef {
@@ -282,13 +206,15 @@ fn main() {
     };
     println!("device: {}", device.name);
 
+    // Called through the loop rather than listed as results: an array of `f(&device)` evaluates every
+    // case before the loop starts, which prints each FAIL after every other case's line.
     let mut failed = 0;
-    for (name, outcome) in [
-        ("round_trip", round_trip(&device)),
-        ("dedup", dedup(&device)),
-        ("refusals", refusals(&device)),
+    for (name, case) in [
+        ("round_trip", round_trip as Case),
+        ("dedup", dedup),
+        ("refusals", refusals),
     ] {
-        if let Err(why) = outcome {
+        if let Err(why) = case(&device) {
             println!("  {name:<21} FAIL {why}");
             failed += 1;
         }

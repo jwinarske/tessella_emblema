@@ -1063,6 +1063,112 @@ impl<'c> Recorder<'c> {
         }
     }
 
+    /// Binds a graphics pipeline.
+    pub fn bind_pipeline(&self, pipeline: vk::Pipeline) {
+        // SAFETY: the command buffer is recording and the pipeline belongs to this device.
+        unsafe {
+            self.device
+                .cmd_bind_pipeline(self.raw, vk::PipelineBindPoint::GRAPHICS, pipeline);
+        }
+    }
+
+    /// Binds one descriptor set at set zero.
+    ///
+    /// Set zero and no dynamic offsets, because that is what the modules declare: group zero and
+    /// nothing else, with every block bound at offset zero in a buffer of its own.
+    pub fn bind_descriptor_set(&self, layout: vk::PipelineLayout, set: vk::DescriptorSet) {
+        let sets = [set];
+        // SAFETY: the command buffer is recording; the layout and the set belong to this device,
+        // and the slices are read only for the call.
+        unsafe {
+            self.device.cmd_bind_descriptor_sets(
+                self.raw,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &sets,
+                &[],
+            );
+        }
+    }
+
+    /// Sets the stencil reference for both faces.
+    ///
+    /// Dynamic rather than baked: one mask pipeline draws every tile and the reference is the only
+    /// thing that differs, so baking it would mean a pipeline per tile.
+    pub fn stencil_reference(&self, reference: u32) {
+        // SAFETY: the command buffer is recording.
+        unsafe {
+            self.device.cmd_set_stencil_reference(
+                self.raw,
+                vk::StencilFaceFlags::FRONT_AND_BACK,
+                reference,
+            );
+        }
+    }
+
+    /// Binds vertex buffers from a first binding, each at its own offset.
+    pub fn bind_vertex_buffers(&self, first: u32, buffers: &[vk::Buffer], offsets: &[u64]) {
+        if buffers.is_empty() {
+            return;
+        }
+        // SAFETY: the command buffer is recording, every buffer belongs to this device, and the
+        // slices are the same length -- which `cmd_bind_vertex_buffers` requires and ash checks.
+        unsafe {
+            self.device
+                .cmd_bind_vertex_buffers(self.raw, first, buffers, offsets);
+        }
+    }
+
+    /// Binds the index buffer, as 16-bit indices.
+    ///
+    /// `UINT16`, because that is what the producer sends: a bucket's indices address one tile's
+    /// vertices and `EXTENT` is 8192, so sixteen bits is more than the range needs.
+    pub fn bind_index_buffer(&self, buffer: vk::Buffer) {
+        // SAFETY: the command buffer is recording and the buffer belongs to this device.
+        unsafe {
+            self.device
+                .cmd_bind_index_buffer(self.raw, buffer, 0, vk::IndexType::UINT16);
+        }
+    }
+
+    /// Draws without an index buffer.
+    ///
+    /// For a quad the vertex stage builds from its own index, which is what a clip mask is.
+    pub fn draw(&self, vertices: u32, instances: u32, first_instance: u32) {
+        // SAFETY: the command buffer is recording and inside a rendering scope.
+        unsafe {
+            self.device
+                .cmd_draw(self.raw, vertices, instances, 0, first_instance);
+        }
+    }
+
+    /// Draws indexed, from parameters `tessella_emblema::draws` computed.
+    ///
+    /// Takes them in the call's own argument order, which is the order that struct is written in --
+    /// so a field swapped between the two is a type error rather than a wrong picture.
+    pub fn draw_indexed(
+        &self,
+        index_count: u32,
+        instance_count: u32,
+        first_index: u32,
+        vertex_offset: i32,
+        first_instance: u32,
+    ) {
+        // SAFETY: the command buffer is recording, inside a rendering scope, with a pipeline and an
+        // index buffer bound.
+        unsafe {
+            self.device.cmd_draw_indexed(
+                self.raw,
+                index_count,
+                instance_count,
+                first_index,
+                vertex_offset,
+                first_instance,
+            );
+        }
+    }
+
     /// Clears a whole image in `TRANSFER_DST_OPTIMAL` to zero.
     ///
     /// For a newly created image, before anything is copied into it. `vkCreateImage` says nothing

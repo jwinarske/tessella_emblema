@@ -71,6 +71,10 @@ name = "descriptor_sets"
 harness = false
 
 [[bench]]
+name = "clip_masks"
+harness = false
+
+[[bench]]
 name = "draw_cost"
 harness = false
 

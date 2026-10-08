@@ -25,6 +25,7 @@ use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 
 use tessella_vk::{DescriptorSetLayout, Gpu, PipelineLayout};
 
+use crate::device::Attachment;
 use crate::families::Family;
 use crate::surface::Surface;
 use crate::vertices::Plan;
@@ -352,3 +353,209 @@ pub fn vertex_input(key: &Key) -> Result<VertexInput, Invalid> {
         attributes,
     })
 }
+
+/// What a pipeline renders into, by format rather than by handle.
+///
+/// There is no `VkRenderPass` and no `VkFramebuffer` here. Dynamic rendering is core in Vulkan 1.3
+/// and reported by every part this runs on -- RADV, V3D 7.1.7.0 and the `VeriSilicon` `GC7000UL` --
+/// so a pipeline names the *formats* it is compatible with and a frame names the image views.
+///
+/// That is not a tidiness preference. #60's contract is a ring of at least three host images, and
+/// says the pass "must not cache per-image state that breaks when the image changes every frame".
+/// A framebuffer is precisely that state: one per image, and one more whenever the ring is resized.
+/// Formats are shared by the whole ring, so there is nothing per-image left to invalidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Targets {
+    /// The host image's format, which the pass is handed rather than choosing.
+    pub color: vk::Format,
+    /// The depth-stencil format, from [`crate::device::depth_stencil_format`].
+    pub depth_stencil: vk::Format,
+    /// Whether this view keeps depth, or only stencil.
+    pub attachment: Attachment,
+}
+
+/// The viewport and scissor are set per draw, not baked.
+///
+/// One pipeline then serves a ring of images of any size, which is the other half of what dynamic
+/// rendering buys: baking the viewport would need a pipeline per target size, and #60's host may
+/// resize its ring. The cost is two `vkCmdSet` calls per pass, which is not a measurement anyone
+/// needs to take.
+const DYNAMIC: [vk::DynamicState; 2] = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+
+/// The depth and stencil state for a view.
+///
+/// Stencil always, because the per-tile clip masks are what the stencil buffer is for: §2.2 draws a
+/// mask quad per tile and every content draw tests against it. Depth only when the view has an
+/// extrusion -- [`Attachment`] is where that is decided, and a view of flat layers can take a
+/// stencil-only format, which on a tiler is less to write back.
+///
+/// `KEEP` on every stencil op and `EQUAL` as the compare: a content draw reads the mask and does not
+/// write it. Whoever draws the masks sets its own stencil state, which is a later slice -- this is
+/// the state the *content* pipelines want.
+pub fn depth_stencil(attachment: Attachment) -> vk::PipelineDepthStencilStateCreateInfo<'static> {
+    let keep = vk::StencilOpState {
+        fail_op: vk::StencilOp::KEEP,
+        pass_op: vk::StencilOp::KEEP,
+        depth_fail_op: vk::StencilOp::KEEP,
+        compare_op: vk::CompareOp::EQUAL,
+        compare_mask: 0xFF,
+        write_mask: 0,
+        reference: 0,
+    };
+    let depth = matches!(attachment, Attachment::DepthStencil);
+    vk::PipelineDepthStencilStateCreateInfo::default()
+        // Tested and written only where there is depth to keep. A flat view that enabled the test
+        // against a stencil-only attachment would be reading an attachment it does not have.
+        .depth_test_enable(depth)
+        .depth_write_enable(depth)
+        .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
+        .stencil_test_enable(true)
+        .front(keep)
+        .back(keep)
+}
+
+/// Straight alpha blending over the target.
+///
+/// `SRC_ALPHA, ONE_MINUS_SRC_ALPHA` on color and `ONE, ONE_MINUS_SRC_ALPHA` on alpha, which is
+/// premultiplied-correct compositing of a straight-alpha source: the color factor premultiplies as
+/// it blends, and the alpha factor must not premultiply again. mbgl's own default.
+///
+/// Per layer rather than per family is a later decision -- a few layers ask for additive, and the
+/// heatmap accumulates -- so this is the default a content pipeline gets and the place that choice
+/// will be threaded through.
+pub fn blend() -> vk::PipelineColorBlendAttachmentState {
+    vk::PipelineColorBlendAttachmentState::default()
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .alpha_blend_op(vk::BlendOp::ADD)
+        .color_write_mask(vk::ColorComponentFlags::RGBA)
+}
+
+/// No culling.
+///
+/// A fill's triangles come from an earcut tessellation and a line's from a stroker, and neither
+/// promises a winding order. mbgl does not cull either. Culling the wrong way is a layer that
+/// disappears at some zooms and not others, which is a bug nobody finds quickly, and the saving on a
+/// tiler is a fraction of a pass.
+pub fn rasterization() -> vk::PipelineRasterizationStateCreateInfo<'static> {
+    vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0)
+}
+
+/// The entry points `crate::shaders::module` emits, as the names Vulkan wants.
+const VERTEX_ENTRY: &core::ffi::CStr = c"vertex_main";
+const FRAGMENT_ENTRY: &core::ffi::CStr = c"fragment_main";
+
+/// Builds the pipeline a key describes, against the targets given.
+///
+/// Both stages come from one module, which is what `shaders::module` assembles: one text, two entry
+/// points. The same handle is named twice rather than compiled twice.
+///
+/// Everything not derived from the key is a decision with a reason beside it --
+/// [`depth_stencil`], [`blend`], [`rasterization`], and the dynamic viewport and scissor. The
+/// topology is a triangle list because every bucket this crate draws is indexed triangles; a line is
+/// a stroked quad pair and a circle is a quad, both tessellated by the producer.
+///
+/// # Errors
+///
+/// [`Error::Invalid`] when the key's layout cannot be described, and [`Error::Device`] when the
+/// device refuses the pipeline.
+pub fn build<'d>(
+    gpu: Gpu<'d>,
+    key: &Key,
+    layout: &Layout<'_>,
+    module: &tessella_vk::ShaderModule<'_>,
+    targets: Targets,
+) -> Result<tessella_vk::Pipeline<'d>, Error> {
+    let input = vertex_input(key)?;
+    let vertex_state = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(&input.bindings)
+        .vertex_attribute_descriptions(&input.attributes);
+
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(module.raw())
+            .name(VERTEX_ENTRY),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(module.raw())
+            .name(FRAGMENT_ENTRY),
+    ];
+    let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    // Counts without pointers: the values are set per draw, so only the counts are baked.
+    let viewport = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+    let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&DYNAMIC);
+    let raster = rasterization();
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let depth = depth_stencil(targets.attachment);
+    let attachments = [blend()];
+    let blending = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
+
+    // The attachments by format, which is what replaces the render pass handle. The stencil format
+    // is the same attachment as the depth one -- these are packed formats, so naming it twice is
+    // naming one image twice.
+    let colors = [targets.color];
+    let mut rendering = vk::PipelineRenderingCreateInfo::default()
+        .color_attachment_formats(&colors)
+        .depth_attachment_format(targets.depth_stencil)
+        .stencil_attachment_format(targets.depth_stencil);
+
+    let create = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vertex_state)
+        .input_assembly_state(&assembly)
+        .viewport_state(&viewport)
+        .rasterization_state(&raster)
+        .multisample_state(&multisample)
+        .depth_stencil_state(&depth)
+        .color_blend_state(&blending)
+        .dynamic_state(&dynamic)
+        .layout(layout.pipeline())
+        .push_next(&mut rendering);
+
+    Ok(gpu.graphics_pipeline(&create)?)
+}
+
+/// Why a pipeline could not be built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Error {
+    /// The key's vertex input cannot be described.
+    Invalid(Invalid),
+    /// The device refused.
+    Device(tessella_vk::Error),
+}
+
+impl From<Invalid> for Error {
+    fn from(why: Invalid) -> Self {
+        Self::Invalid(why)
+    }
+}
+
+impl From<tessella_vk::Error> for Error {
+    fn from(why: tessella_vk::Error) -> Self {
+        Self::Device(why)
+    }
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Invalid(why) => write!(f, "{why}"),
+            Self::Device(why) => write!(f, "{why}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}

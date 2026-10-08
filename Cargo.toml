@@ -59,6 +59,10 @@ name = "descriptor_layouts"
 harness = false
 
 [[bench]]
+name = "pipelines_build"
+harness = false
+
+[[bench]]
 name = "draw_cost"
 harness = false
 

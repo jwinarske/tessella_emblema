@@ -22,6 +22,7 @@ pub struct Open {
     handle: ash::Device,
     memory: vk::PhysicalDeviceMemoryProperties,
     pub limits: vk::PhysicalDeviceLimits,
+    physical: vk::PhysicalDevice,
 }
 
 impl Open {
@@ -63,11 +64,19 @@ impl Open {
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(0)
             .queue_priorities(&priorities)];
+        // Dynamic rendering, which the pass requires rather than prefers -- see
+        // `device::check_dynamic_rendering`. Core in Vulkan 1.3 and reported by every part this runs
+        // on, but a feature still has to be *enabled* at device creation to be used, and a pipeline
+        // chaining `VkPipelineRenderingCreateInfo` without it is invalid usage that a driver need
+        // not report.
+        let mut thirteen = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
         // SAFETY: the info is fully initialized; family zero exists on every conformant device.
         let device = unsafe {
             instance.create_device(
                 physical,
-                &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
+                &vk::DeviceCreateInfo::default()
+                    .queue_create_infos(&queues)
+                    .push_next(&mut thirteen),
                 None,
             )
         }
@@ -80,7 +89,17 @@ impl Open {
             handle: device,
             memory,
             limits,
+            physical,
         })
+    }
+
+    /// What the device will do with a format, for the queries `device.rs` takes as a closure.
+    pub fn format_properties(&self, format: vk::Format) -> vk::FormatProperties {
+        // SAFETY: the instance and the physical device are live.
+        unsafe {
+            self.instance
+                .get_physical_device_format_properties(self.physical, format)
+        }
     }
 
     pub fn gpu(&self) -> Gpu<'_> {

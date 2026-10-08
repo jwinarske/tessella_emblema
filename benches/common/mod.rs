@@ -36,7 +36,11 @@ impl Open {
     pub fn first() -> Result<Self, String> {
         // SAFETY: the loader is linked at run time and this is the documented entry point.
         let entry = unsafe { ash::Entry::load() }.map_err(|why| format!("no loader: {why}"))?;
-        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
+        // 1.3, because the pass requires dynamic rendering and `vkCmdBeginRendering` is 1.3 core.
+        // ash loads an entry point only when the declared version covers it, so an instance asking
+        // for 1.1 gets a null pointer and panics on the first call rather than failing to create --
+        // which is what this said before and how it was found.
+        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
         // SAFETY: the info is fully initialized and borrowed only for the call.
         let instance = unsafe {
             entry.create_instance(

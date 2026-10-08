@@ -103,7 +103,18 @@ image views. That is #60's own requirement rather than a preference: the host pa
 images and the pass "must not cache per-image state that breaks when the image changes every frame",
 which is exactly what a framebuffer is.
 
-Still to come: the hand-off.
+And the hand-off: `target` renders into an image the host allocated. The host owns the ring, states
+what layout each image is in, and submits the frames itself; this pass records and never submits, so
+the semaphore stays the host's to export. The only state the pass keeps for a target is its
+depth-stencil attachment, and that is keyed by *size and format* rather than by image -- the ring
+shares both, so one attachment serves all three and is remade only on a resize. The image comes back
+in `target::LEAVES_IN`, which is `GENERAL`, because a dma-buf importer cannot be told a vendor's
+optimal layout.
+
+That completes #60's order. What is not here yet is the draw list itself: `tessella-consume` reads
+the stream and this crate can build every pipeline and every store, but nothing yet walks an
+`OrderUpdate` and records the draws, and descriptor sets are still allocated per bench rather than
+by the library.
 `tessella-consume` (the reader, draw list and stencil partition) lives once in the tessella
 workspace and carries a texture update's channel type and payload shape, which the format and
 staging decisions both read.

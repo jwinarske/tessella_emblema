@@ -63,6 +63,10 @@ name = "pipelines_build"
 harness = false
 
 [[bench]]
+name = "hand_off"
+harness = false
+
+[[bench]]
 name = "draw_cost"
 harness = false
 

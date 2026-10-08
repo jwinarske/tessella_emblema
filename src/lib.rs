@@ -121,6 +121,7 @@ pub mod spec;
 mod spirv;
 pub mod store;
 pub mod surface;
+pub mod target;
 pub mod textures;
 pub mod uniforms;
 pub mod vertices;

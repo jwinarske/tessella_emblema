@@ -23,6 +23,8 @@
 use ash::vk;
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 
+use tessella_vk::{DescriptorSetLayout, Gpu, PipelineLayout};
+
 use crate::families::Family;
 use crate::surface::Surface;
 use crate::vertices::Plan;
@@ -179,4 +181,82 @@ pub fn pool_sizes(bindings: &[Binding]) -> Vec<(Kind, u32)> {
             (count > 0).then_some((kind, count))
         })
         .collect()
+}
+
+/// The descriptor set layout a family's draws are recorded against, and the pipeline layout over it.
+///
+/// Held together because neither is useful alone: the set layout allocates the sets and the pipeline
+/// layout binds them, and a pipeline built against one must be bound with sets from the other.
+pub struct Layout<'d> {
+    set: DescriptorSetLayout<'d>,
+    pipeline: PipelineLayout<'d>,
+}
+
+impl core::fmt::Debug for Layout<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Layout").finish_non_exhaustive()
+    }
+}
+
+impl Layout<'_> {
+    /// The set layout, for allocating a descriptor set.
+    #[must_use]
+    pub fn set(&self) -> vk::DescriptorSetLayout {
+        self.set.raw()
+    }
+
+    /// The pipeline layout, for creating a pipeline and binding its descriptors.
+    #[must_use]
+    pub fn pipeline(&self) -> vk::PipelineLayout {
+        self.pipeline.raw()
+    }
+}
+
+/// Which stages see a family's descriptors.
+///
+/// Both, for every binding. A block is read where the body reads it and the body is one text
+/// compiled into two entry points -- `tessella_emblema` assembles one module per (family, surface)
+/// and names `vs_main` and `fs_main` in it -- so a binding visible to one stage and not the other
+/// would be a module that does not build against its own layout.
+///
+/// Narrowing this per binding would need the module's own reflection to say which stage touches
+/// which block, and `vkCreateGraphicsPipelines` rejects a layout that is too narrow. The cost of
+/// both is that a driver cannot prove a block is unread in a stage; the cost of guessing is a
+/// pipeline that does not build.
+const BOTH_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::from_raw(
+    vk::ShaderStageFlags::VERTEX.as_raw() | vk::ShaderStageFlags::FRAGMENT.as_raw(),
+);
+
+/// The `VkDescriptorSetLayoutBinding` list for a family's descriptors.
+///
+/// Split from [`layout`] so it can be inspected without a device, and because the bench wants to
+/// count the kinds against the device's own limits before it tries to create anything.
+#[must_use]
+pub fn set_bindings(bindings: &[Binding]) -> Vec<vk::DescriptorSetLayoutBinding<'static>> {
+    bindings
+        .iter()
+        .map(|binding| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(binding.binding)
+                .descriptor_type(binding.kind.descriptor_type())
+                .descriptor_count(1)
+                .stage_flags(BOTH_STAGES)
+        })
+        .collect()
+}
+
+/// Creates the layouts for a family's descriptor set.
+///
+/// # Errors
+///
+/// [`tessella_vk::Error::Call`] when the device refuses either layout, which is what asking for more
+/// descriptors of a kind than `maxPerStageDescriptor*` allows produces. The widest set this crate
+/// declares is twelve bindings -- five storage buffers, four sampled images and four samplers -- and
+/// Vulkan's own floor for `maxPerStageDescriptorStorageBuffers` is four, so this is a limit a
+/// conformant device may genuinely be under.
+pub fn layout<'d>(gpu: Gpu<'d>, bindings: &[Binding]) -> Result<Layout<'d>, tessella_vk::Error> {
+    let described = set_bindings(bindings);
+    let set = gpu.set_layout(&described)?;
+    let pipeline = gpu.pipeline_layout(&set)?;
+    Ok(Layout { set, pipeline })
 }

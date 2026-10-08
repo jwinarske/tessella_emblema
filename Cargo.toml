@@ -55,6 +55,10 @@ name = "texture_images"
 harness = false
 
 [[bench]]
+name = "descriptor_layouts"
+harness = false
+
+[[bench]]
 name = "draw_cost"
 harness = false
 

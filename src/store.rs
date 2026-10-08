@@ -28,7 +28,7 @@
 use std::collections::BTreeMap;
 
 use ash::vk;
-use tessella_capture_abi::envelope::{GeometryId, SlabRef};
+use tessella_capture_abi::envelope::{GeometryId, Segment, SlabRef};
 use tessella_vk::{Buffer, Gpu, Requirements};
 
 use crate::buffers::Needs;
@@ -160,6 +160,28 @@ struct Held<'d> {
     /// Where each vertex buffer starts, for reading one back without recomputing the layout from an
     /// alignment this no longer has.
     offsets: Vec<u64>,
+    /// The handles `vkCmdBindVertexBuffers` wants, in binding order.
+    ///
+    /// Precomputed here rather than gathered per draw. `Needs::reads` maps a binding slot to a
+    /// buffer *index*, and the dedup makes that non-trivial -- three bindings over one interleaved
+    /// buffer are three entries naming one handle -- so a draw would otherwise walk `reads` and
+    /// allocate two vectors every time. A batch is bound thousands of times a frame, and
+    /// `tessella_consume::batch::Batches` already records what per-draw allocation costs at that
+    /// rate: "at the quad's entry count that was 15,000 allocations a frame".
+    bound: Vec<vk::Buffer>,
+    /// Zero per binding, parallel to [`Self::bound`].
+    ///
+    /// Zero because each buffer is bound to its own allocation offset already -- the offsets in
+    /// `offsets` are inside the geometry's allocation, not inside a buffer. Kept as a vector
+    /// because `vkCmdBindVertexBuffers` wants a slice as long as the handles, and building one per
+    /// draw is the allocation this exists to avoid.
+    offsets_in_buffer: Vec<u64>,
+    /// The segments the draws come from.
+    ///
+    /// Arrives with the geometry and is otherwise discarded. `draws::indexed` turns it into
+    /// `vkCmdDrawIndexed` parameters, and nothing else in the crate holds it -- so a draw recorded
+    /// from the store alone was impossible before this.
+    segments: Vec<Segment>,
 }
 
 impl<'d> Store<'d> {
@@ -187,6 +209,28 @@ impl<'d> Store<'d> {
     #[must_use]
     pub fn vertex_buffer(&self, geometry: GeometryId, at: usize) -> Option<vk::Buffer> {
         Some(self.held.get(&geometry)?.vertices.get(at)?.raw())
+    }
+
+    /// The vertex buffers to bind, and their offsets, in binding order.
+    ///
+    /// Ready for `vkCmdBindVertexBuffers` from binding zero: one entry per binding the plan
+    /// declares, with a buffer repeated where several bindings read one interleaved vertex.
+    #[must_use]
+    pub fn bindings(&self, geometry: GeometryId) -> Option<(&[vk::Buffer], &[u64])> {
+        let held = self.held.get(&geometry)?;
+        Some((&held.bound, &held.offsets_in_buffer))
+    }
+
+    /// The segments this geometry draws, which [`crate::draws::indexed`] turns into draw
+    /// parameters.
+    ///
+    /// Empty for a geometry the store does not hold, which is the same answer as a geometry with no
+    /// segments -- and both mean the same thing to a caller: nothing to draw.
+    #[must_use]
+    pub fn segments(&self, geometry: GeometryId) -> &[Segment] {
+        self.held
+            .get(&geometry)
+            .map_or(&[], |held| held.segments.as_slice())
     }
 
     /// This geometry's index buffer, if it has one.
@@ -260,6 +304,7 @@ impl<'d> Store<'d> {
         gpu: Gpu<'d>,
         geometry: GeometryId,
         needs: &Needs,
+        segments: &[Segment],
         resolve: &dyn Fn(SlabRef) -> Option<&'bytes [u8]>,
     ) -> Result<(), Error> {
         // Resolved before anything is created, so a protocol fault costs no device objects.
@@ -341,6 +386,16 @@ impl<'d> Store<'d> {
             }
         }
 
+        // The bind list, in binding order. `reads` is ordered by the plan, which is ordered by the
+        // `@location` each attribute declares -- so this is already the order
+        // `vkCmdBindVertexBuffers` wants from binding zero.
+        let bound: Vec<vk::Buffer> = needs
+            .reads
+            .iter()
+            .map(|read| vertices[read.buffer].raw())
+            .collect();
+        let offsets_in_buffer = vec![0; bound.len()];
+
         self.held.insert(
             geometry,
             Held {
@@ -348,6 +403,9 @@ impl<'d> Store<'d> {
                 indexes,
                 memory,
                 offsets: placed.vertices.iter().map(|at| at.offset).collect(),
+                bound,
+                offsets_in_buffer,
+                segments: segments.to_vec(),
             },
         );
         Ok(())

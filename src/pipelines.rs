@@ -260,3 +260,95 @@ pub fn layout<'d>(gpu: Gpu<'d>, bindings: &[Binding]) -> Result<Layout<'d>, tess
     let pipeline = gpu.pipeline_layout(&set)?;
     Ok(Layout { set, pipeline })
 }
+
+/// The vertex input state a key describes, as Vulkan wants it.
+///
+/// One binding and one attribute per slot, with the binding number equal to the `@location` --
+/// which is what [`Slot::slot`] is, and what the producer's own descriptors say.
+///
+/// # The interleaved case is three bindings, not one
+///
+/// `buffers::needs` deduplicates three descriptors over one twelve-byte vertex into one *buffer*,
+/// and keeps three `Reads`, each with its own slot. So the pipeline sees three bindings of stride
+/// twelve at offsets zero, four and eight, and the draw binds one buffer handle to all three. The
+/// dedup saves the allocation, not the binding.
+///
+/// That is worth stating because the other reading is tempting and wrong: one binding read by three
+/// attributes would need the three to agree about the stride, and nothing in a `Plan` makes them
+/// distinct slots if they are one binding. They are distinct slots, so they are distinct bindings.
+/// `ash`'s description structs implement neither `PartialEq` nor `Eq`, so neither does this. A test
+/// comparing two of these compares the fields it cares about, which is the honest thing anyway: a
+/// derived equality over a `#[repr(C)]` Vulkan struct also compares its padding.
+#[derive(Debug, Clone, Default)]
+pub struct VertexInput {
+    /// One per binding, in slot order.
+    pub bindings: Vec<vk::VertexInputBindingDescription>,
+    /// One per attribute, in slot order.
+    pub attributes: Vec<vk::VertexInputAttributeDescription>,
+}
+
+/// Why a key cannot become vertex input state.
+///
+/// One variant, because the binding number *is* the location: two slots clash at a binding exactly
+/// when they clash at a location, so there is nothing a second variant could distinguish. An
+/// earlier version of this had one for a binding claimed twice with two strides, which cannot
+/// happen -- the slots would have to be equal to share a binding and distinct to disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Invalid {
+    /// Two slots claim one `@location`, and so one binding number.
+    ///
+    /// A module declares each location once, so this is a plan naming the same shader input twice.
+    /// `vkCreateGraphicsPipelines` rejects it too, as a duplicated binding; this says which.
+    RepeatedLocation {
+        /// The location claimed twice.
+        location: u32,
+    },
+}
+
+impl core::fmt::Display for Invalid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::RepeatedLocation { location } => {
+                write!(f, "location {location} is claimed twice")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Invalid {}
+
+/// The vertex input state for a key.
+///
+/// # Errors
+///
+/// [`Invalid::RepeatedLocation`] for a layout claiming one location twice.
+pub fn vertex_input(key: &Key) -> Result<VertexInput, Invalid> {
+    let mut bindings: Vec<vk::VertexInputBindingDescription> = Vec::new();
+    let mut attributes: Vec<vk::VertexInputAttributeDescription> = Vec::new();
+
+    for slot in &key.layout {
+        if attributes.iter().any(|a| a.location == slot.slot) {
+            return Err(Invalid::RepeatedLocation {
+                location: slot.slot,
+            });
+        }
+        bindings.push(
+            vk::VertexInputBindingDescription::default()
+                .binding(slot.slot)
+                .stride(slot.stride)
+                .input_rate(slot.rate),
+        );
+        attributes.push(
+            vk::VertexInputAttributeDescription::default()
+                .location(slot.slot)
+                .binding(slot.slot)
+                .format(slot.format)
+                .offset(slot.offset),
+        );
+    }
+
+    Ok(VertexInput {
+        bindings,
+        attributes,
+    })
+}

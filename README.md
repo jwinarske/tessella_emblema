@@ -95,7 +95,15 @@ first part of this crate to need a command buffer, because an optimally tiled im
 -- so `tessella-vk` gained `Image`, `ImageView` and a `Recorder` that records into a command buffer
 somebody else owns. This module records and never submits; the queue stays with the host.
 
-Still to come, in dependency order: the pipelines these modules become, and the hand-off.
+The pipelines are here too: `pipelines` keys them, describes the descriptor set its module
+declares, turns the key into vertex input state, and builds the pipeline. **There is no
+`VkRenderPass` and no `VkFramebuffer`** -- dynamic rendering is core in Vulkan 1.3 and reported by
+every part this runs on, so a pipeline names the formats it is compatible with and a frame names the
+image views. That is #60's own requirement rather than a preference: the host passes a ring of
+images and the pass "must not cache per-image state that breaks when the image changes every frame",
+which is exactly what a framebuffer is.
+
+Still to come: the hand-off.
 `tessella-consume` (the reader, draw list and stencil partition) lives once in the tessella
 workspace and carries a texture update's channel type and payload shape, which the format and
 staging decisions both read.

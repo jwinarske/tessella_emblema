@@ -47,12 +47,41 @@ pub enum Unsupported {
     /// Carries the first one found, because the fix is per format and a list of every failure is
     /// no more actionable than the first.
     VertexFormat(vk::Format),
+    /// The device cannot do dynamic rendering.
+    ///
+    /// Required rather than optional, and the reason is #60's own contract: the host passes a ring
+    /// of at least three images and the pass "must not cache per-image state that breaks when the
+    /// image changes every frame". A `VkFramebuffer` is exactly that state -- one per image, and one
+    /// per size if the ring is ever resized -- so a render pass would make the requirement a
+    /// cache-invalidation problem instead of a non-problem.
+    ///
+    /// It costs nothing on the parts this runs on: core in Vulkan 1.3, and `dynamicRendering` is
+    /// reported `true` by RADV, by V3D 7.1.7.0 (the gating target) and by the `VeriSilicon`
+    /// `GC7000UL`.
+    NoDynamicRendering,
     /// A texture format the producer can send cannot be sampled or written here.
     ///
     /// The first one found, as for [`Self::VertexFormat`]. A device without one of these cannot
     /// draw a layer that samples it -- a glyph atlas missing is a map with no labels -- so it is
     /// an error at creation rather than a layer quietly skipped.
     TextureFormat(vk::Format),
+}
+
+/// Checks the device can render without a render pass.
+///
+/// Takes the feature bit rather than a `vk::PhysicalDevice`, which is what makes it testable without
+/// a GPU -- the caller reads `VkPhysicalDeviceVulkan13Features::dynamicRendering` and this decides
+/// what to do about it.
+///
+/// # Errors
+///
+/// [`Unsupported::NoDynamicRendering`] when the device does not have it.
+pub fn check_dynamic_rendering(supported: bool) -> Result<(), Unsupported> {
+    if supported {
+        Ok(())
+    } else {
+        Err(Unsupported::NoDynamicRendering)
+    }
 }
 
 /// Which `VkFormat` a texture of this pixel and channel type is, as mbgl's Vulkan backend decides.

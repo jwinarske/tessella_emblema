@@ -341,6 +341,38 @@ impl<'d> Gpu<'d> {
         })
     }
 
+    /// Creates one graphics pipeline, destroyed when the returned value is dropped.
+    ///
+    /// Takes the whole `VkGraphicsPipelineCreateInfo` rather than assembling it: every field of it
+    /// is a decision with a reason, and those belong to the pass.
+    /// `tessella_emblema::pipelines::build` is where they are made and written down.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Call`] if `vkCreateGraphicsPipelines` fails. Note what that does *not* cover: on the
+    /// `VeriSilicon` `GC7000UL` this call segfaults on SPIR-V the driver cannot digest -- see
+    /// jwinarske/vivante-spirv-crash -- which no `Result` can report.
+    pub fn graphics_pipeline(
+        self,
+        create: &vk::GraphicsPipelineCreateInfo<'_>,
+    ) -> Result<Pipeline<'d>, Error> {
+        let infos = [*create];
+        // SAFETY: the create info is the caller's, fully initialized, and borrowed only for the
+        // call; the device outlives the returned pipeline by the lifetime on `Gpu`.
+        let raw = unsafe {
+            self.device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &infos, None)
+        }
+        .map_err(|(_, result)| Error::Call {
+            call: "vkCreateGraphicsPipelines",
+            result,
+        })?;
+        Ok(Pipeline {
+            device: self.device,
+            raw: raw[0],
+        })
+    }
+
     /// Allocates memory able to back every one of `requirements`, with the properties given.
     ///
     /// The returned allocation is `size` bytes, which the caller chooses: it is laying the buffers out
@@ -981,5 +1013,35 @@ impl Drop for PipelineLayout<'_> {
         // SAFETY: made by this device, which outlives this, and destroyed exactly once. A pipeline
         // built with it may outlive it, which Vulkan allows.
         unsafe { self.device.destroy_pipeline_layout(self.raw, None) };
+    }
+}
+
+/// A graphics pipeline, destroyed when dropped.
+pub struct Pipeline<'d> {
+    device: &'d ash::Device,
+    raw: vk::Pipeline,
+}
+
+impl core::fmt::Debug for Pipeline<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Pipeline").field(&self.raw).finish()
+    }
+}
+
+impl Pipeline<'_> {
+    /// The handle, for binding it in a recorded draw.
+    ///
+    /// Copying it out does not extend its life, as for [`Buffer::raw`]: a recorded bind must be
+    /// submitted and completed before this is dropped.
+    #[must_use]
+    pub fn raw(&self) -> vk::Pipeline {
+        self.raw
+    }
+}
+
+impl Drop for Pipeline<'_> {
+    fn drop(&mut self) {
+        // SAFETY: made by this device, which outlives this, and destroyed exactly once.
+        unsafe { self.device.destroy_pipeline(self.raw, None) };
     }
 }

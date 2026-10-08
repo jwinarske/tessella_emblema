@@ -373,6 +373,36 @@ impl<'d> Gpu<'d> {
         })
     }
 
+    /// Creates a depth-stencil view of a whole image, destroyed when dropped.
+    ///
+    /// Both aspects, for the reason [`WHOLE_DEPTH_STENCIL`] gives. As [`Self::view`], the image must
+    /// already be bound to memory.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Call`] if `vkCreateImageView` fails.
+    pub fn depth_view(self, image: &Image<'_>, format: vk::Format) -> Result<ImageView<'d>, Error> {
+        // SAFETY: as `view`; the create info is fully initialized and names an image of this device.
+        let raw = unsafe {
+            self.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image.raw)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(WHOLE_DEPTH_STENCIL),
+                None,
+            )
+        }
+        .map_err(|result| Error::Call {
+            call: "vkCreateImageView",
+            result,
+        })?;
+        Ok(ImageView {
+            device: self.device,
+            raw,
+        })
+    }
+
     /// Allocates memory able to back every one of `requirements`, with the properties given.
     ///
     /// The returned allocation is `size` bytes, which the caller chooses: it is laying the buffers out
@@ -421,6 +451,21 @@ impl<'d> Gpu<'d> {
         })
     }
 }
+
+/// Every depth and stencil level of an image.
+///
+/// Both aspects in one view, which is what a packed depth-stencil format wants: the rendering scope
+/// names the same view as its depth attachment and as its stencil attachment, because they are one
+/// image. A view of a single aspect could be one or the other and not both.
+const WHOLE_DEPTH_STENCIL: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
+    aspect_mask: vk::ImageAspectFlags::from_raw(
+        vk::ImageAspectFlags::DEPTH.as_raw() | vk::ImageAspectFlags::STENCIL.as_raw(),
+    ),
+    base_mip_level: 0,
+    level_count: 1,
+    base_array_layer: 0,
+    layer_count: 1,
+};
 
 /// Every color level and layer of an image, which is all any texture here has.
 ///
@@ -843,6 +888,110 @@ impl<'c> Recorder<'c> {
                 &[],
                 &[barrier],
             );
+        }
+    }
+
+    /// Opens a rendering scope over one color attachment and one depth-stencil attachment.
+    ///
+    /// The dynamic-rendering replacement for a render pass and a framebuffer: the views are named
+    /// here, per frame, so nothing per-image is cached anywhere. Both attachments must already be in
+    /// the layouts named below, which the caller transitions them into.
+    ///
+    /// The color attachment loads rather than clears when `clear` is `None`, which is how a host
+    /// image that already holds something is drawn over. The depth-stencil attachment always clears:
+    /// it is the pass's own, nothing outside the frame reads it, and a frame that inherited the last
+    /// one's depth would hide geometry behind a surface that is no longer there.
+    ///
+    /// Must be closed with [`Self::end_rendering`] before the command buffer ends.
+    pub fn begin_rendering(
+        &self,
+        color: &ImageView<'_>,
+        depth_stencil: &ImageView<'_>,
+        width: u32,
+        height: u32,
+        clear: Option<[f32; 4]>,
+    ) {
+        let mut color_attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(color.raw)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .store_op(vk::AttachmentStoreOp::STORE);
+        color_attachment = match clear {
+            Some(rgba) => color_attachment
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue { float32: rgba },
+                }),
+            None => color_attachment.load_op(vk::AttachmentLoadOp::LOAD),
+        };
+        let colors = [color_attachment];
+
+        // Depth one and stencil zero, which is what the tile masks and the extrusion prepass both
+        // expect to start from.
+        let cleared = vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
+        };
+        let depth = vk::RenderingAttachmentInfo::default()
+            .image_view(depth_stencil.raw)
+            .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            // Nothing outside the frame reads it, so there is no reason to write it back -- which on
+            // a tiler is the saving that matters most about saying so.
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .clear_value(cleared);
+
+        let info = vk::RenderingInfo::default()
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D { width, height },
+            })
+            .layer_count(1)
+            .color_attachments(&colors)
+            .depth_attachment(&depth)
+            .stencil_attachment(&depth);
+
+        // SAFETY: the command buffer is recording, the views belong to this device, and the info is
+        // fully initialized and borrowed only for the call.
+        unsafe { self.device.cmd_begin_rendering(self.raw, &info) };
+    }
+
+    /// Closes the rendering scope.
+    pub fn end_rendering(&self) {
+        // SAFETY: the command buffer is recording and inside a scope `begin_rendering` opened.
+        unsafe { self.device.cmd_end_rendering(self.raw) };
+    }
+
+    /// Sets the viewport and scissor to the whole of a target.
+    ///
+    /// Both are dynamic state, which is what lets one pipeline serve a ring of any size --
+    /// `tessella_emblema::pipelines` says why. The viewport's y runs down, matching the clip space
+    /// naga emits.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a u32 to f32 cast is exact below 2^24, and a viewport is bounded by \
+                  maxViewportDimensions -- measured 4096 on V3D, 8192 on the GC7000UL and 16384 on \
+                  RADV, all three orders of magnitude inside it. A target larger than 16,777,216 \
+                  pixels on a side is not a thing this pass can be handed."
+    )]
+    pub fn viewport(&self, width: u32, height: u32) {
+        let viewports = [vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: width as f32,
+            height: height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }];
+        let scissors = [vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D { width, height },
+        }];
+        // SAFETY: the command buffer is recording; both slices are read only for the call.
+        unsafe {
+            self.device.cmd_set_viewport(self.raw, 0, &viewports);
+            self.device.cmd_set_scissor(self.raw, 0, &scissors);
         }
     }
 

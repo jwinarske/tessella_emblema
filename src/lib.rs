@@ -112,6 +112,7 @@ pub mod buffers;
 pub mod device;
 pub mod draws;
 pub mod families;
+pub mod images;
 pub mod pipelines;
 pub mod preamble;
 pub mod residency;

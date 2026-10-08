@@ -361,7 +361,16 @@ pub fn staging(
     pixel: TexturePixelType,
     channel: TextureChannelDataType,
 ) -> Staging {
-    let texel = texel(pixel, channel);
+    staging_for(rects, size, texel(pixel, channel))
+}
+
+/// [`staging`] for a caller that already has the texel size.
+///
+/// The image store holds a texture's texel rather than the pixel and channel types it came from,
+/// because the texel is all the staging arithmetic uses and keeping both would be two things that
+/// can disagree.
+#[must_use]
+pub fn staging_for(rects: &[Rect16], size: Extent, texel: u64) -> Staging {
     let alignment = copy_alignment(texel);
     let whole = Rect16 {
         x: 0,

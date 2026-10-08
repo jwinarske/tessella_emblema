@@ -20,6 +20,8 @@
 //! [`crate::vertices::plan_instanced`] sets it from which run a descriptor arrived in, so the
 //! field has a source rather than being a placeholder.
 
+use std::collections::HashMap;
+
 use ash::vk;
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 
@@ -670,4 +672,181 @@ pub fn build_mask<'d>(
         .push_next(&mut rendering);
 
     Ok(gpu.graphics_pipeline(&create)?)
+}
+
+/// The pipelines a frame has built, by key.
+///
+/// # Why a cache at all
+///
+/// `vkCreateGraphicsPipelines` compiles the shader. On the gating target that is tens of
+/// milliseconds for the 57 modules together, and a frame that rebuilt a pipeline per batch would
+/// pay it per batch -- a styled view has thousands. So a pipeline is built once per key and bound
+/// many times, which is what the key exists for.
+///
+/// # Two levels, because the module is not per key
+///
+/// A module is per `(family, surface)`: one text, two entry points, 57 of them. A *pipeline* is per
+/// [`Key`], which adds the permutation and the vertex input -- so one module serves every pipeline
+/// of its family, and the two are cached separately. Holding the module beside each pipeline would
+/// compile the same text once per stride.
+///
+/// # What it does not do
+///
+/// Evict. A key holds a family, a surface, a permutation and a vertex layout, and all four are
+/// bounded by the style: a style that drew every family on every surface in every permutation it
+/// declares would build that many pipelines and then build no more. Eviction would need a
+/// measurement of a frame that actually thrashes, and nothing here has one -- so the cache grows to
+/// the style's own size and stops, and [`Cache::len`] is what a caller watches to find out it was
+/// wrong about that.
+pub struct Cache<'d> {
+    modules: HashMap<(BuiltIn, Surface), tessella_vk::ShaderModule<'d>>,
+    layouts: HashMap<(BuiltIn, Surface), Layout<'d>>,
+    pipelines: HashMap<Key, tessella_vk::Pipeline<'d>>,
+    built: usize,
+    bound: usize,
+}
+
+impl core::fmt::Debug for Cache<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Cache")
+            .field("pipelines", &self.pipelines.len())
+            .field("modules", &self.modules.len())
+            .field("built", &self.built)
+            .field("bound", &self.bound)
+            .finish()
+    }
+}
+
+impl Default for Cache<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'d> Cache<'d> {
+    /// Nothing built.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            modules: HashMap::new(),
+            layouts: HashMap::new(),
+            pipelines: HashMap::new(),
+            built: 0,
+            bound: 0,
+        }
+    }
+
+    /// How many pipelines are held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.pipelines.len()
+    }
+
+    /// Whether nothing is held.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pipelines.is_empty()
+    }
+
+    /// How many modules are held, which is at most one per family and surface.
+    #[must_use]
+    pub fn modules(&self) -> usize {
+        self.modules.len()
+    }
+
+    /// How many pipelines have been built, across the cache's life.
+    ///
+    /// Equal to [`Self::len`] while nothing is evicted, and reported separately so a caller can
+    /// tell a cache that grew from one that is rebuilding -- which is what a thrash would look
+    /// like.
+    #[must_use]
+    pub fn built(&self) -> usize {
+        self.built
+    }
+
+    /// How many times a pipeline has been asked for and found.
+    #[must_use]
+    pub fn bound(&self) -> usize {
+        self.bound
+    }
+
+    /// The layout for a family and surface, built on first use.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Device`] when the device refuses either layout.
+    pub fn layout(
+        &mut self,
+        gpu: Gpu<'d>,
+        shader: BuiltIn,
+        surface: Surface,
+        bindings: &[Binding],
+    ) -> Result<&Layout<'d>, Error> {
+        // `entry` would need the layout built before the lookup, and building it is the fallible
+        // part -- so the miss is handled first and the entry taken after.
+        if let std::collections::hash_map::Entry::Vacant(slot) =
+            self.layouts.entry((shader, surface))
+        {
+            slot.insert(layout(gpu, bindings)?);
+        }
+        Ok(&self.layouts[&(shader, surface)])
+    }
+
+    /// The pipeline for a key, built on first use.
+    ///
+    /// `words` is only consulted on a miss, so a caller that has to compile to produce them should
+    /// check [`Self::holds`] first -- compiling WGSL is the expensive half and a hit does not need
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a key whose layout cannot be described, and [`Error::Device`] when
+    /// the device refuses the module or the pipeline.
+    pub fn pipeline(
+        &mut self,
+        gpu: Gpu<'d>,
+        key: &Key,
+        bindings: &[Binding],
+        words: &[u32],
+        targets: Targets,
+    ) -> Result<vk::Pipeline, Error> {
+        if let Some(had) = self.pipelines.get(key) {
+            self.bound += 1;
+            return Ok(had.raw());
+        }
+
+        let at = (key.shader, key.surface);
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.modules.entry(at) {
+            slot.insert(gpu.shader(words)?);
+        }
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.layouts.entry(at) {
+            slot.insert(layout(gpu, bindings)?);
+        }
+        let pipeline = build(gpu, key, &self.layouts[&at], &self.modules[&at], targets)?;
+        let raw = pipeline.raw();
+        self.pipelines.insert(key.clone(), pipeline);
+        self.built += 1;
+        self.bound += 1;
+        Ok(raw)
+    }
+
+    /// Whether a key already has a pipeline.
+    #[must_use]
+    pub fn holds(&self, key: &Key) -> bool {
+        self.pipelines.contains_key(key)
+    }
+
+    /// Whether the module for a family and surface is already compiled.
+    ///
+    /// This is the question a caller deciding whether to compile should ask, and [`Self::holds`] is
+    /// not it. A key carries the vertex layout, so a drawable of a known family with a new stride
+    /// is a pipeline *miss* and a module *hit* -- and a caller that checked only `holds` would
+    /// recompile the text to build a pipeline from a module it already has.
+    ///
+    /// [`Self::pipeline`] ignores `words` when the module is present, so a caller seeing `true`
+    /// here can pass an empty slice.
+    #[must_use]
+    pub fn has_module(&self, shader: BuiltIn, surface: Surface) -> bool {
+        self.modules.contains_key(&(shader, surface))
+    }
 }

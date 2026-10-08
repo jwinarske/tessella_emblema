@@ -216,6 +216,155 @@ fn a_bogus_location_is_reported(device: &Open) -> Result<(), String> {
     Ok(())
 }
 
+/// A second ask for the same key builds nothing.
+///
+/// What the cache is for. A styled view has thousands of batches over tens of programs, so a frame
+/// that rebuilt per batch would pay the shader compile per batch -- and the only observable
+/// difference between a cache that works and one that silently misses is this count.
+fn the_cache_reuses(device: &Open) -> Result<(), String> {
+    let depth_stencil = device::depth_stencil_format(Attachment::DepthStencil, |format| {
+        device.format_properties(format).optimal_tiling_features
+    })
+    .map_err(|why| format!("no depth-stencil format: {why:?}"))?;
+    let targets = Targets {
+        color: COLOR,
+        depth_stencil,
+        attachment: Attachment::DepthStencil,
+    };
+
+    let mut cache = pipelines::Cache::new();
+    let mut asked = 0usize;
+    // Every pair, three times over, which is what a frame redrawing the same style looks like.
+    for round in 0..3 {
+        for family in families::ALL {
+            for surface in Surface::ALL {
+                if !family.surfaces.contains(&surface) {
+                    continue;
+                }
+                let who = format!("{} on {surface:?}", family.name);
+                let bindings = pipelines::bindings(family, surface);
+                let key = key_for(family, surface).map_err(|why| format!("{who}: {why}"))?;
+
+                // The words are needed only when the *module* is missing, which is the question
+                // `has_module` answers and `holds` does not.
+                let words = if cache.has_module(family.shader, surface) {
+                    Vec::new()
+                } else {
+                    let text = shaders::module(
+                        surface,
+                        family.blocks,
+                        family.attributes,
+                        family.textures,
+                        family.body,
+                    )
+                    .map_err(|why| format!("{who}: {why:?}"))?;
+                    compile(&text).map_err(|why| format!("{who}: {why}"))?
+                };
+                if round > 0 && !words.is_empty() {
+                    return Err(format!("{who} was compiled again on round {round}"));
+                }
+
+                let pipeline = cache
+                    .pipeline(device.gpu(), &key, &bindings, &words, targets)
+                    .map_err(|why| format!("{who}: {why}"))?;
+                if pipeline == vk::Pipeline::null() {
+                    return Err(format!("{who}: a null pipeline"));
+                }
+                asked += 1;
+            }
+        }
+    }
+
+    if cache.built() != 57 {
+        return Err(format!(
+            "{} pipelines built for 57 keys asked {asked} times",
+            cache.built()
+        ));
+    }
+    if cache.len() != 57 || cache.modules() != 57 {
+        return Err(format!(
+            "{} pipelines and {} modules held, wanted 57 of each",
+            cache.len(),
+            cache.modules()
+        ));
+    }
+    if cache.bound() != asked {
+        return Err(format!("{} binds for {asked} asks", cache.bound()));
+    }
+    println!(
+        "  the cache reuses      ok   {asked} asks, {} built, {} modules",
+        cache.built(),
+        cache.modules()
+    );
+    Ok(())
+}
+
+/// A key differing only in a stride is a different pipeline.
+///
+/// The failure `Key` exists for, from the cache's side: keyed on the family and permutation alone,
+/// the second ask here would be a hit and the draw would read every vertex at the wrong stride.
+fn a_stride_is_a_different_pipeline(device: &Open) -> Result<(), String> {
+    let depth_stencil = device::depth_stencil_format(Attachment::DepthStencil, |format| {
+        device.format_properties(format).optimal_tiling_features
+    })
+    .map_err(|why| format!("no depth-stencil format: {why:?}"))?;
+    let targets = Targets {
+        color: COLOR,
+        depth_stencil,
+        attachment: Attachment::DepthStencil,
+    };
+    let family = families::ALL
+        .iter()
+        .find(|f| f.name == "background")
+        .ok_or("a background family")?;
+    let bindings = pipelines::bindings(family, Surface::Plane);
+    let text = shaders::module(
+        Surface::Plane,
+        family.blocks,
+        family.attributes,
+        family.textures,
+        family.body,
+    )
+    .map_err(|why| format!("{why:?}"))?;
+    let words = compile(&text)?;
+
+    let mut cache = pipelines::Cache::new();
+    let key = key_for(family, Surface::Plane)?;
+    let first = cache
+        .pipeline(device.gpu(), &key, &bindings, &words, targets)
+        .map_err(|why| why.to_string())?;
+
+    let mut wider = key.clone();
+    for slot in &mut wider.layout {
+        slot.stride *= 2;
+    }
+    // Empty words deliberately: the module is already compiled, and a cache that reached for them
+    // anyway would be recompiling the same text per stride. `vkCreateShaderModule` of nothing
+    // fails, so this is the assertion rather than a count.
+    if !cache.has_module(family.shader, Surface::Plane) {
+        return Err("the first pipeline did not cache its module".into());
+    }
+    let second = cache
+        .pipeline(device.gpu(), &wider, &bindings, &[], targets)
+        .map_err(|why| format!("a second stride needed the words again: {why}"))?;
+
+    if first == second {
+        return Err("two strides got one pipeline".into());
+    }
+    if cache.built() != 2 {
+        return Err(format!("{} built for two strides", cache.built()));
+    }
+    // And one module serves both, which is the other half of the two-level split.
+    if cache.modules() != 1 {
+        return Err(format!(
+            "{} modules for one family: the text was compiled per stride",
+            cache.modules()
+        ));
+    }
+    println!("  a stride differs      ok   two pipelines, one module");
+    Ok(())
+}
+
 fn main() {
     let device = match Open::first() {
         Ok(device) => device,
@@ -230,6 +379,8 @@ fn main() {
     for (name, case) in [
         ("every_pipeline", every_pipeline_builds as Case),
         ("bogus_location", a_bogus_location_is_reported),
+        ("cache_reuses", the_cache_reuses),
+        ("stride_differs", a_stride_is_a_different_pipeline),
     ] {
         if let Err(why) = case(&device) {
             println!("  {name:<21} FAIL {why}");

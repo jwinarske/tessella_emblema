@@ -42,6 +42,19 @@ pub enum Rejected {
         /// What arrived.
         got: usize,
     },
+    /// The data is not the whole buffer.
+    ///
+    /// [`Consolidated::replace`] takes what an `UboUpdate` carries, which is the buffer entire. A
+    /// shorter one is not a partial write to apply: the record describes the whole buffer, so a
+    /// length that disagrees means the producer and this consumer disagree about how many entries
+    /// the layer has -- and that is a *different buffer*, which `blocks::declare` refuses for the
+    /// same reason.
+    NotTheBuffer {
+        /// How many bytes this buffer holds.
+        expected: usize,
+        /// What arrived.
+        got: usize,
+    },
     /// The index is past what this buffer can hold.
     ///
     /// Refused rather than grown. The buffer's size comes from the view's own declaration, so an
@@ -127,6 +140,57 @@ impl Consolidated {
         self.bytes[at..at + self.block].copy_from_slice(data);
         self.dirty.insert(index);
         Ok(())
+    }
+
+    /// Takes a whole buffer, marking the entries whose bytes changed.
+    ///
+    /// What an `UboUpdate` actually delivers. The producer writes a layer's buffer entire -- one
+    /// record carrying `pack_drawable_buffer`'s whole array -- and [`Self::write`] takes one entry,
+    /// so before this there was no call that could apply what arrived. A twelve-drawable fill layer
+    /// turns up as 1152 bytes and `write` rejects every length but 96.
+    ///
+    /// # The dirty set comes from the comparison
+    ///
+    /// §11.7 asks a consumer for "sub-range buffer updates from UBO dirty ranges" and the wire
+    /// carries no ranges, so deriving them is this side's job. That is what the shadow is for: the
+    /// bytes that arrived are compared against the bytes already there, and only the entries that
+    /// differ are marked. A still map re-sending an identical buffer flushes nothing.
+    ///
+    /// Comparing rather than trusting also means a producer that re-sends a buffer it did not
+    /// change costs a comparison and no bandwidth, which is the common case on a parked frame.
+    ///
+    /// # Errors
+    ///
+    /// [`Rejected::NotTheBuffer`] when the data is not exactly this buffer's size. Nothing is
+    /// written in that case.
+    pub fn replace(&mut self, data: &[u8]) -> Result<usize, Rejected> {
+        if data.len() != self.bytes.len() {
+            return Err(Rejected::NotTheBuffer {
+                expected: self.bytes.len(),
+                got: data.len(),
+            });
+        }
+        let mut changed = 0;
+        for (index, (held, arrived)) in self
+            .bytes
+            .chunks_mut(self.block)
+            .zip(data.chunks(self.block))
+            .enumerate()
+        {
+            if held == arrived {
+                continue;
+            }
+            held.copy_from_slice(arrived);
+            // The index is bounded by the entry count, which was a `usize` when the buffer was
+            // made -- so a buffer with more entries than `u32` can name cannot exist to reach here.
+            // Skipped rather than panicked over, because the alternative is a panic in a path fed
+            // by a protocol record.
+            if let Ok(index) = u32::try_from(index) {
+                self.dirty.insert(index);
+                changed += 1;
+            }
+        }
+        Ok(changed)
     }
 
     /// Whether anything has been written since the last flush.

@@ -402,6 +402,83 @@ fn slots_are_separate(device: &Open) -> Result<(), String> {
     Ok(())
 }
 
+/// A whole buffer arrives, reaches the device, and a second arrival flushes only what moved.
+///
+/// The shape an `UboUpdate` has: `Upload::Uniforms` carries a layer's buffer entire, and
+/// `Blocks::write` takes one entry -- so this is the path that could not be walked at all before
+/// `replace`. What the host side cannot say is that the comparison's dirty set lands at the right
+/// offsets on the device, which is the same thing `scattered_writes` says about per-entry writes.
+///
+/// The second arrival differs in one entry out of eight, so a `replace` that marked everything
+/// would flush one range covering the whole buffer rather than one covering an entry -- both
+/// correct on the device, which is why the range count is asserted beside the bytes.
+fn a_whole_buffer_arrives(device: &Open) -> Result<(), String> {
+    let mut blocks = Blocks::new();
+    let at = which(11);
+    blocks
+        .declare(device.gpu(), at, SLOT, ENTRIES, BLOCK)
+        .map_err(|why| format!("declare: {why}"))?;
+
+    // The producer's first send: every entry named after itself.
+    let first: Vec<u8> = (0..ENTRIES as u32).flat_map(block_for).collect();
+    let changed = blocks
+        .replace(at, SLOT, &first)
+        .map_err(|why| format!("first arrival: {why}"))?;
+    if changed != ENTRIES {
+        return Err(format!("{changed} of {ENTRIES} entries taken as new"));
+    }
+    let ranges = blocks
+        .flush(at, SLOT, 0)
+        .map_err(|why| format!("flush: {why}"))?;
+    if ranges != 1 {
+        return Err(format!("a wholly new buffer flushed as {ranges} ranges"));
+    }
+    let found = entries_of(&blocks, at, SLOT)?;
+    for index in 0..ENTRIES as u32 {
+        if found[index as usize] != block_for(index) {
+            return Err(format!(
+                "entry {index} holds {:#04x} after the first arrival",
+                found[index as usize][0]
+            ));
+        }
+    }
+
+    // The same bytes again, which is a parked frame: nothing moves.
+    if blocks.replace(at, SLOT, &first) != Ok(0) || blocks.is_dirty(at, SLOT) {
+        return Err("an identical buffer dirtied something".into());
+    }
+    if blocks.flush(at, SLOT, 0) != Ok(0) {
+        return Err("an identical buffer flushed something".into());
+    }
+
+    // One entry moves, and one range carries it.
+    let mut second = first.clone();
+    second[5 * BLOCK..6 * BLOCK].fill(0xC5);
+    if blocks.replace(at, SLOT, &second) != Ok(1) {
+        return Err("one changed entry was not the only one marked".into());
+    }
+    if blocks.flush(at, SLOT, 0) != Ok(1) {
+        return Err("one changed entry flushed as more than one range".into());
+    }
+    let found = entries_of(&blocks, at, SLOT)?;
+    if found[5] != [0xC5; BLOCK] {
+        return Err(format!(
+            "entry 5 holds {:#04x} after the second arrival",
+            found[5][0]
+        ));
+    }
+    for index in (0..ENTRIES as u32).filter(|index| *index != 5) {
+        if found[index as usize] != block_for(index) {
+            return Err(format!(
+                "entry {index} moved when only entry 5 changed, and holds {:#04x}",
+                found[index as usize][0]
+            ));
+        }
+    }
+    println!("  a whole buffer        ok   8 entries in, then 1 range for 1 changed entry");
+    Ok(())
+}
+
 fn main() {
     let device = match Open::first() {
         Ok(device) => device,
@@ -425,6 +502,7 @@ fn main() {
         ("refusals", refusals_and_forgetting),
         ("layers_are_separate", layers_are_separate),
         ("slots_are_separate", slots_are_separate),
+        ("whole_buffer", a_whole_buffer_arrives),
     ] {
         if let Err(why) = case(&device) {
             println!("  {name:<21} FAIL {why}");

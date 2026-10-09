@@ -16,15 +16,15 @@
 //! reference can fail to match one: the same reason `benches/clip_masks.rs` covers four.
 
 use tessella_capture_abi::envelope::{
-    AttributeDesc, CameraUpdate, DrawFlags, GeometryAdd, GeometryId, OrderEntry, OrderEpoch,
-    OrderUpdate, Segment, SlabRef, Span, StencilTile, StencilTiles, TileId, ViewId, ViewUse,
-    WireRecord,
+    AttributeDesc, CameraUpdate, DrawFlags, Extent, GeometryAdd, GeometryId, OrderEntry,
+    OrderEpoch, OrderUpdate, Rect16, Segment, SlabRef, Span, StencilTile, StencilTiles, TextureId,
+    TextureRef, TextureUpdate, TileId, ViewId, ViewUse, WireRecord,
 };
 use tessella_capture_abi::generated::mbgl_enums::{AttributeDataType, BuiltIn};
 use tessella_capture_abi::generated::ubo_layouts::{FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO};
 use tessella_capture_abi::generated::{ubo_layouts, ubo_slots};
 use tessella_capture_abi::ring::{Producer, Ring};
-use tessella_capture_abi::{EnvelopeKind, RenderPass};
+use tessella_capture_abi::{EnvelopeKind, RenderPass, TextureChannelDataType, TexturePixelType};
 use tessella_consume::slab::Slab;
 
 /// The view the frame draws.
@@ -32,6 +32,13 @@ pub const VIEW: ViewId = ViewId(1);
 
 /// The layer group the two tiles belong to.
 pub const LAYER: i32 = 0;
+
+/// The layer that samples a texture, which covers a band across the top.
+///
+/// A raster, because it is the shortest family that samples: three attributes, two blocks and two
+/// images. Thirteen of the eighteen families sample something and nothing had driven a
+/// `TextureUpdate` into a sampler, so this is the layer that does -- see #93.
+pub const SAMPLED: i32 = 2;
 
 /// The layer drawn over it.
 ///
@@ -48,6 +55,28 @@ pub const GEOMETRIES: [GeometryId; 2] = [GeometryId(10), GeometryId(11)];
 
 /// The upper layer's one geometry, which covers the middle of the target and no tile.
 pub const ABOVE: GeometryId = GeometryId(12);
+
+/// The sampling layer's one geometry.
+pub const SAMPLER: GeometryId = GeometryId(13);
+
+/// The two textures the raster binds, in the order its table declares them.
+///
+/// Both, because `descriptors::Sets::write` refuses a drawable naming a different number than the
+/// family declares -- and the second is bound because the shader declares it, not because anything
+/// reads it: `fade_t` of zero takes the near tile alone.
+pub const TEXTURES: [TextureId; 2] = [TextureId(100), TextureId(101)];
+
+/// The texel the sampling layer reads, which is texel (2, 2) of its own image.
+///
+/// Opaque, unlike `first_pixel`'s raster image: the band is drawn over the tiles beneath it, so a
+/// half-transparent texel would make the expectation a blend rather than a texel. With an alpha of
+/// 255 and every adjustment at its identity the result is the texel itself.
+pub const SAMPLED_COLOR: [u8; 4] = [128, 64, 128, 255];
+
+/// How much of the target's height the sampling layer covers, either side of the top.
+///
+/// An eighth, so it is rows 0 through 7 and disjoint from the band in the middle.
+pub const TOP_OF: u16 = 8;
 
 /// The target's edge. Each tile's mask covers half of it.
 pub const SIDE: u32 = 64;
@@ -95,8 +124,9 @@ pub struct Geometry {
     pub region: Vec<u8>,
     /// The slab table, which the consumer is handed rather than deriving.
     pub slabs: Vec<Slab>,
-    /// Per tile: the position, color and opacity runs, then the indexes.
-    refs: Vec<[SlabRef; 4]>,
+    /// Per drawable: the position, color and opacity runs, the indexes, then a raster's texture
+    /// coordinate and skirt.
+    refs: Vec<[SlabRef; 6]>,
 }
 
 /// A quad covering clip space, as four vertices of two signed shorts.
@@ -118,7 +148,7 @@ impl Geometry {
         // Three drawables over one quad: the two tiles and the layer above them. What differs is
         // the color each carries and the matrix its block holds -- the upper layer's squashes the
         // quad into a band across the middle, which is why it needs no geometry of its own.
-        for color in [COLORS[0], COLORS[1], ABOVE_COLOR] {
+        for color in [COLORS[0], COLORS[1], ABOVE_COLOR, SAMPLED_COLOR] {
             let mut at = |bytes: &[u8]| {
                 let offset = u32::try_from(region.len()).expect("a small region");
                 region.extend_from_slice(bytes);
@@ -148,7 +178,26 @@ impl Geometry {
                 .flat_map(|_| [1.0f32, 1.0].iter().flat_map(|v| v.to_le_bytes()))
                 .collect();
             let indexes: Vec<u8> = INDEXES.iter().flat_map(|v| v.to_le_bytes()).collect();
-            refs.push([at(&positions), at(&packed), at(&opacity), at(&indexes)]);
+            // A raster reads three `Short2` runs where a fill reads a position, a packed color and
+            // an opacity -- so the fourth drawable's three runs are the texture coordinate and the
+            // skirt rather than a color, and the color above is unused for it. Laid out in the same
+            // region, because a slab is a slab.
+            let coordinates: Vec<u8> = (0..4)
+                .flat_map(|_| {
+                    [COORDINATE, COORDINATE]
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                })
+                .collect();
+            let skirt: Vec<u8> = vec![0u8; 4 * 4];
+            refs.push([
+                at(&positions),
+                at(&packed),
+                at(&opacity),
+                at(&indexes),
+                at(&coordinates),
+                at(&skirt),
+            ]);
         }
         let length = region.len() as u64;
         Self {
@@ -164,6 +213,14 @@ impl Default for Geometry {
         Self::new()
     }
 }
+
+/// The texture coordinate the sampling layer reads with.
+///
+/// Under a buffer scale of two, `uv = t / 16384 + 0.25`, so 6144 is 0.625 -- the dead center of
+/// texel 2 of a four-texel image. The same number `benches/first_pixel.rs`'s raster cases use, and
+/// for the same reason: the center of a texel rather than its edge, so the pixel says which texel
+/// was read.
+const COORDINATE: i16 = 6144;
 
 /// A tile, as the producer names one.
 #[must_use]
@@ -224,8 +281,22 @@ pub fn write(capacity: usize) -> (Ring, Geometry) {
     let geometry = Geometry::new();
     let mut ring = Ring::new(capacity);
     let producer = ring.producer();
+    let fill = [
+        AttributeDataType::Short2,
+        AttributeDataType::Float4,
+        AttributeDataType::Float2,
+    ];
     for (at, id) in GEOMETRIES.iter().enumerate() {
-        announce(producer, *id, &geometry.refs[at]);
+        let refs = &geometry.refs[at];
+        announce(
+            producer,
+            *id,
+            BuiltIn::FillShader,
+            &fill,
+            &refs[0..3],
+            refs[3],
+            &[],
+        );
         used(
             producer,
             *id,
@@ -236,8 +307,32 @@ pub fn write(capacity: usize) -> (Ring, Geometry) {
     // The layer above, with no tile of its own: a layer that covers the viewport rather than a
     // tile's ground -- which is what `ViewUse::has_tile` of zero says, and what `Partition`'s "a
     // tile absent here has no mask" leaves unclipped.
-    announce(producer, ABOVE, &geometry.refs[GEOMETRIES.len()]);
+    let refs = &geometry.refs[GEOMETRIES.len()];
+    announce(
+        producer,
+        ABOVE,
+        BuiltIn::FillShader,
+        &fill,
+        &refs[0..3],
+        refs[3],
+        &[],
+    );
     used(producer, ABOVE, OVER, None);
+
+    // And the layer that samples: three `Short2` runs -- a position, a texture coordinate and a
+    // skirt -- and both of the images its table declares.
+    let refs = &geometry.refs[GEOMETRIES.len() + 1];
+    announce(
+        producer,
+        SAMPLER,
+        BuiltIn::RasterShader,
+        &[AttributeDataType::Short2; 3],
+        &[refs[0], refs[4], refs[5]],
+        refs[3],
+        &TEXTURES,
+    );
+    used(producer, SAMPLER, SAMPLED, None);
+    textures(producer);
 
     clips(producer);
     uniforms(producer);
@@ -246,25 +341,29 @@ pub fn write(capacity: usize) -> (Ring, Geometry) {
     (ring, geometry)
 }
 
-/// One geometry: its attribute descriptors, its segment, and the slab its bytes are in.
-fn announce(producer: &mut Producer, id: GeometryId, refs: &[SlabRef; 4]) {
-    // One descriptor per attribute the fill family declares, each over its own run at offset zero
-    // -- which is the per-attribute layout. `first_pixel`'s `raster_interleaved` is the other one.
-    // The types `FILL_SHADER` declares, in its own order. Taken from the table rather than
-    // guessed: `vertices::plan` refuses a descriptor whose declared type disagrees, which is how
-    // the first version of this fixture was caught claiming `UShort4` for a `Float4` color.
-    let declared = [
-        AttributeDataType::Short2,
-        AttributeDataType::Float4,
-        AttributeDataType::Float2,
-    ];
+/// One geometry: its attribute descriptors, its segment, the textures it binds, and its slab.
+///
+/// `declared` is the family's own attribute types, in its own order, each over its own run at
+/// offset zero -- the per-attribute layout; `first_pixel`'s `raster_interleaved` is the other one.
+/// Taken from the table rather than guessed: `vertices::plan` refuses a descriptor whose declared
+/// type disagrees, which is how the first version of this fixture was caught claiming `UShort4`
+/// for a fill's `Float4` color.
+fn announce(
+    producer: &mut Producer,
+    id: GeometryId,
+    shader: BuiltIn,
+    declared: &[AttributeDataType],
+    runs: &[SlabRef],
+    indexes: SlabRef,
+    textures: &[TextureId],
+) {
     let attrs: Vec<AttributeDesc> = declared
         .iter()
         .enumerate()
         .map(|(slot, kind)| AttributeDesc {
-            attr_id: u32::try_from(slot).expect("three attributes"),
-            binding: i32::try_from(slot).expect("three attributes"),
-            source: refs[slot],
+            attr_id: u32::try_from(slot).expect("a short table"),
+            binding: i32::try_from(slot).expect("a short table"),
+            source: runs[slot],
             offset: 0,
             vertex_offset: 0,
             stride: stride_of(*kind),
@@ -286,17 +385,33 @@ fn announce(producer: &mut Producer, id: GeometryId, refs: &[SlabRef; 4]) {
     }
     let attrs_span = Span {
         offset: 0,
-        count: u32::try_from(attrs.len()).expect("three"),
+        count: u32::try_from(attrs.len()).expect("a short table"),
     };
     let segments_at = u32::try_from(payload.len()).expect("a small payload");
     for segment in &segments {
         payload.extend_from_slice(segment.as_bytes());
     }
 
+    // The textures it binds, in the order the shader declares them. `descriptors::Sets::write`
+    // refuses a drawable naming a different number than the family does, so a raster names both of
+    // its images even though `fade_t` of zero reads only the first.
+    let textures_at = u32::try_from(payload.len()).expect("a small payload");
+    for (slot, texture) in textures.iter().enumerate() {
+        let bound = TextureRef {
+            texture: *texture,
+            slot: u32::try_from(slot).expect("two textures"),
+            // Zero, which the ABI says is `Linear`: "this was padding through R0, and zero is
+            // `TextureFilter::Linear`". The sampling layer reads a texel's center, so either
+            // filter gives that texel; `first_pixel` is where the filter is chosen deliberately.
+            filter: 0,
+        };
+        payload.extend_from_slice(bound.as_bytes());
+    }
+
     let add = GeometryAdd {
         geometry: id,
         permutation_key: 0,
-        indexes: refs[3],
+        indexes,
         vertex_count: 4,
         attrs: attrs_span,
         instance_attrs: Span::default(),
@@ -304,8 +419,11 @@ fn announce(producer: &mut Producer, id: GeometryId, refs: &[SlabRef; 4]) {
             offset: segments_at,
             count: 1,
         },
-        texture_refs: Span::default(),
-        builtin_shader: BuiltIn::FillShader as i32,
+        texture_refs: Span {
+            offset: textures_at,
+            count: u32::try_from(textures.len()).expect("a short list"),
+        },
+        builtin_shader: shader as i32,
         vertex_type: AttributeDataType::Short2 as u8,
         reason: 0,
         topology: 0,
@@ -345,6 +463,100 @@ fn used(producer: &mut Producer, id: GeometryId, layer: i32, at: Option<TileId>)
     };
     producer
         .write(EnvelopeKind::ViewUse, use_.as_bytes(), &[])
+        .expect("room");
+}
+
+/// The sampling layer's two images.
+///
+/// The near tile goes out as a **packed** two-rect update and the parent as a whole-texture one, so
+/// both payload forms `upload::rows` resolves are driven. `TextureUpdate::packed` says what the
+/// difference costs if a consumer reads the wrong one:
+///
+/// > the rects would land at the right addresses holding the wrong pixels, which is a map that
+/// > draws rather than one that fails
+///
+/// The rects are the image's two halves by row, so between them they cover it: a packed payload
+/// holds each region's own rows end to end at the region's width, where a whole one holds the
+/// texture and the rects are windows into it.
+fn textures(producer: &mut Producer) {
+    // Texel (x, y) is (x * 64, y * 32, 128, 255), so every one differs and the sampled one says
+    // which was read. Opaque, so the band's pixel is the texel rather than a blend over the tiles.
+    let texel = |x: u16, y: u16| {
+        let (x, y) = (
+            u8::try_from(x).expect("a small image"),
+            u8::try_from(y).expect("a small image"),
+        );
+        [x * 64, y * 32, 128, 255]
+    };
+
+    // Two sub-regions, not two row-halves. Row-halves were the first shape here and they cannot
+    // tell the two payload forms apart: a region spanning the full width starts at the same offset
+    // and runs at the same stride whichever form it is in, so a consumer ignoring `packed` reads
+    // exactly the right bytes. Measured -- the frame came out unchanged with the flag thrown away.
+    //
+    // A quarter-sized region does differ. The *second* covers texels (2, 2) to (3, 3), which is the
+    // one the sampling layer reads:
+    //
+    //   packed   at 16, stride 8     after the first region's four texels, at its own width
+    //   whole    at 40, stride 16    two rows down and two texels across, at the texture's width
+    //
+    // Second rather than first, and that matters too: at offset zero a consumer that dropped the
+    // offset entirely would still read the right texels. The first covers the opposite corner, so
+    // between them nothing the frame reads is left at the zeros `Images::declare` clears to.
+    let corners = [
+        Rect16 {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 2,
+        },
+        Rect16 {
+            x: 2,
+            y: 2,
+            w: 2,
+            h: 2,
+        },
+    ];
+    let packed: Vec<u8> = corners
+        .iter()
+        .flat_map(|rect| {
+            (rect.y..rect.y + rect.h)
+                .flat_map(move |y| (rect.x..rect.x + rect.w).flat_map(move |x| texel(x, y)))
+        })
+        .collect();
+    debug_assert_eq!(packed.len(), 2 * 2 * 2 * 4, "two regions of four texels");
+    texture(producer, TEXTURES[0], &corners, true, &packed);
+
+    // The parent, which `fade_t` of zero mixes none of. Painted differently from the near tile so a
+    // frame that sampled the wrong one would say so, and sent whole -- `rect_count` of zero, which
+    // is what a producer sends for a texture it has just created.
+    let parent: Vec<u8> = (0..4 * 4).flat_map(|_| [255, 0, 255, 255]).collect();
+    texture(producer, TEXTURES[1], &[], false, &parent);
+}
+
+/// One texture's pixels, in whichever form the rects describe.
+fn texture(producer: &mut Producer, id: TextureId, rects: &[Rect16], packed: bool, pixels: &[u8]) {
+    let mut held = [Rect16::default(); 4];
+    held[..rects.len()].copy_from_slice(rects);
+    let update = TextureUpdate {
+        texture: id,
+        size: Extent {
+            width: 4,
+            height: 4,
+        },
+        rects: held,
+        pixels: Span {
+            offset: 0,
+            count: u32::try_from(pixels.len()).expect("a small image"),
+        },
+        format: TexturePixelType::RGBA as u8,
+        rect_count: u8::try_from(rects.len()).expect("at most four"),
+        channel_type: TextureChannelDataType::UnsignedByte as u8,
+        packed: u8::from(packed),
+        _pad: Default::default(),
+    };
+    producer
+        .write(EnvelopeKind::TextureUpdate, update.as_bytes(), pixels)
         .expect("room");
 }
 
@@ -409,6 +621,69 @@ fn uniforms(producer: &mut Producer) {
         ubo_slots::ID_FILL_EVALUATED_PROPS_UBO,
         &props(),
     );
+
+    // The sampling layer: its quad squashed into a band across the top, and every color adjustment
+    // at its identity -- so what its pixel says is which texel was sampled and not what the chain
+    // does to it. `benches/first_pixel.rs`'s `raster_adjusted` is where the chain is read.
+    let mut raster = vec![0u8; ubo_layouts::RASTER_DRAWABLE_UBO.stride as usize];
+    let mut matrix = CLIP;
+    matrix[5] /= f32::from(TOP_OF);
+    // Up to the top edge. The sign is the one thing here that was not reasoned to: `-0.875` put the
+    // band in rows 56 through 63 and `+0.875` puts it in rows 0 through 7, measured by tallying the
+    // frame row by row. Two negations are involved -- the drawable matrix's own and the one naga's
+    // SPIR-V backend emits -- and reasoning about them in series is how the first attempt got it
+    // backwards.
+    matrix[13] = 1.0 - 1.0 / f32::from(TOP_OF);
+    put(
+        &mut raster,
+        &ubo_layouts::RASTER_DRAWABLE_UBO,
+        "matrix",
+        &matrix,
+    );
+    ubo(
+        producer,
+        SAMPLED,
+        ubo_slots::ID_RASTER_DRAWABLE_UBO,
+        &raster,
+    );
+    ubo(
+        producer,
+        SAMPLED,
+        ubo_slots::ID_RASTER_EVALUATED_PROPS_UBO,
+        &raster_paint(),
+    );
+}
+
+/// A raster's evaluated properties, with every color adjustment at its identity.
+///
+/// The same values `benches/first_pixel.rs`'s `raster` case uses, and for the same reason: with the
+/// chain neutral the pixel is the texel, so what this frame says is which texel was sampled. The
+/// one difference is the opacity, which is one here -- the band is drawn over the tiles beneath it,
+/// and a half-transparent raster would make the expectation a blend.
+fn raster_paint() -> Vec<u8> {
+    let mut paint = vec![0u8; ubo_layouts::RASTER_EVALUATED_PROPS_UBO.stride as usize];
+    for (field, values) in [
+        // `dot(rgb, spin.xyz)`, `dot(rgb, spin.zxy)`, `dot(rgb, spin.yzx)`, which leaves every
+        // channel alone exactly when the weights are (1, 0, 0).
+        ("spin_weights", &[1.0f32, 0.0, 0.0, 0.0][..]),
+        ("buffer_scale", &[2.0][..]),
+        ("scale_parent", &[1.0][..]),
+        ("tl_parent", &[0.0, 0.0][..]),
+        ("fade_t", &[0.0][..]),
+        ("opacity", &[1.0][..]),
+        ("brightness_low", &[0.0][..]),
+        ("brightness_high", &[1.0][..]),
+        ("saturation_factor", &[0.0][..]),
+        ("contrast_factor", &[1.0][..]),
+    ] {
+        put(
+            &mut paint,
+            &ubo_layouts::RASTER_EVALUATED_PROPS_UBO,
+            field,
+            values,
+        );
+    }
+    paint
 }
 
 /// One drawable entry: where it is placed, and both interpolation factors at their first endpoint.
@@ -473,11 +748,20 @@ fn order(producer: &mut Producer) {
             _pad: [0; 3],
         })
         .collect();
-    // After them, which is what puts it on top: the order is the painter's.
+    // After them, which is what puts them on top: the order is the painter's.
     entries.push(OrderEntry {
         geometry: ABOVE,
         draw_priority: 0,
         layer_index: u32::try_from(OVER).expect("a non-negative layer"),
+        sub_layer_index: 0,
+        ubo_index: 0,
+        pass: RenderPass::TRANSLUCENT,
+        _pad: [0; 3],
+    });
+    entries.push(OrderEntry {
+        geometry: SAMPLER,
+        draw_priority: 0,
+        layer_index: u32::try_from(SAMPLED).expect("a non-negative layer"),
         sub_layer_index: 0,
         ubo_index: 0,
         pass: RenderPass::TRANSLUCENT,

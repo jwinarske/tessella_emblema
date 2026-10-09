@@ -12,17 +12,47 @@
 #![allow(dead_code)]
 
 use ash::vk;
+use tessella_emblema::device;
 use tessella_vk::{Gpu, Recorder};
+
+/// What a device's class is called in a summary line.
+fn tier(class: vk::PhysicalDeviceType) -> &'static str {
+    match class {
+        vk::PhysicalDeviceType::DISCRETE_GPU => "external",
+        vk::PhysicalDeviceType::INTEGRATED_GPU => "internal",
+        vk::PhysicalDeviceType::VIRTUAL_GPU => "virtual",
+        vk::PhysicalDeviceType::CPU => "software",
+        _ => "unknown",
+    }
+}
 
 /// A device, open for as long as this lives.
 pub struct Open {
     pub name: String,
+    /// The tier that answered: external, internal, virtual or software.
+    ///
+    /// What a run reports, because which tier drew is part of reading a result -- a pixel from a
+    /// software rasterizer says less about a board than one from its own GPU.
+    pub class: &'static str,
     _entry: ash::Entry,
     instance: ash::Instance,
     handle: ash::Device,
     memory: vk::PhysicalDeviceMemoryProperties,
     pub limits: vk::PhysicalDeviceLimits,
     physical: vk::PhysicalDevice,
+    family: u32,
+}
+
+/// Which of the enumerated devices to take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pick {
+    /// The first that enumerates, which is all a store or a layout needs.
+    First,
+    /// External, then internal, then software, through [`device::preferred`].
+    ///
+    /// What a bench reading pixels wants: a result is only as good as the part that produced it,
+    /// and a machine with a software rasterizer beside a GPU enumerates both.
+    Preferred,
 }
 
 impl Open {
@@ -34,8 +64,26 @@ impl Open {
     /// allocation, and not one of those touches a queue. One is requested anyway because
     /// `vkCreateDevice` requires at least one queue family.
     pub fn first() -> Result<Self, String> {
-        // SAFETY: the loader is linked at run time and this is the documented entry point.
-        let entry = unsafe { ash::Entry::load() }.map_err(|why| format!("no loader: {why}"))?;
+        Self::with(Pick::First)
+    }
+
+    /// Opens the device [`device::preferred`] names, which is what a pixel oracle wants.
+    pub fn preferred() -> Result<Self, String> {
+        Self::with(Pick::Preferred)
+    }
+
+    /// Opens a device, choosing it as `pick` says.
+    ///
+    /// `TSL_VULKAN_LIB` names a driver to load directly rather than through the loader, for an
+    /// image whose loader and driver disagree about which ICDs exist.
+    pub fn with(pick: Pick) -> Result<Self, String> {
+        // SAFETY: the loader is linked at run time and these are its documented entry points. The
+        // path is the operator's, and loading a named driver is the whole point of the variable.
+        let entry = match std::env::var("TSL_VULKAN_LIB") {
+            Ok(path) => unsafe { ash::Entry::load_from(&path) }
+                .map_err(|why| format!("no driver at {path}: {why}"))?,
+            Err(_) => unsafe { ash::Entry::load() }.map_err(|why| format!("no loader: {why}"))?,
+        };
         // 1.3, because the pass requires dynamic rendering and `vkCmdBeginRendering` is 1.3 core.
         // ash loads an entry point only when the declared version covers it, so an instance asking
         // for 1.1 gets a null pointer and panics on the first call rather than failing to create --
@@ -53,7 +101,19 @@ impl Open {
         // SAFETY: the instance is live.
         let devices = unsafe { instance.enumerate_physical_devices() }
             .map_err(|why| format!("enumerate: {why}"))?;
-        let physical = *devices.first().ok_or("no physical device")?;
+        let physical = match pick {
+            Pick::First => *devices.first().ok_or("no physical device")?,
+            Pick::Preferred => {
+                let classes: Vec<vk::PhysicalDeviceType> = devices
+                    .iter()
+                    // SAFETY: the instance is live and each handle came from it.
+                    .map(|at| unsafe { instance.get_physical_device_properties(*at) }.device_type)
+                    .collect();
+                device::preferred(&classes)
+                    .and_then(|at| devices.get(at).copied())
+                    .ok_or("no physical device")?
+            }
+        };
         // SAFETY: as above.
         let properties = unsafe { instance.get_physical_device_properties(physical) };
         let name = properties.device_name_as_c_str().map_or_else(
@@ -64,9 +124,19 @@ impl Open {
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
         let limits = properties.limits;
 
+        // A family that can draw, rather than family zero. Zero is a graphics family on every part
+        // this runs on, but a device that reported otherwise would fail at the first draw rather
+        // than here, and the search costs one call.
+        // SAFETY: the instance and the handle are live.
+        let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
+        let family = families
+            .iter()
+            .position(|queue| queue.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+            .and_then(|at| u32::try_from(at).ok())
+            .ok_or("no graphics queue family")?;
         let priorities = [1.0f32];
         let queues = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(0)
+            .queue_family_index(family)
             .queue_priorities(&priorities)];
         // Dynamic rendering, which the pass requires rather than prefers -- see
         // `device::check_dynamic_rendering`. Core in Vulkan 1.3 and reported by every part this runs
@@ -74,7 +144,7 @@ impl Open {
         // chaining `VkPipelineRenderingCreateInfo` without it is invalid usage that a driver need
         // not report.
         let mut thirteen = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
-        // SAFETY: the info is fully initialized; family zero exists on every conformant device.
+        // SAFETY: the info is fully initialized and names a family this device reported.
         let device = unsafe {
             instance.create_device(
                 physical,
@@ -88,12 +158,14 @@ impl Open {
 
         Ok(Self {
             name,
+            class: tier(properties.device_type),
             _entry: entry,
             instance,
             handle: device,
             memory,
             limits,
             physical,
+            family,
         })
     }
 
@@ -119,12 +191,11 @@ impl Open {
     /// Waits on a fence rather than `vkQueueWaitIdle`, because a bench that reads pixels back has to
     /// know the copy finished and not merely that the queue went quiet.
     pub fn submit(&self, record: impl FnOnce(Recorder<'_>)) -> Result<(), String> {
-        // SAFETY: family zero exists on every conformant device and was the one the device was
-        // created with.
+        // SAFETY: this family was the one the device was created with.
         let pool = unsafe {
             self.handle.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
-                    .queue_family_index(0)
+                    .queue_family_index(self.family)
                     .flags(vk::CommandPoolCreateFlags::TRANSIENT),
                 None,
             )
@@ -188,8 +259,8 @@ impl Open {
     fn wait_on(&self, buffer: vk::CommandBuffer, fence: vk::Fence) -> Result<(), String> {
         let buffers = [buffer];
         let submit = vk::SubmitInfo::default().command_buffers(&buffers);
-        // SAFETY: family zero was requested at device creation, so index zero of it exists.
-        let queue = unsafe { self.handle.get_device_queue(0, 0) };
+        // SAFETY: this family was requested at device creation, so index zero of it exists.
+        let queue = unsafe { self.handle.get_device_queue(self.family, 0) };
         // SAFETY: the buffer has ended, the fence is unsignaled, and both belong to this device.
         unsafe { self.handle.queue_submit(queue, &[submit], fence) }
             .map_err(|why| format!("queue_submit: {why}"))?;

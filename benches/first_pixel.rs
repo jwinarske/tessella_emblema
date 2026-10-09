@@ -17,6 +17,34 @@
 //! read back by the generated WGSL struct; and that `instance_index` reaches `ubo_index`. Each
 //! case adds whatever its own body computes on top of that.
 //!
+//! # Through the library, not beside it
+//!
+//! Every step between a case's inputs and its pixel is the library's: `vertices::plan` over the
+//! `AttributeDesc`s a producer would have sent, `buffers::needs` and [`Store`] for the geometry,
+//! [`blocks`] for the uniform buffers at the slots the wire names them, [`Images`] for the
+//! textures, `descriptors::Sets` for the set, [`Cache`] for the pipeline and `target::frame` for
+//! the pass. What the probe still owns is the *inputs* and the one pixel to read.
+//!
+//! It owned all of it once -- about a thousand lines of its own Vulkan, from the instance to the
+//! render pass to a linear-tiled image it mapped. Those pixels said the eighteen families' bodies
+//! and the ABI's tables agree, which is worth having, and said nothing at all about the code that
+//! will draw them in a frame. `descriptors::Sets::write` pointed every block binding at one buffer
+//! for four merged slices and no test could see it; this bench now fails on the second case.
+//!
+//! The substitution was measured rather than assumed: all twenty-six expected pixels are the ones
+//! derived by hand against the probe's own Vulkan, unchanged.
+//!
+//! # What it still does not reach
+//!
+//! The join. A case names its own geometry, blocks and textures, where a frame gets them from a
+//! capture stream through `Joiner` and `Batches` and draws them through `record::content`. So this
+//! says a family draws right when it is set up right, and not that a stream sets it up right.
+//!
+//! And one driver quirk is lost with the probe's own pipeline: it compiled the SPIR-V into a module
+//! per stage, because Adreno rejects a module with two entry points. `pipelines::build` uses one
+//! module for both, so this no longer runs on the sa8155p -- which is the library's gap rather than
+//! the bench's, and is tracked as #85.
+//!
 //! # A case has to be sensitive to what it claims to read
 //!
 //! Twice on 2026-10-04 a case drew the right pixel while being blind to one of its inputs, both
@@ -24,6 +52,14 @@
 //! the same texel. `color_relief`'s coordinate lands 8e-6 from one; `raster_interleaved` could
 //! not tell a four-byte offset error until the bytes nothing binds were filled with a value that
 //! samples a *different* texel.
+//!
+//! It is still one-sided, and the same boundary is why. `raster_interleaved` catches an attribute
+//! read four bytes *late* -- that reads the skirt, which samples another texel -- and not one read
+//! four bytes *early*, which reads the position: as a coordinate that is 0.25 of a four-texel
+//! image, exactly the boundary between texels zero and one, and it resolves to texel one, which is
+//! the texel the case meant to read. Measured by zeroing every planned offset, which this bench
+//! then passed. Choosing inputs against that is tracked separately, because re-deriving a case's
+//! numbers and moving its path are two changes and only one can be reviewed at a time -- #84.
 //!
 //! So a new case is not finished when it draws the expected pixel. Nudge each input to a
 //! neighbouring value and check the pixel moves: a texel of each image, each stream, each uniform
@@ -46,7 +82,11 @@
 //! disagree; see `draw_cost.rs`.
 
 use ash::vk;
+use tessella_capture_abi::envelope::{
+    AttributeDesc, Extent, GeometryId, Rect16, SlabRef, TextureFilter, TextureId, ViewId,
+};
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
+use tessella_capture_abi::generated::shader_attributes::ShaderAttribute;
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PATTERN_DRAWABLE_UBO, BACKGROUND_PATTERN_PROPS_UBO,
     BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
@@ -61,10 +101,22 @@ use tessella_capture_abi::generated::ubo_layouts::{
     RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO, SYMBOL_EVALUATED_PROPS_UBO,
     SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
-use tessella_emblema::device::{check_vertex_formats, preferred, vertex_format};
+use tessella_capture_abi::{TextureChannelDataType, TexturePixelType};
+use tessella_emblema::device::{self, Attachment, check_vertex_formats, vertex_format};
 use tessella_emblema::families::family;
+use tessella_emblema::images::Images;
+use tessella_emblema::pipelines::{Blend, Cache, Targets};
 use tessella_emblema::shaders::module;
+use tessella_emblema::store::Store;
 use tessella_emblema::surface::{GLOBE_BEND_UBO, GLOBE_CAMERA_UBO, Surface, TERRAIN_DRAWABLE_UBO};
+use tessella_emblema::target::{self, Depth, Host};
+use tessella_emblema::{blocks, buffers, descriptors, pipelines, slots, vertices};
+// The probe's own `Image` is a case's input; the wrapper's is a device object. Aliased rather
+// than renamed, because the twenty-six cases name theirs.
+use tessella_vk::{Buffer, Image as Device2d, ImageView, Memory, Recorder};
+
+mod common;
+use common::Open;
 
 /// The target's edge, in pixels. Small: one pixel is read and the rest is margin.
 const SIDE: u32 = 32;
@@ -154,11 +206,19 @@ enum Texels {
 }
 
 impl Texels {
-    fn format(&self) -> vk::Format {
+    /// The pair the producer sends, which is what the format is derived *from*.
+    ///
+    /// Not a `vk::Format` any more. mbgl's `Texture2D::setFormat` takes a pixel type and a channel
+    /// type and `device::texture_format` is the mapping between them, so a probe naming the Vulkan
+    /// format would be asserting its own copy of that mapping rather than the library's.
+    fn kinds(&self) -> (TexturePixelType, TextureChannelDataType) {
         match self {
-            Self::Rgba(_) => vk::Format::R8G8B8A8_UNORM,
-            Self::Red(_) => vk::Format::R8_UNORM,
-            Self::Floats(_) => vk::Format::R32G32B32A32_SFLOAT,
+            Self::Rgba(_) => (TexturePixelType::RGBA, TextureChannelDataType::UnsignedByte),
+            Self::Red(_) => (
+                TexturePixelType::Alpha,
+                TextureChannelDataType::UnsignedByte,
+            ),
+            Self::Floats(_) => (TexturePixelType::RGBA, TextureChannelDataType::Float),
         }
     }
 
@@ -448,13 +508,15 @@ fn main() {
 }
 
 fn run() -> Result<usize, String> {
-    let gpu = Gpu::open()?;
-    println!("  device: {} ({})", gpu.name, gpu.class);
+    let open = Open::preferred()?;
+    println!("  device: {} ({})", open.name, open.class);
+    let probe = Probe::new(&open)?;
+    let mut cache = Cache::new();
 
     // The control first. A cleared pass has to read black, or a right answer below could be
     // whatever the mapped memory happened to hold.
-    gpu.clear()?;
-    let cleared = gpu.pixel(SIDE / 2, SIDE / 2)?;
+    probe.draw(&open, None)?;
+    let cleared = probe.pixel(SIDE / 2, SIDE / 2)?;
     if cleared != [0, 0, 0, 0] {
         return Err(format!(
             "a cleared pass reads {cleared:?}, so the readback is not showing the pass"
@@ -473,7 +535,7 @@ fn run() -> Result<usize, String> {
         return Err(format!("no case named {}", only.unwrap_or_default()));
     }
     for case in &cases {
-        let drawn = gpu.run(case)?;
+        let drawn = draw_case(&open, &probe, &mut cache, case)?;
         if drawn != case.expect {
             return Err(format!(
                 "{} reads {drawn:?}, wanted {:?}",
@@ -482,6 +544,12 @@ fn run() -> Result<usize, String> {
         }
         println!("  {:<18} {drawn:?}", case.name);
     }
+    println!(
+        "  through the library: {} pipelines from {} modules, {} binds",
+        cache.built(),
+        cache.modules(),
+        cache.bound()
+    );
     Ok(cases.len())
 }
 
@@ -2041,75 +2109,6 @@ fn per_vertex(values: &[f32], vertices: usize) -> Vec<u8> {
         .collect()
 }
 
-/// A case's vertex input state: its bindings, its attributes and the formats to check.
-type VertexInput = (
-    Vec<vk::VertexInputBindingDescription>,
-    Vec<vk::VertexInputAttributeDescription>,
-    Vec<vk::Format>,
-);
-
-/// The vertex input state for a case: one binding per declared attribute, with the stride and
-/// offset its layout gives.
-///
-/// Lifted out of `pipeline` because that function is at `clippy::too_many_lines` and this is the
-/// part of it that is about the ABI rather than about Vulkan plumbing.
-fn vertex_input(case: &Case) -> Result<VertexInput, String> {
-    let mut bindings = Vec::new();
-    let mut attributes = Vec::new();
-    let mut formats = Vec::new();
-    let table = family(case.family)
-        .ok_or_else(|| format!("{}: {:?} is not a drawn family", case.name, case.family))?
-        .attributes;
-    for attribute in table {
-        let format = vertex_format(attribute.declared)
-            .ok_or_else(|| format!("{} has no vertex format", attribute.name))?;
-        formats.push(format);
-        let slot = u32::try_from(attribute.binding)
-            .map_err(|_| format!("{} binds at {}", attribute.name, attribute.binding))?;
-        let (stride, offset) = strided(case, format, bindings.len(), table.len())?;
-        bindings.push(
-            vk::VertexInputBindingDescription::default()
-                .binding(slot)
-                .stride(stride)
-                .input_rate(vk::VertexInputRate::VERTEX),
-        );
-        attributes.push(
-            vk::VertexInputAttributeDescription::default()
-                .location(slot)
-                .binding(slot)
-                .format(format)
-                .offset(offset),
-        );
-    }
-
-    Ok((bindings, attributes, formats))
-}
-
-/// One attribute's stride and offset, from the case's layout.
-///
-/// `at` is its place in the family's table, which is also its place in an interleaved layout's
-/// offsets.
-fn strided(
-    case: &Case,
-    format: vk::Format,
-    at: usize,
-    declared: usize,
-) -> Result<(u32, u32), String> {
-    match case.layout {
-        Layout::PerAttribute => Ok((stride_of(format), 0)),
-        Layout::Interleaved { stride, offsets } => {
-            let offset = *offsets.get(at).ok_or_else(|| {
-                format!(
-                    "{}: interleaved layout gives {} offsets for {declared} attributes",
-                    case.name,
-                    offsets.len()
-                )
-            })?;
-            Ok((stride, offset))
-        }
-    }
-}
-
 /// The value in the skirt's four bytes, which nothing binds.
 ///
 /// Not zero, and not a value that samples the same texel as the texture coordinate does. An
@@ -2196,965 +2195,11 @@ fn compile(source: &str) -> Result<Vec<u32>, String> {
         .map_err(|why| format!("spirv: {why}"))
 }
 
-/// A device, a linear-tiled target, and everything shared between cases.
+/// How wide a vertex format is, from its own name.
 ///
-/// Linear tiling and host-visible memory, so the readback is a map rather than a staging copy and
-/// a blit this probe would also have to get right. Every target here supports it for a color
-/// attachment at this size; a device that does not would fail at image creation, which is where it
-/// should.
-struct Gpu {
-    name: String,
-    class: &'static str,
-    _entry: ash::Entry,
-    instance: ash::Instance,
-    physical: vk::PhysicalDevice,
-    device: ash::Device,
-    queue: vk::Queue,
-    pool: vk::CommandPool,
-    command: vk::CommandBuffer,
-    fence: vk::Fence,
-    image: vk::Image,
-    image_memory: vk::DeviceMemory,
-    view: vk::ImageView,
-    pass: vk::RenderPass,
-    framebuffer: vk::Framebuffer,
-    row: u64,
-    offset: u64,
-}
-
-/// What a device's class is called here, which is the tier a run reports.
-fn tier(class: vk::PhysicalDeviceType) -> &'static str {
-    match class {
-        vk::PhysicalDeviceType::DISCRETE_GPU => "external",
-        vk::PhysicalDeviceType::INTEGRATED_GPU => "internal",
-        vk::PhysicalDeviceType::VIRTUAL_GPU => "virtual",
-        vk::PhysicalDeviceType::CPU => "software",
-        _ => "unknown",
-    }
-}
-
-impl Gpu {
-    #[allow(clippy::too_many_lines)]
-    fn open() -> Result<Self, String> {
-        let entry = match std::env::var("TSL_VULKAN_LIB") {
-            Ok(path) => unsafe { ash::Entry::load_from(&path) }
-                .map_err(|why| format!("no driver at {path}: {why}"))?,
-            Err(_) => unsafe { ash::Entry::load() }.map_err(|why| format!("no loader: {why}"))?,
-        };
-        // 1.1 where there is one: naga emits `StorageBuffer` through
-        // `SPV_KHR_storage_buffer_storage_class`, core from 1.1. Asked rather than assumed, for
-        // the implementations that are 1.0 whatever their manifest says.
-        let version = unsafe { entry.try_enumerate_instance_version() }
-            .ok()
-            .flatten()
-            .unwrap_or(vk::make_api_version(0, 1, 0, 0));
-        let wanted = if vk::api_version_minor(version) >= 1 {
-            vk::make_api_version(0, 1, 1, 0)
-        } else {
-            vk::make_api_version(0, 1, 0, 0)
-        };
-        let app = vk::ApplicationInfo::default().api_version(wanted);
-        let instance = unsafe {
-            entry.create_instance(
-                &vk::InstanceCreateInfo::default().application_info(&app),
-                None,
-            )
-        }
-        .map_err(|why| format!("no instance: {why}"))?;
-
-        // External, then internal, then software.
-        let devices = unsafe { instance.enumerate_physical_devices() }
-            .map_err(|why| format!("no devices: {why}"))?;
-        let classes: Vec<vk::PhysicalDeviceType> = devices
-            .iter()
-            .map(|device| unsafe { instance.get_physical_device_properties(*device) }.device_type)
-            .collect();
-        let physical = preferred(&classes)
-            .map(|index| devices[index])
-            .ok_or_else(|| "no physical device".to_string())?;
-        let properties = unsafe { instance.get_physical_device_properties(physical) };
-        let name = properties.device_name_as_c_str().map_or_else(
-            |_| "unnamed".to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        );
-        let class = tier(properties.device_type);
-
-        let family = unsafe { instance.get_physical_device_queue_family_properties(physical) }
-            .iter()
-            .position(|queue| queue.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-            .ok_or_else(|| "no graphics queue".to_string())?;
-        let family = u32::try_from(family).map_err(|_| "absurd queue family".to_string())?;
-        let priorities = [1.0f32];
-        let queues = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(family)
-            .queue_priorities(&priorities)];
-        let device = unsafe {
-            instance.create_device(
-                physical,
-                &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
-                None,
-            )
-        }
-        .map_err(|why| format!("no device: {why}"))?;
-        let queue = unsafe { device.get_device_queue(family, 0) };
-
-        let pool = unsafe {
-            device.create_command_pool(
-                &vk::CommandPoolCreateInfo::default()
-                    .queue_family_index(family)
-                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-                None,
-            )
-        }
-        .map_err(|why| format!("no command pool: {why}"))?;
-        let command = unsafe {
-            device.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(pool)
-                    .command_buffer_count(1),
-            )
-        }
-        .map_err(|why| format!("no command buffer: {why}"))?[0];
-        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
-            .map_err(|why| format!("no fence: {why}"))?;
-
-        let image = unsafe {
-            device.create_image(
-                &vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(vk::Format::R8G8B8A8_UNORM)
-                    .extent(vk::Extent3D {
-                        width: SIDE,
-                        height: SIDE,
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::LINEAR)
-                    .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-                    .initial_layout(vk::ImageLayout::UNDEFINED),
-                None,
-            )
-        }
-        .map_err(|why| format!("no image: {why}"))?;
-        let needs = unsafe { device.get_image_memory_requirements(image) };
-        let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical) };
-        let host = pick(
-            &memory_properties,
-            needs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .ok_or_else(|| "no host-visible memory for a linear attachment".to_string())?;
-        let image_memory = unsafe {
-            device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(needs.size)
-                    .memory_type_index(host),
-                None,
-            )
-        }
-        .map_err(|why| format!("no image memory: {why}"))?;
-        unsafe { device.bind_image_memory(image, image_memory, 0) }
-            .map_err(|why| format!("image not bound: {why}"))?;
-        let subresource = unsafe {
-            device.get_image_subresource_layout(
-                image,
-                vk::ImageSubresource::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .mip_level(0)
-                    .array_layer(0),
-            )
-        };
-
-        let view = unsafe {
-            device.create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(vk::Format::R8G8B8A8_UNORM)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1),
-                    ),
-                None,
-            )
-        }
-        .map_err(|why| format!("no view: {why}"))?;
-
-        let attachments = [vk::AttachmentDescription::default()
-            .format(vk::Format::R8G8B8A8_UNORM)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::GENERAL)];
-        let references = [vk::AttachmentReference::default()
-            .attachment(0)
-            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
-        let subpasses = [vk::SubpassDescription::default()
-            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(&references)];
-        let pass = unsafe {
-            device.create_render_pass(
-                &vk::RenderPassCreateInfo::default()
-                    .attachments(&attachments)
-                    .subpasses(&subpasses),
-                None,
-            )
-        }
-        .map_err(|why| format!("no render pass: {why}"))?;
-        let views = [view];
-        let framebuffer = unsafe {
-            device.create_framebuffer(
-                &vk::FramebufferCreateInfo::default()
-                    .render_pass(pass)
-                    .attachments(&views)
-                    .width(SIDE)
-                    .height(SIDE)
-                    .layers(1),
-                None,
-            )
-        }
-        .map_err(|why| format!("no framebuffer: {why}"))?;
-
-        Ok(Self {
-            name,
-            class,
-            _entry: entry,
-            instance,
-            physical,
-            device,
-            queue,
-            pool,
-            command,
-            fence,
-            image,
-            image_memory,
-            view,
-            pass,
-            framebuffer,
-            row: subresource.row_pitch,
-            offset: subresource.offset,
-        })
-    }
-
-    /// The control: the same pass with nothing drawn in it.
-    fn clear(&self) -> Result<(), String> {
-        self.record(None)?;
-        self.submit()
-    }
-
-    /// Draws one case and reads its pixel.
-    fn run(&self, case: &Case) -> Result<[u8; 4], String> {
-        let family = family(case.family)
-            .ok_or_else(|| format!("{}: {:?} is not a drawn family", case.name, case.family))?;
-        let source = module(
-            case.surface,
-            family.blocks,
-            family.attributes,
-            family.textures,
-            family.body,
-        )
-        .map_err(|why| format!("{} does not assemble: {why:?}", case.name))?;
-        let words = compile(&source).map_err(|why| format!("{}: {why}", case.name))?;
-        let held = Held::new(self, case)?;
-        let pipeline = self.pipeline(case, &words, held.pipeline_layout)?;
-        self.record(Some((case, &pipeline, &held)))?;
-        self.submit()?;
-        unsafe {
-            self.device.destroy_pipeline(pipeline.pipeline, None);
-            for shader in &pipeline.modules {
-                self.device.destroy_shader_module(*shader, None);
-            }
-        }
-        drop(held);
-        self.pixel(case.at.0, case.at.1)
-    }
-
-    fn record(&self, draw: Option<(&Case, &Pipeline, &Held)>) -> Result<(), String> {
-        unsafe {
-            self.device
-                .begin_command_buffer(self.command, &vk::CommandBufferBeginInfo::default())
-        }
-        .map_err(|why| format!("not recording: {why}"))?;
-
-        // The sampled images go from `UNDEFINED` to `GENERAL` before the pass reads them. Written
-        // through a map, so there is nothing to wait on but the host write itself.
-        if let Some((_, _, held)) = draw {
-            let barriers: Vec<vk::ImageMemoryBarrier<'_>> = held
-                .images
-                .iter()
-                .map(|image| {
-                    vk::ImageMemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::HOST_WRITE)
-                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                        .old_layout(vk::ImageLayout::UNDEFINED)
-                        .new_layout(vk::ImageLayout::GENERAL)
-                        .image(*image)
-                        .subresource_range(
-                            vk::ImageSubresourceRange::default()
-                                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                .level_count(1)
-                                .layer_count(1),
-                        )
-                })
-                .collect();
-            if !barriers.is_empty() {
-                unsafe {
-                    self.device.cmd_pipeline_barrier(
-                        self.command,
-                        vk::PipelineStageFlags::HOST,
-                        vk::PipelineStageFlags::FRAGMENT_SHADER
-                            | vk::PipelineStageFlags::VERTEX_SHADER,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &[],
-                        &barriers,
-                    );
-                }
-            }
-        }
-
-        let clears = [vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [0.0, 0.0, 0.0, 0.0],
-            },
-        }];
-        unsafe {
-            self.device.cmd_begin_render_pass(
-                self.command,
-                &vk::RenderPassBeginInfo::default()
-                    .render_pass(self.pass)
-                    .framebuffer(self.framebuffer)
-                    .render_area(vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent: vk::Extent2D {
-                            width: SIDE,
-                            height: SIDE,
-                        },
-                    })
-                    .clear_values(&clears),
-                vk::SubpassContents::INLINE,
-            );
-            if let Some((case, pipeline, held)) = draw {
-                self.device.cmd_bind_pipeline(
-                    self.command,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipeline.pipeline,
-                );
-                self.device.cmd_bind_descriptor_sets(
-                    self.command,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    held.pipeline_layout,
-                    0,
-                    &[held.descriptors],
-                    &[],
-                );
-                // One binding per declared attribute, which is what the pipeline was built with.
-                let bindings = family(case.family).map_or(0, |found| found.attributes.len());
-                let streams = held.bound(case, bindings);
-                let zeros = vec![0u64; streams.len()];
-                self.device
-                    .cmd_bind_vertex_buffers(self.command, 0, &streams, &zeros);
-                // `firstInstance` is the drawable's slot, which the body reads as `ubo_index`.
-                self.device.cmd_draw(self.command, case.vertices, 1, 0, 0);
-            }
-            self.device.cmd_end_render_pass(self.command);
-            self.device
-                .end_command_buffer(self.command)
-                .map_err(|why| format!("not recorded: {why}"))?;
-        }
-        Ok(())
-    }
-
-    fn submit(&self) -> Result<(), String> {
-        let commands = [self.command];
-        let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &submits, self.fence)
-                .map_err(|why| format!("not submitted: {why}"))?;
-            self.device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
-                .map_err(|why| format!("not finished: {why}"))?;
-            self.device
-                .reset_fences(&[self.fence])
-                .map_err(|why| format!("fence not reset: {why}"))?;
-        }
-        Ok(())
-    }
-
-    /// A pipeline for the module, with the vertex input taken from the ABI's table.
-    ///
-    /// One binding per attribute, numbered by the table's own `binding` -- which is also the
-    /// `@location` the generated `In` struct gives it, so the two cannot drift apart here.
-    fn pipeline(
-        &self,
-        case: &Case,
-        words: &[u32],
-        layout: vk::PipelineLayout,
-    ) -> Result<Pipeline, String> {
-        // Adreno rejects a module with two entry points, so each stage gets its own.
-        let vertex = self.shader(words)?;
-        let fragment = self.shader(words)?;
-
-        let (bindings, attributes, formats) = vertex_input(case)?;
-        // A device that will not take one of these in a vertex buffer binds the attribute
-        // anyway and the shader reads zero, so ask before building the pipeline rather than
-        // reading the silence as a pixel. Per case, not once per device: a board missing one
-        // format can still run every family that does not declare it.
-        check_vertex_formats(&formats, |format| unsafe {
-            self.instance
-                .get_physical_device_format_properties(self.physical, format)
-                .buffer_features
-        })
-        .map_err(|why| format!("{} needs a format this device refuses: {why:?}", case.name))?;
-
-        let entry_vertex = c"vertex_main";
-        let entry_fragment = c"fragment_main";
-        let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(vertex)
-                .name(entry_vertex),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(fragment)
-                .name(entry_fragment),
-        ];
-        let input = vk::PipelineVertexInputStateCreateInfo::default()
-            .vertex_binding_descriptions(&bindings)
-            .vertex_attribute_descriptions(&attributes);
-        let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-        let side = f64::from(SIDE) as f32;
-        let viewports = [vk::Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: side,
-            height: side,
-            min_depth: 0.0,
-            max_depth: 1.0,
-        }];
-        let scissors = [vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent: vk::Extent2D {
-                width: SIDE,
-                height: SIDE,
-            },
-        }];
-        let viewport = vk::PipelineViewportStateCreateInfo::default()
-            .viewports(&viewports)
-            .scissors(&scissors);
-        let raster = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(vk::PolygonMode::FILL)
-            // No culling: this probe is not checking which way a triangle winds.
-            .cull_mode(vk::CullModeFlags::NONE)
-            .line_width(1.0);
-        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        // Blending off, so the pixel read back is what the fragment stage returned rather than
-        // what it returned composited over the clear.
-        let blends = [vk::PipelineColorBlendAttachmentState::default()
-            .color_write_mask(vk::ColorComponentFlags::RGBA)
-            .blend_enable(false)];
-        let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blends);
-
-        let create = [vk::GraphicsPipelineCreateInfo::default()
-            .stages(&stages)
-            .vertex_input_state(&input)
-            .input_assembly_state(&assembly)
-            .viewport_state(&viewport)
-            .rasterization_state(&raster)
-            .multisample_state(&multisample)
-            .color_blend_state(&blend)
-            .layout(layout)
-            .render_pass(self.pass)
-            .subpass(0)];
-        let pipelines = unsafe {
-            self.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &create, None)
-        }
-        .map_err(|(_, why)| format!("no pipeline for {}: {why}", case.name))?;
-        Ok(Pipeline {
-            pipeline: pipelines[0],
-            modules: vec![vertex, fragment],
-        })
-    }
-
-    fn shader(&self, words: &[u32]) -> Result<vk::ShaderModule, String> {
-        unsafe {
-            self.device
-                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None)
-        }
-        .map_err(|why| format!("no shader module: {why}"))
-    }
-
-    /// A pixel, read straight out of the linear image.
-    fn pixel(&self, x: u32, y: u32) -> Result<[u8; 4], String> {
-        let mapped = unsafe {
-            self.device.map_memory(
-                self.image_memory,
-                0,
-                vk::WHOLE_SIZE,
-                vk::MemoryMapFlags::empty(),
-            )
-        }
-        .map_err(|why| format!("image not mapped: {why}"))?
-        .cast::<u8>();
-        let at = self.offset + u64::from(y) * self.row + u64::from(x) * 4;
-        let mut pixel = [0u8; 4];
-        unsafe {
-            std::ptr::copy_nonoverlapping(mapped.add(at as usize), pixel.as_mut_ptr(), 4);
-            self.device.unmap_memory(self.image_memory);
-        }
-        Ok(pixel)
-    }
-}
-
-/// A pipeline and the modules it was built from, destroyed together.
-struct Pipeline {
-    pipeline: vk::Pipeline,
-    modules: Vec<vk::ShaderModule>,
-}
-
-/// One case's buffers and descriptors, freed when it is done.
-struct Held<'a> {
-    gpu: &'a Gpu,
-    buffers: Vec<vk::Buffer>,
-    streams: usize,
-    memory: vk::DeviceMemory,
-    descriptor_layout: vk::DescriptorSetLayout,
-    descriptor_pool: vk::DescriptorPool,
-    descriptors: vk::DescriptorSet,
-    pipeline_layout: vk::PipelineLayout,
-    images: Vec<vk::Image>,
-    image_memory: Vec<vk::DeviceMemory>,
-    views: Vec<vk::ImageView>,
-    samplers: Vec<vk::Sampler>,
-}
-
-impl<'a> Held<'a> {
-    #[allow(clippy::too_many_lines)]
-    fn new(gpu: &'a Gpu, case: &Case) -> Result<Self, String> {
-        let streams = case.streams.len();
-        let contents: Vec<&Vec<u8>> = case.streams.iter().chain(case.uniforms.iter()).collect();
-
-        let mut buffers = Vec::with_capacity(contents.len());
-        for (index, bytes) in contents.iter().enumerate() {
-            let usage = if index < streams {
-                vk::BufferUsageFlags::VERTEX_BUFFER
-            } else {
-                vk::BufferUsageFlags::STORAGE_BUFFER
-            };
-            let buffer = unsafe {
-                gpu.device.create_buffer(
-                    &vk::BufferCreateInfo::default()
-                        .size(bytes.len() as u64)
-                        .usage(usage),
-                    None,
-                )
-            }
-            .map_err(|why| format!("no buffer {index} for {}: {why}", case.name))?;
-            buffers.push(buffer);
-        }
-
-        // One allocation, each buffer at its own aligned offset.
-        let mut offsets = vec![0u64; buffers.len()];
-        let mut total = 0u64;
-        let mut bits = u32::MAX;
-        for (index, buffer) in buffers.iter().enumerate() {
-            let needs = unsafe { gpu.device.get_buffer_memory_requirements(*buffer) };
-            let align = needs.alignment.max(1);
-            total = total.div_ceil(align) * align;
-            offsets[index] = total;
-            total += needs.size;
-            bits &= needs.memory_type_bits;
-        }
-        let memory_properties = unsafe {
-            gpu.instance
-                .get_physical_device_memory_properties(gpu.physical)
-        };
-        let host = pick(
-            &memory_properties,
-            bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .ok_or_else(|| "no host-visible memory for the buffers".to_string())?;
-        let memory = unsafe {
-            gpu.device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(total)
-                    .memory_type_index(host),
-                None,
-            )
-        }
-        .map_err(|why| format!("no buffer memory: {why}"))?;
-
-        let mapped = unsafe {
-            gpu.device
-                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-        }
-        .map_err(|why| format!("not mapped: {why}"))?
-        .cast::<u8>();
-        for (index, buffer) in buffers.iter().enumerate() {
-            unsafe {
-                gpu.device
-                    .bind_buffer_memory(*buffer, memory, offsets[index])
-            }
-            .map_err(|why| format!("buffer {index} not bound: {why}"))?;
-            let bytes = contents[index];
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    mapped.add(offsets[index] as usize),
-                    bytes.len(),
-                );
-            }
-        }
-        unsafe { gpu.device.unmap_memory(memory) };
-
-        // The images the family samples, each a linear host-visible one so the texels are a
-        // memory write rather than a staging buffer and a copy this probe would also have to get
-        // right. Sampling a linear image needs `SAMPLED_IMAGE` in the format's
-        // `linearTilingFeatures`, which every target here reports for `R8G8B8A8_UNORM`.
-        let (images, image_memory, views, samplers) = Self::images(gpu, case)?;
-
-        // One storage binding per block, from zero, then two per texture -- the image and its
-        // sampler, in that order, which is how `module` numbers them.
-        let count = u32::try_from(case.uniforms.len()).map_err(|_| "absurd block count")?;
-        let mut bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = (0..count)
-            .map(|slot| {
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(slot)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
-            })
-            .collect();
-        for index in 0..u32::try_from(views.len()).map_err(|_| "absurd image count")? {
-            for (step, kind) in [
-                vk::DescriptorType::SAMPLED_IMAGE,
-                vk::DescriptorType::SAMPLER,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let step = u32::try_from(step).unwrap_or_default();
-                bindings.push(
-                    vk::DescriptorSetLayoutBinding::default()
-                        .binding(count + index * 2 + step)
-                        .descriptor_type(kind)
-                        .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
-                );
-            }
-        }
-        let descriptor_layout = unsafe {
-            gpu.device.create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
-                None,
-            )
-        }
-        .map_err(|why| format!("no descriptor layout: {why}"))?;
-        let images_count = u32::try_from(views.len()).map_err(|_| "absurd image count")?;
-        let mut sizes = vec![
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(count.max(1)),
-        ];
-        if images_count > 0 {
-            sizes.push(
-                vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                    .descriptor_count(images_count),
-            );
-            sizes.push(
-                vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::SAMPLER)
-                    .descriptor_count(images_count),
-            );
-        }
-        let descriptor_pool = unsafe {
-            gpu.device.create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(1)
-                    .pool_sizes(&sizes),
-                None,
-            )
-        }
-        .map_err(|why| format!("no descriptor pool: {why}"))?;
-        let layouts = [descriptor_layout];
-        let descriptors = unsafe {
-            gpu.device.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(descriptor_pool)
-                    .set_layouts(&layouts),
-            )
-        }
-        .map_err(|why| format!("no descriptor set: {why}"))?[0];
-        let pipeline_layout = unsafe {
-            gpu.device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts),
-                None,
-            )
-        }
-        .map_err(|why| format!("no pipeline layout: {why}"))?;
-
-        let infos: Vec<vk::DescriptorBufferInfo> = buffers[streams..]
-            .iter()
-            .map(|buffer| {
-                vk::DescriptorBufferInfo::default()
-                    .buffer(*buffer)
-                    .offset(0)
-                    .range(vk::WHOLE_SIZE)
-            })
-            .collect();
-        let updates: Vec<vk::WriteDescriptorSet<'_>> = infos
-            .iter()
-            .enumerate()
-            .map(|(slot, info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(descriptors)
-                    .dst_binding(u32::try_from(slot).unwrap_or_default())
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(std::slice::from_ref(info))
-            })
-            .collect();
-        let image_infos: Vec<vk::DescriptorImageInfo> = views
-            .iter()
-            .zip(&samplers)
-            .flat_map(|(view, sampler)| {
-                [
-                    vk::DescriptorImageInfo::default()
-                        .image_view(*view)
-                        .image_layout(vk::ImageLayout::GENERAL),
-                    vk::DescriptorImageInfo::default().sampler(*sampler),
-                ]
-            })
-            .collect();
-        let mut updates = updates;
-        for (step, info) in image_infos.iter().enumerate() {
-            let step = u32::try_from(step).unwrap_or_default();
-            let kind = if step % 2 == 0 {
-                vk::DescriptorType::SAMPLED_IMAGE
-            } else {
-                vk::DescriptorType::SAMPLER
-            };
-            updates.push(
-                vk::WriteDescriptorSet::default()
-                    .dst_set(descriptors)
-                    .dst_binding(count + step)
-                    .descriptor_type(kind)
-                    .image_info(std::slice::from_ref(info)),
-            );
-        }
-        unsafe { gpu.device.update_descriptor_sets(&updates, &[]) };
-
-        Ok(Self {
-            gpu,
-            buffers,
-            streams,
-            memory,
-            descriptor_layout,
-            descriptor_pool,
-            descriptors,
-            pipeline_layout,
-            images,
-            image_memory,
-            views,
-            samplers,
-        })
-    }
-
-    /// The case's images, uploaded and left in `GENERAL` so a sampler can read them.
-    ///
-    /// Linear tiling and host-visible memory: the texels are written through the map, a row at a
-    /// time because the row pitch the device reports is its own and not the image's width. A
-    /// `NEAREST` sampler with `CLAMP_TO_EDGE`, so a case that wants to know which texel was read
-    /// gets one answer rather than a blend of four.
-    // Vulkan setup, which is a sequence rather than a composition.
-    #[allow(clippy::too_many_lines, clippy::type_complexity)]
-    fn images(
-        gpu: &Gpu,
-        case: &Case,
-    ) -> Result<
-        (
-            Vec<vk::Image>,
-            Vec<vk::DeviceMemory>,
-            Vec<vk::ImageView>,
-            Vec<vk::Sampler>,
-        ),
-        String,
-    > {
-        let mut images = Vec::new();
-        let mut memories = Vec::new();
-        let mut views = Vec::new();
-        let mut samplers = Vec::new();
-        for (index, source) in case.images.iter().enumerate() {
-            let image = unsafe {
-                gpu.device.create_image(
-                    &vk::ImageCreateInfo::default()
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .format(source.texels.format())
-                        .extent(vk::Extent3D {
-                            width: source.width,
-                            height: source.height,
-                            depth: 1,
-                        })
-                        .mip_levels(1)
-                        .array_layers(1)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .tiling(vk::ImageTiling::LINEAR)
-                        .usage(vk::ImageUsageFlags::SAMPLED)
-                        .initial_layout(vk::ImageLayout::UNDEFINED),
-                    None,
-                )
-            }
-            .map_err(|why| format!("no image {index} for {}: {why}", case.name))?;
-            let needs = unsafe { gpu.device.get_image_memory_requirements(image) };
-            let properties = unsafe {
-                gpu.instance
-                    .get_physical_device_memory_properties(gpu.physical)
-            };
-            let host = pick(
-                &properties,
-                needs.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )
-            .ok_or_else(|| "no host-visible memory for a sampled image".to_string())?;
-            let memory = unsafe {
-                gpu.device.allocate_memory(
-                    &vk::MemoryAllocateInfo::default()
-                        .allocation_size(needs.size)
-                        .memory_type_index(host),
-                    None,
-                )
-            }
-            .map_err(|why| format!("no memory for image {index}: {why}"))?;
-            unsafe { gpu.device.bind_image_memory(image, memory, 0) }
-                .map_err(|why| format!("image {index} not bound: {why}"))?;
-
-            let layout = unsafe {
-                gpu.device.get_image_subresource_layout(
-                    image,
-                    vk::ImageSubresource::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .mip_level(0)
-                        .array_layer(0),
-                )
-            };
-            let mapped = unsafe {
-                gpu.device
-                    .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-            }
-            .map_err(|why| format!("image {index} not mapped: {why}"))?
-            .cast::<u8>();
-            let bytes = source.texels.bytes();
-            let stride = source.width as usize * source.texels.width();
-            for row in 0..source.height as usize {
-                let from = &bytes[row * stride..(row + 1) * stride];
-                let at = layout.offset as usize + row * layout.row_pitch as usize;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(from.as_ptr(), mapped.add(at), stride);
-                }
-            }
-            unsafe { gpu.device.unmap_memory(memory) };
-
-            let view = unsafe {
-                gpu.device.create_image_view(
-                    &vk::ImageViewCreateInfo::default()
-                        .image(image)
-                        .view_type(vk::ImageViewType::TYPE_2D)
-                        // The identity component mapping, which is the default and what
-                        // `SYMBOL_SDF_BODY` requires of the producer: it reads a one-channel atlas
-                        // from `.r`, where mbgl's own backend swizzles red into alpha and reads
-                        // `.a`. The two have to agree and nothing but a pixel says whether they do.
-                        .format(source.texels.format())
-                        .subresource_range(
-                            vk::ImageSubresourceRange::default()
-                                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                .level_count(1)
-                                .layer_count(1),
-                        ),
-                    None,
-                )
-            }
-            .map_err(|why| format!("no view for image {index}: {why}"))?;
-            let sampler = unsafe {
-                gpu.device.create_sampler(
-                    &vk::SamplerCreateInfo::default()
-                        .mag_filter(vk::Filter::NEAREST)
-                        .min_filter(vk::Filter::NEAREST)
-                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
-                    None,
-                )
-            }
-            .map_err(|why| format!("no sampler for image {index}: {why}"))?;
-
-            images.push(image);
-            memories.push(memory);
-            views.push(view);
-            samplers.push(sampler);
-        }
-        Ok((images, memories, views, samplers))
-    }
-
-    fn streams(&self) -> Vec<vk::Buffer> {
-        self.buffers[..self.streams].to_vec()
-    }
-
-    /// The buffers to bind, one per binding.
-    ///
-    /// The interleaved form has one buffer and several bindings, so the same buffer is bound to
-    /// each: a binding's stride and a declared attribute's offset within it are pipeline state,
-    /// and only the buffer itself is bound here.
-    fn bound(&self, case: &Case, bindings: usize) -> Vec<vk::Buffer> {
-        match case.layout {
-            Layout::PerAttribute => self.streams(),
-            Layout::Interleaved { .. } => vec![self.buffers[0]; bindings],
-        }
-    }
-}
-
-impl Drop for Held<'_> {
-    fn drop(&mut self) {
-        let device = &self.gpu.device;
-        unsafe {
-            let _ = device.device_wait_idle();
-            device.destroy_pipeline_layout(self.pipeline_layout, None);
-            device.destroy_descriptor_pool(self.descriptor_pool, None);
-            device.destroy_descriptor_set_layout(self.descriptor_layout, None);
-            for buffer in &self.buffers {
-                device.destroy_buffer(*buffer, None);
-            }
-            device.free_memory(self.memory, None);
-            for sampler in &self.samplers {
-                device.destroy_sampler(*sampler, None);
-            }
-            for view in &self.views {
-                device.destroy_image_view(*view, None);
-            }
-            for image in &self.images {
-                device.destroy_image(*image, None);
-            }
-            for memory in &self.image_memory {
-                device.free_memory(*memory, None);
-            }
-        }
-    }
-}
-
-/// How many bytes one vertex of a format occupies, read from the format's own name.
-///
-/// A table of my own would be a second opinion about what `R16G16_SINT` means, and would also let
-/// a wrong format fail here -- loudly, in this probe's own code -- instead of reaching the draw
-/// and producing the wrong pixel, which is the failure worth seeing.
+/// Parsed rather than tabulated: a table of fifty formats is fifty chances to write a wrong number,
+/// and the name already carries the answer. Only used for the one-buffer-per-attribute layout,
+/// where an attribute's stride is its own width.
 fn stride_of(format: vk::Format) -> u32 {
     let name = format!("{format:?}");
     let channels = name
@@ -3179,33 +2224,479 @@ fn stride_of(format: vk::Format) -> u32 {
     bits / 8
 }
 
-/// A memory type satisfying the requirements and carrying the properties.
-fn pick(
-    properties: &vk::PhysicalDeviceMemoryProperties,
-    bits: u32,
-    wanted: vk::MemoryPropertyFlags,
-) -> Option<u32> {
-    (0..properties.memory_type_count).find(|index| {
-        bits & (1 << index) != 0
-            && properties.memory_types[*index as usize]
-                .property_flags
-                .contains(wanted)
-    })
+/// The slab this probe's streams live in, which is the only one it has.
+const SLAB: u32 = 0;
+
+/// The geometry every case announces, one at a time.
+const GEOMETRY: GeometryId = GeometryId(1);
+
+/// The view and layer a case's blocks belong to.
+const WHICH: blocks::Which = blocks::Which {
+    view: ViewId(1),
+    layer: 0,
+};
+
+/// The target's format, which is what the expected pixels are written in.
+const COLOR: vk::Format = vk::Format::R8G8B8A8_UNORM;
+
+/// What the producer would have sent for this case's streams.
+///
+/// The point of going through `AttributeDesc` rather than building Vulkan state directly: these are
+/// the records a capture carries, and `vertices::plan` is what a consumer turns them into. A probe
+/// that built the bindings itself would be checking its own arithmetic against the shader and would
+/// not be checking the library's at all.
+///
+/// One `SlabRef` per attribute for the per-attribute layout, and one shared by all of them for the
+/// interleaved one -- which is what makes the dedup in `buffers::needs` observable: three
+/// descriptors over one reference are one buffer bound three times at three offsets.
+fn descriptors_for(case: &Case, table: &[ShaderAttribute]) -> Result<Vec<AttributeDesc>, String> {
+    let mut out = Vec::with_capacity(table.len());
+    let mut at = 0u32;
+    for (index, attribute) in table.iter().enumerate() {
+        let format = vertex_format(attribute.declared)
+            .ok_or_else(|| format!("{} has no vertex format", attribute.name))?;
+        let (source, offset, stride) = match case.layout {
+            Layout::PerAttribute => {
+                let length = case
+                    .streams
+                    .get(index)
+                    .ok_or_else(|| format!("{}: no stream {index}", case.name))?
+                    .len();
+                let source = SlabRef {
+                    slab: SLAB,
+                    offset: at,
+                    length: u32::try_from(length).map_err(|_| "a stream past 4GiB".to_string())?,
+                };
+                at += source.length;
+                (source, 0, stride_of(format))
+            }
+            Layout::Interleaved { stride, offsets } => {
+                let whole = case
+                    .streams
+                    .first()
+                    .ok_or_else(|| format!("{}: no interleaved stream", case.name))?
+                    .len();
+                let offset = *offsets.get(index).ok_or_else(|| {
+                    format!(
+                        "{}: interleaved layout gives {} offsets for {} attributes",
+                        case.name,
+                        offsets.len(),
+                        table.len()
+                    )
+                })?;
+                let source = SlabRef {
+                    slab: SLAB,
+                    offset: 0,
+                    length: u32::try_from(whole).map_err(|_| "a stream past 4GiB".to_string())?,
+                };
+                (source, offset, stride)
+            }
+        };
+        out.push(AttributeDesc {
+            attr_id: attribute.attr_id,
+            binding: attribute.binding,
+            source,
+            offset,
+            vertex_offset: 0,
+            stride,
+            // The same on both sides, which is what a producer sends for an attribute it supplies
+            // at the declared type. A disagreement is `Refused::DeclaredDisagrees`, and
+            // `tests/vertex_plans.rs` is where that is exercised.
+            data_type: attribute.declared as u8,
+            declared_data_type: attribute.declared as u8,
+            _pad: [0; 2],
+        });
+    }
+    Ok(out)
 }
 
-impl Drop for Gpu {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = self.device.device_wait_idle();
-            self.device.destroy_framebuffer(self.framebuffer, None);
-            self.device.destroy_render_pass(self.pass, None);
-            self.device.destroy_image_view(self.view, None);
-            self.device.destroy_image(self.image, None);
-            self.device.free_memory(self.image_memory, None);
-            self.device.destroy_fence(self.fence, None);
-            self.device.destroy_command_pool(self.pool, None);
-            self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
+/// The bytes a slab reference names, out of the case's own streams.
+///
+/// Stands in for `tessella_consume::slab::resolve`, which reaches into the shared region. Here the
+/// streams are `Vec<u8>` the case built, and the references were laid out over them end to end.
+fn resolve(case: &Case, reference: SlabRef) -> Option<&[u8]> {
+    match case.layout {
+        // Laid out end to end in `descriptors_for`, so the offset locates the stream.
+        Layout::PerAttribute => {
+            let mut at = 0u32;
+            for stream in &case.streams {
+                let length = u32::try_from(stream.len()).ok()?;
+                if at == reference.offset {
+                    return Some(stream);
+                }
+                at += length;
+            }
+            None
         }
+        Layout::Interleaved { .. } => case.streams.first().map(Vec::as_slice),
     }
+}
+
+/// The target a case draws into, and the buffer its pixel is read back out of.
+///
+/// Through `target::frame` rather than a render pass of the probe's own, which is the whole point of
+/// this bench now: the pass the library records is the pass under test. That costs a readback --
+/// the image is optimally tiled and device-local, so a pixel is a `vkCmdCopyImageToBuffer` and a map
+/// rather than a map alone -- and buys the dynamic rendering, the depth-stencil attachment and the
+/// layout transitions being the library's.
+struct Probe<'d> {
+    image: Device2d<'d>,
+    view: ImageView<'d>,
+    _memory: Memory<'d>,
+    readback: Buffer<'d>,
+    read_memory: Memory<'d>,
+    depth: Depth<'d>,
+    targets: Targets,
+}
+
+impl<'d> Probe<'d> {
+    fn new(open: &'d Open) -> Result<Self, String> {
+        let gpu = open.gpu();
+        let image = gpu
+            .image(
+                SIDE,
+                SIDE,
+                COLOR,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+            )
+            .map_err(|why| format!("target image: {why}"))?;
+        let requirements = [image.requirements()];
+        let memory = gpu
+            .allocate(
+                requirements[0].size,
+                &requirements,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .map_err(|why| format!("target memory: {why}"))?;
+        memory
+            .bind_image(&image, 0)
+            .map_err(|why| format!("bind target: {why}"))?;
+        let view = gpu
+            .view(&image, COLOR)
+            .map_err(|why| format!("target view: {why}"))?;
+
+        let bytes = u64::from(SIDE) * u64::from(SIDE) * 4;
+        let readback = gpu
+            .buffer(bytes, vk::BufferUsageFlags::TRANSFER_DST)
+            .map_err(|why| format!("readback buffer: {why}"))?;
+        let needs = [readback.requirements()];
+        let read_memory = gpu
+            .allocate(
+                bytes.max(needs[0].size),
+                &needs,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+            .map_err(|why| format!("readback memory: {why}"))?;
+        read_memory
+            .bind(&readback, 0)
+            .map_err(|why| format!("bind readback: {why}"))?;
+
+        // Stencil only: these cases draw flat and test no depth, and the stencil is what the
+        // library's content pipelines always have. A compare mask of zero is the unclipped path --
+        // `benches/clip_masks.rs` measures that it draws everywhere rather than nowhere.
+        let depth_stencil = device::depth_stencil_format(Attachment::StencilOnly, |format| {
+            open.format_properties(format).optimal_tiling_features
+        })
+        .map_err(|why| format!("no depth-stencil format: {why:?}"))?;
+        let depth = Depth::new(gpu, SIDE, SIDE, depth_stencil)
+            .map_err(|why| format!("depth attachment: {why}"))?;
+
+        Ok(Self {
+            image,
+            view,
+            _memory: memory,
+            readback,
+            read_memory,
+            depth,
+            targets: Targets {
+                color: COLOR,
+                depth_stencil,
+                attachment: Attachment::StencilOnly,
+            },
+        })
+    }
+
+    /// One pixel of the last frame read back, as the target's format has it.
+    fn pixel(&self, x: u32, y: u32) -> Result<[u8; 4], String> {
+        let mapping = self
+            .read_memory
+            .map()
+            .map_err(|why| format!("map readback: {why}"))?;
+        let mut pixel = [0u8; 4];
+        // `copy_to_buffer` sets a row length of the image's width, so a row is `SIDE` texels.
+        let at = (u64::from(y) * u64::from(SIDE) + u64::from(x)) * 4;
+        mapping
+            .read(at, &mut pixel)
+            .map_err(|why| format!("read pixel: {why}"))?;
+        Ok(pixel)
+    }
+}
+
+/// What one draw needs bound, for the closure that records it.
+///
+/// The buffers and offsets are borrowed from the [`Store`], which is what makes them worth passing:
+/// a probe that bound buffers it had created itself would not be checking that
+/// `buffers::needs` and the store agree about which binding reads which slab.
+struct Bound<'a> {
+    pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+    set: vk::DescriptorSet,
+    streams: &'a [vk::Buffer],
+    offsets: &'a [u64],
+    vertices: u32,
+}
+
+impl Probe<'_> {
+    /// Records one frame through `target::frame` and copies the result back.
+    ///
+    /// `None` draws nothing, which is the cleared control. The copy is part of the same submission,
+    /// so the fence the harness waits on covers the draw and the readback together -- a wait that
+    /// covered only the draw would map a buffer the copy had not reached.
+    fn draw(&self, open: &Open, bound: Option<&Bound<'_>>) -> Result<(), String> {
+        open.submit(|record: Recorder<'_>| {
+            target::frame(
+                record,
+                Host {
+                    image: &self.image,
+                    view: &self.view,
+                    width: SIDE,
+                    height: SIDE,
+                    layout: vk::ImageLayout::UNDEFINED,
+                },
+                &self.depth,
+                Some([0.0, 0.0, 0.0, 0.0]),
+                |record| {
+                    if let Some(bound) = bound {
+                        record.bind_pipeline(bound.pipeline);
+                        record.bind_descriptor_set(bound.layout, bound.set);
+                        // Unclipped: a compare mask of no bits compares nothing and passes, which
+                        // `benches/clip_masks.rs` measures. These cases are about what a family
+                        // draws, not about where a tile's mask lets it.
+                        record.stencil_compare_mask(0);
+                        record.stencil_reference(0);
+                        record.bind_vertex_buffers(0, bound.streams, bound.offsets);
+                        // `firstInstance` is the drawable's slot, which the body reads as
+                        // `ubo_index`. Zero: one drawable per case, at entry zero of its blocks.
+                        record.draw(bound.vertices, 1, 0);
+                    }
+                },
+            );
+            record.transition(
+                &self.image,
+                target::LEAVES_IN,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            );
+            record.copy_to_buffer(&self.image, &self.readback, SIDE, SIDE);
+        })
+    }
+}
+
+/// Sets one case up through the library and draws it, answering the pixel it asked for.
+///
+/// Every step here is the library's. What the probe still owns is the *inputs*: the case's streams,
+/// its blocks, its images and the one pixel to read. That is the division the bench exists for -- a
+/// pixel that moves when a case's input moves says the input reached the shader, and it says it
+/// about the path a capture takes rather than about a path written here.
+#[allow(clippy::too_many_lines)]
+fn draw_case<'d>(
+    open: &'d Open,
+    probe: &Probe<'d>,
+    cache: &mut Cache<'d>,
+    case: &Case,
+) -> Result<[u8; 4], String> {
+    let gpu = open.gpu();
+    let found = family(case.family)
+        .ok_or_else(|| format!("{}: {:?} is not a drawn family", case.name, case.family))?;
+    let source = module(
+        case.surface,
+        found.blocks,
+        found.attributes,
+        found.textures,
+        found.body,
+    )
+    .map_err(|why| format!("{} does not assemble: {why:?}", case.name))?;
+    let words = compile(&source).map_err(|why| format!("{}: {why}", case.name))?;
+
+    // The producer's records, then the plan a consumer makes of them, then the key that plan is.
+    let descs = descriptors_for(case, found.attributes)?;
+    let plan = vertices::plan(found.attributes, &descs)
+        .map_err(|why| format!("{}: {why:?}", case.name))?;
+    if plan.bound.len() != found.attributes.len() {
+        return Err(format!(
+            "{}: {} of {} attributes planned",
+            case.name,
+            plan.bound.len(),
+            found.attributes.len()
+        ));
+    }
+    // A device that will not take one of these in a vertex buffer binds the attribute anyway and
+    // the shader reads zero, so ask before building the pipeline rather than reading the silence as
+    // a pixel. Per case, not once per device: a board missing one format can still run every family
+    // that does not declare it.
+    let formats: Vec<vk::Format> = plan.bound.iter().map(|bound| bound.format).collect();
+    check_vertex_formats(&formats, |format| {
+        open.format_properties(format).buffer_features
+    })
+    .map_err(|why| format!("{} needs a format this device refuses: {why:?}", case.name))?;
+
+    let key = pipelines::key(case.family, case.surface, 0, &plan, Blend::Unblended);
+    let bindings = pipelines::bindings(found, case.surface);
+
+    // The geometry, through the store the frame loop uses.
+    let needs = buffers::needs(
+        &plan,
+        SlabRef {
+            slab: SLAB,
+            offset: 0,
+            length: 0,
+        },
+    );
+    let mut store = Store::new();
+    store
+        .upload(gpu, GEOMETRY, &needs, &[], &|reference| {
+            resolve(case, reference)
+        })
+        .map_err(|why| format!("{}: geometry: {why}", case.name))?;
+
+    // One block buffer per slot, which is what the wire sends and what a set binds.
+    let mut held = blocks::Blocks::new();
+    let declared: Vec<&UboLayout> = found
+        .blocks
+        .iter()
+        .copied()
+        .chain(case.surface.blocks().iter().copied())
+        .collect();
+    if declared.len() != case.uniforms.len() {
+        return Err(format!(
+            "{}: {} blocks declared and {} supplied",
+            case.name,
+            declared.len(),
+            case.uniforms.len()
+        ));
+    }
+    for (layout, bytes) in declared.iter().zip(&case.uniforms) {
+        let slot = slots::of(layout)
+            .ok_or_else(|| format!("{}: {} has no slot", case.name, layout.name))?;
+        if bytes.len() != layout.stride as usize {
+            return Err(format!(
+                "{}: {} is {} bytes and its layout is {}",
+                case.name,
+                layout.name,
+                bytes.len(),
+                layout.stride
+            ));
+        }
+        held.declare(gpu, WHICH, slot, 1, bytes.len())
+            .map_err(|why| format!("{}: {} buffer: {why}", case.name, layout.name))?;
+        held.write(WHICH, slot, 0, bytes)
+            .map_err(|why| format!("{}: {} write: {why}", case.name, layout.name))?;
+        held.flush(WHICH, slot, 0)
+            .map_err(|why| format!("{}: {} flush: {why}", case.name, layout.name))?;
+    }
+
+    // The images, in one submission: declared, filled, and left where a sampler can read them.
+    let mut images = Images::new();
+    // Point sampling, which is what every case's expected pixel was derived against: a case checks
+    // *which* texel was read, and an interpolated sample is a blend of two. `raster` reads
+    // [22, 11, 64, 64] under linear filtering against the [32, 16, 64, 64] it was derived for,
+    // which is the neighboring texel bleeding in at eleven sixteenths.
+    //
+    // The filter is per binding on the wire -- `TextureRef::filter`, because one atlas is sampled
+    // both ways in one frame -- so a case that wanted to check the filter itself would carry its
+    // own, and none does yet.
+    let refs: Vec<(TextureId, TextureFilter)> = (0..case.images.len())
+        .map(|at| (TextureId(at as u64 + 1), TextureFilter::Nearest))
+        .collect();
+    let mut staged: Result<(), String> = Ok(());
+    open.submit(|record: Recorder<'_>| {
+        staged = stage(&mut images, gpu, record, case, &refs);
+    })?;
+    staged?;
+    let bound = descriptors::bound_from(&images, &refs)
+        .map_err(|why| format!("{}: textures: {why}", case.name))?;
+
+    let pipeline = cache
+        .pipeline(gpu, &key, &bindings, &words, probe.targets)
+        .map_err(|why| format!("{}: pipeline: {why}", case.name))?;
+    let layout = cache
+        .layout(gpu, case.family, case.surface, &bindings)
+        .map_err(|why| format!("{}: layout: {why}", case.name))?;
+    let mut sets = descriptors::Sets::new(gpu, 1, &bindings)
+        .map_err(|why| format!("{}: pool: {why}", case.name))?;
+    let set = sets
+        .write(layout, &bindings, WHICH, &held, &bound)
+        .map_err(|why| format!("{}: set: {why}", case.name))?;
+
+    let (streams, offsets) = store
+        .bindings(GEOMETRY)
+        .ok_or_else(|| format!("{}: the geometry is not resident", case.name))?;
+    probe.draw(
+        open,
+        Some(&Bound {
+            pipeline,
+            layout: layout.pipeline(),
+            set,
+            streams,
+            offsets,
+            vertices: case.vertices,
+        }),
+    )?;
+    probe.pixel(case.at.0, case.at.1)
+}
+
+/// Declares and fills a case's images, and leaves them readable by a shader.
+///
+/// One region covering each whole image, which is the `rect_count` of zero a producer sends for a
+/// texture it has just created. The transition to `SHADER_READ_ONLY_OPTIMAL` is the caller's --
+/// `Images::upload` leaves the image in `TRANSFER_DST_OPTIMAL` so a frame writing several regions
+/// of one atlas pays for one barrier instead of one per region -- and `descriptors::Sets::write`
+/// names that layout in the descriptor, so skipping it is a sampled image in the wrong layout.
+fn stage<'d>(
+    images: &mut Images<'d>,
+    gpu: tessella_vk::Gpu<'d>,
+    record: Recorder<'_>,
+    case: &Case,
+    refs: &[(TextureId, TextureFilter)],
+) -> Result<(), String> {
+    for (at, image) in case.images.iter().enumerate() {
+        let (texture, _) = refs[at];
+        let (pixel, channel) = image.texels.kinds();
+        images
+            .declare(
+                gpu,
+                record,
+                texture,
+                Extent {
+                    width: image.width,
+                    height: image.height,
+                },
+                pixel,
+                channel,
+            )
+            .map_err(|why| format!("{}: image {at}: {why}", case.name))?;
+
+        let bytes = image.texels.bytes();
+        let row = image.width as usize * image.texels.width();
+        let whole = [Rect16 {
+            x: 0,
+            y: 0,
+            w: u16::try_from(image.width).map_err(|_| "an image past 65535".to_string())?,
+            h: u16::try_from(image.height).map_err(|_| "an image past 65535".to_string())?,
+        }];
+        images
+            .upload(gpu, record, texture, &whole, &|_, line| {
+                let start = line as usize * row;
+                bytes.get(start..start + row)
+            })
+            .map_err(|why| format!("{}: image {at} upload: {why}", case.name))?;
+        let held = images
+            .image(texture)
+            .ok_or_else(|| format!("{}: image {at} was not held", case.name))?;
+        record.transition(
+            held,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+    }
+    Ok(())
 }

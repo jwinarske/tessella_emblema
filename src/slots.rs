@@ -110,3 +110,31 @@ fn hand_agreed(block: &str) -> Option<u32> {
         _ => None,
     }
 }
+
+/// The stride the entries of a slot's buffer sit at.
+///
+/// The union's where the block is a member of one, and the block's own otherwise. A layer's drawable
+/// buffer is an array of the *union* of its drawable blocks, which the producer says where it packs
+/// one:
+///
+/// > A plain fill writes an 80-byte `FillDrawableUBO` into a 96-byte slot, because the pattern
+/// > variants are larger and set the stride for everyone. Packing at 80 would put every entry after
+/// > the first at the wrong offset -- a layer whose tiles are drawn with each other's matrices,
+/// > which is plausible-looking output no size check would catch.
+///
+/// This is the reading half of that. `ubo_layouts::UNIONS` is generated from the same headers and
+/// carries both the membership and the stride, so neither is written here.
+///
+/// Eight of the fifty blocks answer something other than their own stride: `BackgroundDrawableUBO`
+/// (64 against 96), `FillDrawableUBO`, `FillOutlineDrawableUBO` and
+/// `FillOutlineTriangulatedDrawableUBO` (80 against 96), `LineDrawableUBO`,
+/// `LineGradientDrawableUBO` and `LinePatternDrawableUBO` (96 against 128), and
+/// `LineSDFTilePropsUBO` (16 against 64). Five of them are declared by a family this crate draws:
+/// `background`, `fill`, `fill_outline`, `line` and `line_pattern`.
+#[must_use]
+pub fn stride(layout: &UboLayout) -> u32 {
+    UNIONS
+        .iter()
+        .find(|union| union.members.contains(&layout.name))
+        .map_or(layout.stride, |union| union.stride)
+}

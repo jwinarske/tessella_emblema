@@ -186,7 +186,10 @@ pub fn module(
         .collect();
 
     for layout in &all {
-        out.push_str(&declare(layout)?);
+        // Padded to the stride the producer packs entries at, which for a drawable block is its
+        // union's rather than its own -- see `slots::stride`. WGSL sizes `array<T>` from `T`, so
+        // this is the only place that stride can be expressed.
+        out.push_str(&declare(layout, crate::slots::stride(layout))?);
         out.push('\n');
     }
 

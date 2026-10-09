@@ -175,6 +175,12 @@ struct Case {
     /// One image per entry in `textures`, in the same order.
     images: Vec<Image>,
     vertices: u32,
+    /// Which entry of the blocks the draw reads, which the body receives as `ubo_index`.
+    ///
+    /// Zero for every case but one. `drawable_at_one` is the exception and the reason this is a
+    /// field: entry zero sits at offset zero under any stride, so a case at zero cannot tell what
+    /// stride the entries are packed at -- see #81.
+    ubo_index: u32,
     expect: [u8; 4],
 }
 
@@ -587,6 +593,66 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            ubo_index: 0,
+            expect: [0, 0, 255, 255],
+        },
+        // The second entry of a drawable buffer, which is where the entry *stride* becomes visible.
+        //
+        // Every other case draws entry zero, and entry zero sits at offset zero under any stride --
+        // so none of them can tell what stride the entries are packed at. This one can, and it is
+        // the case #81 asked for.
+        //
+        // A fill's drawable buffer is an array of `FillDrawableUnionUBO`, whose stride is 96
+        // because the pattern variants are larger than the plain 80-byte `FillDrawableUBO`. So
+        // entry one starts at byte 96. A shader declaring the struct at its own 80 bytes reads it
+        // at byte 80 instead, where the first sixteen bytes are entry zero's tail -- zeros -- so
+        // the matrix's first column is zero, the triangle is degenerate and nothing draws.
+        //
+        // Three outcomes, which is what makes this worth a case rather than an assertion:
+        //
+        // * the stride right, the index right -- blue, below;
+        // * the stride right, the index dropped to zero -- red, because entry zero's `color_t` is
+        //   zero where entry one's is one;
+        // * the stride wrong -- the clear, because the matrix read across the boundary collapses.
+        Case {
+            name: "drawable_at_one",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillShader,
+            surface: Surface::Plane,
+            layout: Layout::PerAttribute,
+            streams: vec![
+                shorts(&COVERING),
+                per_vertex(&packed_pair([255, 0, 0, 255], [0, 0, 255, 255]), 3),
+                per_vertex(&[0.0, 1.0], 3),
+            ],
+            uniforms: vec![
+                // Two entries, end to end at the union's stride. The decoy's matrix is the same,
+                // so a wrong *index* draws rather than blanks -- which is the outcome a decoy of
+                // zeros could not be told apart from a wrong stride.
+                [
+                    block(
+                        &FILL_DRAWABLE_UBO,
+                        &[
+                            ("matrix", At::F(&CLIP)),
+                            ("color_t", At::F(&[0.0])),
+                            ("opacity_t", At::F(&[1.0])),
+                        ],
+                    ),
+                    block(
+                        &FILL_DRAWABLE_UBO,
+                        &[
+                            ("matrix", At::F(&CLIP)),
+                            ("color_t", At::F(&[1.0])),
+                            ("opacity_t", At::F(&[1.0])),
+                        ],
+                    ),
+                ]
+                .concat(),
+                block(&FILL_EVALUATED_PROPS_UBO, &[]),
+            ],
+            images: Vec::new(),
+            vertices: 3,
+            ubo_index: 1,
             expect: [0, 0, 255, 255],
         },
         // A background: the only family whose color is a uniform rather than an attribute, and
@@ -611,6 +677,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            ubo_index: 0,
             expect: [0, 0, 255, 255],
         },
         // An outline, which is the one family whose fragment stage reads its own screen position
@@ -657,6 +724,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            ubo_index: 0,
             expect: [255, 255, 255, 255],
         },
         // An extrusion's roof, which is the one family that computes a color rather than
@@ -715,6 +783,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            ubo_index: 0,
             expect: [255, 115, 12, 255],
         },
         // The same roof under a dim light at an angle, which is where the other half of the
@@ -765,6 +834,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            ubo_index: 0,
             expect: [125, 125, 125, 255],
         },
         // A raster tile, which is the first case to sample anything.
@@ -844,6 +914,7 @@ fn cases() -> Vec<Case> {
                 Image::new(4, |_, _| [255, 0, 255, 255]),
             ],
             vertices: 3,
+            ubo_index: 0,
             expect: [32, 16, 64, 64],
         },
         // The same picture from the same numbers, in the layout the producer actually sends.
@@ -905,6 +976,7 @@ fn cases() -> Vec<Case> {
                 Image::new(4, |_, _| [255, 0, 255, 255]),
             ],
             vertices: 3,
+            ubo_index: 0,
             expect: [32, 16, 64, 64],
         },
         // The same texel through adjustments that are not identities, which is where the chain's
@@ -964,6 +1036,7 @@ fn cases() -> Vec<Case> {
                 Image::new(4, |_, _| [255, 0, 255, 255]),
             ],
             vertices: 3,
+            ubo_index: 0,
             expect: [54, 37, 87, 255],
         },
         // The heatmap's second pass, which turns an accumulated density into a color through a
@@ -1025,6 +1098,7 @@ fn cases() -> Vec<Case> {
                 }),
             ],
             vertices: 3,
+            ubo_index: 0,
             expect: [128, 64, 0, 128],
         },
         // A color relief: an elevation decoded from a DEM, then looked up in a ramp by a binary
@@ -1106,6 +1180,7 @@ fn cases() -> Vec<Case> {
                 }),
             ],
             vertices: 3,
+            ubo_index: 0,
             expect: [10, 90, 55, 128],
         },
         // A glyph, read from the middle of its own solid texel.
@@ -1139,6 +1214,7 @@ fn cases() -> Vec<Case> {
             uniforms: symbol_blocks(symbol_drawable()),
             images: vec![glyph_atlas()],
             vertices: 3,
+            ubo_index: 0,
             expect: [200, 100, 50, 255],
         },
         // The same glyph, read one texel over, outside the letter.
@@ -1162,6 +1238,7 @@ fn cases() -> Vec<Case> {
             uniforms: symbol_blocks(symbol_drawable()),
             images: vec![glyph_atlas()],
             vertices: 3,
+            ubo_index: 0,
             expect: [0, 0, 0, 0],
         },
         // The first hillshade pass, which writes a slope rather than a picture.
@@ -1208,6 +1285,7 @@ fn cases() -> Vec<Case> {
                 [u8::try_from(x * 20 + y * 5).unwrap_or(255), 0, 0, 255]
             })],
             vertices: 3,
+            ubo_index: 0,
             expect: [194, 144, 255, 255],
         },
         // The second pass, shading the slope the first one wrote.
@@ -1277,6 +1355,7 @@ fn cases() -> Vec<Case> {
                 _ => [128, 128, 0, 255],
             })],
             vertices: 3,
+            ubo_index: 0,
             expect: [95, 47, 24, 118],
         },
         // The heatmap's first pass: one point feature's Gaussian, written into a texture.
@@ -1347,6 +1426,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 6,
+            ubo_index: 0,
             expect: [80, 255, 255, 255],
         },
         // A tiled background, which is the case for `pattern_pos` -- the one piece of the
@@ -1434,6 +1514,7 @@ fn cases() -> Vec<Case> {
                 ]
             })],
             vertices: 3,
+            ubo_index: 0,
             expect: [48, 24, 64, 64],
         },
         // A tiled fill, which shares `pattern_pos` with the background above and differs in
@@ -1506,6 +1587,7 @@ fn cases() -> Vec<Case> {
                 ]
             })],
             vertices: 3,
+            ubo_index: 0,
             expect: [48, 24, 64, 64],
         },
         // A sprite running along a line, which is the last family a pixel can reach.
@@ -1617,6 +1699,7 @@ fn cases() -> Vec<Case> {
                 ]
             })],
             vertices: 6,
+            ubo_index: 0,
             expect: [32, 16, 64, 64],
         },
         // A symbol's icon: a sprite from a sheet, with no color of its own and no halo.
@@ -1650,6 +1733,7 @@ fn cases() -> Vec<Case> {
             uniforms: symbol_blocks(symbol_drawable()),
             images: vec![sprite_sheet(16)],
             vertices: 3,
+            ubo_index: 0,
             expect: [40, 20, 64, 64],
         },
         // One draw holding both, read at a vertex marked as a sprite.
@@ -1678,6 +1762,7 @@ fn cases() -> Vec<Case> {
                 sprite_sheet(16),
             ],
             vertices: 3,
+            ubo_index: 0,
             expect: [40, 20, 64, 64],
         },
         // The same draw, read at a vertex marked as a glyph.
@@ -1705,6 +1790,7 @@ fn cases() -> Vec<Case> {
                 sprite_sheet(16),
             ],
             vertices: 3,
+            ubo_index: 0,
             expect: [100, 50, 25, 64],
         },
         // A fill bent onto a sphere, which is the first case on any surface but the plane.
@@ -1795,6 +1881,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            ubo_index: 0,
             expect: [0, 255, 255, 255],
         },
         // The same fill on the anchored bend: the sphere as a quadratic about the tile's own
@@ -1854,6 +1941,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            ubo_index: 0,
             expect: [255, 255, 0, 255],
         },
         // The raise: a fill standing on a DEM, which is the fourth and last surface.
@@ -1935,6 +2023,7 @@ fn cases() -> Vec<Case> {
                 ]
             })],
             vertices: 3,
+            ubo_index: 0,
             expect: [255, 0, 255, 255],
         },
         // The curtain: a raster quad on raised ground, with every vertex flagged.
@@ -2025,6 +2114,7 @@ fn cases() -> Vec<Case> {
                 Image::new(4, |_, _| [128, 128, 128, 255]),
             ],
             vertices: 3,
+            ubo_index: 0,
             expect: [32, 16, 64, 64],
         },
         // A circle, read at its own center: the extrusion interpolates to zero there, which is
@@ -2074,6 +2164,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 6,
+            ubo_index: 0,
             expect: [0, 255, 0, 255],
         },
     ]
@@ -2155,13 +2246,19 @@ fn ushorts(values: &[u16]) -> Vec<u8> {
         .collect()
 }
 
-/// A block, written at the offsets the ABI declares rather than at counted ones.
+/// One entry of a block's buffer, written at the offsets the ABI declares rather than at counted
+/// ones.
 ///
 /// The point of going through the table: a block written by hand would agree with the WGSL struct
 /// only because the same person wrote both. Taking every offset from the layout makes this a
 /// comparison between the producer's placement and the shader's.
+///
+/// Sized to the stride the producer packs entries at, which for a drawable block is its union's
+/// rather than its own -- `slots::stride`. For a single entry the extra bytes are a tail of zeros
+/// and change nothing; what they are for is `drawable_at_one`, where two of these sit end to end
+/// and the second has to start where the producer would have put it.
 fn block(layout: &'static UboLayout, writes: &[(&str, At<'_>)]) -> Vec<u8> {
-    let mut bytes = vec![0u8; layout.stride as usize];
+    let mut bytes = vec![0u8; slots::stride(layout) as usize];
     for (name, value) in writes {
         let field = layout
             .fields
@@ -2444,6 +2541,7 @@ struct Bound<'a> {
     streams: &'a [vk::Buffer],
     offsets: &'a [u64],
     vertices: u32,
+    ubo_index: u32,
 }
 
 impl Probe<'_> {
@@ -2475,9 +2573,9 @@ impl Probe<'_> {
                         record.stencil_compare_mask(0);
                         record.stencil_reference(0);
                         record.bind_vertex_buffers(0, bound.streams, bound.offsets);
-                        // `firstInstance` is the drawable's slot, which the body reads as
-                        // `ubo_index`. Zero: one drawable per case, at entry zero of its blocks.
-                        record.draw(bound.vertices, 1, 0);
+                        // `firstInstance` is the drawable's entry, which the body reads as
+                        // `ubo_index`.
+                        record.draw(bound.vertices, 1, bound.ubo_index);
                     }
                 },
             );
@@ -2577,19 +2675,26 @@ fn draw_case<'d>(
     for (layout, bytes) in declared.iter().zip(&case.uniforms) {
         let slot = slots::of(layout)
             .ok_or_else(|| format!("{}: {} has no slot", case.name, layout.name))?;
-        if bytes.len() != layout.stride as usize {
+        // The stride the producer packs entries at, which for a drawable block is its union's --
+        // so a case supplying two entries supplies two of *those*, and the second starts where the
+        // producer would have put it rather than where the struct happens to end.
+        let stride = slots::stride(layout) as usize;
+        if bytes.is_empty() || bytes.len() % stride != 0 {
             return Err(format!(
-                "{}: {} is {} bytes and its layout is {}",
+                "{}: {} is {} bytes, which is not whole entries of {stride}",
                 case.name,
                 layout.name,
-                bytes.len(),
-                layout.stride
+                bytes.len()
             ));
         }
-        held.declare(gpu, WHICH, slot, 1, bytes.len())
+        let entries = bytes.len() / stride;
+        held.declare(gpu, WHICH, slot, entries, stride)
             .map_err(|why| format!("{}: {} buffer: {why}", case.name, layout.name))?;
-        held.write(WHICH, slot, 0, bytes)
-            .map_err(|why| format!("{}: {} write: {why}", case.name, layout.name))?;
+        for (index, entry) in bytes.chunks(stride).enumerate() {
+            let index = u32::try_from(index).map_err(|_| "absurd entry count".to_string())?;
+            held.write(WHICH, slot, index, entry)
+                .map_err(|why| format!("{}: {} write: {why}", case.name, layout.name))?;
+        }
         held.flush(WHICH, slot, 0)
             .map_err(|why| format!("{}: {} flush: {why}", case.name, layout.name))?;
     }
@@ -2639,6 +2744,7 @@ fn draw_case<'d>(
             streams,
             offsets,
             vertices: case.vertices,
+            ubo_index: case.ubo_index,
         }),
     )?;
     probe.pixel(case.at.0, case.at.1)

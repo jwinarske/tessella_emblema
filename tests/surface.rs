@@ -11,6 +11,7 @@ use tessella_capture_abi::globe_ubo::GlobeBendUbo;
 use tessella_capture_abi::terrain_ubo::TerrainDrawableUbo;
 use tessella_emblema::preamble::{declare, offsets, type_name};
 use tessella_emblema::shaders::{FILL_BODY, module};
+use tessella_emblema::slots;
 use tessella_emblema::surface::{GLOBE_BEND_UBO, GLOBE_CAMERA_UBO, Surface, TERRAIN_DRAWABLE_UBO};
 
 use tessella_capture_abi::generated::shader_attributes::FILL_SHADER;
@@ -152,7 +153,7 @@ fn no_surface_block_collides_with_a_family_block() {
 fn every_surface_block_declares() {
     for surface in Surface::ALL {
         for block in surface.blocks() {
-            let source = declare(block)
+            let source = declare(block, slots::stride(block))
                 .unwrap_or_else(|why| panic!("{} cannot be declared: {why:?}", block.name));
             for field in block.fields {
                 assert!(

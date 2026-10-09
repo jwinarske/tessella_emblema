@@ -7,6 +7,7 @@
 
 use tessella_capture_abi::generated::ubo_layouts::{LAYOUTS, UboFieldKind, UboLayout};
 use tessella_emblema::preamble::{Unrepresentable, declare, offsets, type_name};
+use tessella_emblema::slots;
 
 /// Every block the producer describes is placed exactly where it says.
 ///
@@ -49,7 +50,7 @@ fn every_block_lands_where_the_producer_put_it() {
 #[test]
 fn every_block_declares() {
     for layout in LAYOUTS {
-        let source = declare(&layout)
+        let source = declare(&layout, slots::stride(&layout))
             .unwrap_or_else(|why| panic!("{} cannot be declared: {why:?}", layout.name));
         assert!(
             source.contains("struct "),
@@ -127,7 +128,7 @@ fn a_field_packed_tighter_than_wgsl_allows_is_refused() {
     };
 
     assert_eq!(
-        declare(&impossible),
+        declare(&impossible, impossible.stride),
         Err(Unrepresentable::FieldTooEarly {
             block: "Impossible",
             field: "second",
@@ -160,7 +161,7 @@ fn an_unaligned_stride_is_refused() {
     };
 
     assert_eq!(
-        declare(&ragged),
+        declare(&ragged, ragged.stride),
         Err(Unrepresentable::StrideUnaligned {
             block: "Ragged",
             stride: 20,
@@ -225,7 +226,7 @@ fn a_gap_the_producer_leaves_is_padded() {
     let placed = offsets(&gapped).expect("declarable");
     assert_eq!(placed, [("first", 0), ("second", 16)], "padded to the gap");
 
-    let source = declare(&gapped).expect("declarable");
+    let source = declare(&gapped, gapped.stride).expect("declarable");
     assert!(
         source.contains("array<u32, 3>"),
         "three words of padding, not {source}"

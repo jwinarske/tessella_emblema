@@ -117,6 +117,7 @@ pub mod images;
 pub mod masks;
 pub mod pipelines;
 pub mod preamble;
+pub mod record;
 pub mod residency;
 pub mod shaders;
 pub mod spec;

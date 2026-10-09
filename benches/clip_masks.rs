@@ -360,6 +360,20 @@ fn mask_then_fill(
     scene: &Scene<'_>,
     reference: u32,
 ) -> Result<Vec<u8>, String> {
+    mask_then_fill_masked(device, owned, scene, reference, None)
+}
+
+/// As above, with the content draw's compare mask overridden.
+///
+/// `None` is the tile's own `read_mask`, which every case but one wants. The exception is the case
+/// that measures what a mask of no bits does, and it needs everything else held still.
+fn mask_then_fill_masked(
+    device: &Open,
+    owned: &Owned<'_>,
+    scene: &Scene<'_>,
+    reference: u32,
+    compare: Option<u32>,
+) -> Result<Vec<u8>, String> {
     let given = assignment();
     let set = scene
         .sets
@@ -390,7 +404,7 @@ fn mask_then_fill(
                 record.bind_pipeline(scene.fill_pipeline.raw());
                 record.bind_descriptor_set(scene.mask_layout.pipeline(), set);
                 record.stencil_reference(reference);
-                record.stencil_compare_mask(u32::from(given.read_mask));
+                record.stencil_compare_mask(compare.unwrap_or(u32::from(given.read_mask)));
                 record.draw(6, 1, 0);
             },
         );
@@ -460,6 +474,36 @@ fn the_wrong_reference_draws_nothing(device: &Open) -> Result<(), String> {
         ));
     }
     println!("  the wrong reference   ok   nothing drawn, so the test is really testing");
+    Ok(())
+}
+
+/// A compare mask of zero draws everywhere, which is what "unclipped" is.
+///
+/// Measured because the constant behind it once claimed the opposite: that a pipeline whose dynamic
+/// compare mask was never set "compares no bits and the draw is clipped away entirely, which is a
+/// blank layer". The stencil test compares `reference & compare_mask` against
+/// `stencil & compare_mask`, so a mask of zero makes both sides zero and `EQUAL` passes everywhere.
+///
+/// The control is the case above: the same scene and the same reference no tile was assigned, which
+/// draws nothing under a real mask. Only the compare mask differs between the two, so the whole
+/// target coming back covered is attributable to it and to nothing else.
+///
+/// Pinned rather than left to the comment, because the value is the one `record::clipping` returns
+/// for a drawable with no tile -- the unclipped path depends on this being a draw and not a blank.
+fn a_zero_compare_mask_draws_unclipped(device: &Open) -> Result<(), String> {
+    let owned = Owned::new(device.gpu())?;
+    let scene = scene(device, placed(left_half(), -1.0, -1.0))?;
+    let found = mask_then_fill_masked(device, &owned, &scene, unassigned(), Some(0))?;
+    let (total, left) = white(&found);
+    let texels = (SIDE * SIDE) as usize;
+    if total != texels || left != texels / 2 {
+        return Err(format!(
+            "{total} of {texels} texels drawn, {left} in the masked half, for a mask of no bits"
+        ));
+    }
+    println!(
+        "  zero compare mask     ok   all {total} texels, so no bits compared draws unclipped"
+    );
     Ok(())
 }
 
@@ -542,6 +586,7 @@ fn main() {
     for (name, case) in [
         ("mask_clips", a_mask_clips_the_fill as Case),
         ("wrong_reference", the_wrong_reference_draws_nothing),
+        ("zero_compare", a_zero_compare_mask_draws_unclipped),
         ("whole_tile", a_whole_tile_mask_clips_nothing),
         ("no_color", the_mask_writes_no_color),
     ] {

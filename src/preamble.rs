@@ -40,17 +40,31 @@ pub enum Unrepresentable {
         /// The earliest WGSL would.
         earliest: u32,
     },
-    /// The block's own stride is not a multiple of its alignment.
+    /// The stride the entries sit at is not a multiple of the block's alignment.
     ///
     /// A consolidated buffer is an array of these, and an array element stride that is not
     /// aligned puts every block after the first at an offset WGSL will not index to.
     StrideUnaligned {
         /// The block.
         block: &'static str,
-        /// Its stride.
+        /// The stride asked for.
         stride: u32,
         /// Its alignment.
         align: u32,
+    },
+    /// The block's fields run past the stride its entries sit at.
+    ///
+    /// Padding can only make a struct larger, so there is no declaration whose entries land on
+    /// that stride. A union member larger than its union is the shape that would cause it, and
+    /// `ubo_layouts::UNIONS` takes the largest member's stride -- so this says the generated table
+    /// disagrees with itself rather than that a caller asked for something odd.
+    StrideTooSmall {
+        /// The block.
+        block: &'static str,
+        /// The stride asked for.
+        stride: u32,
+        /// Where its fields end, padded up to its alignment.
+        needs: u32,
     },
 }
 
@@ -147,16 +161,33 @@ pub fn type_name(block: &str) -> String {
 /// The WGSL `struct` for one block, with explicit padding wherever WGSL would place a field
 /// anywhere other than where the producer does.
 ///
+/// `entries_at` is the stride the producer packs consecutive blocks at, which the struct is padded
+/// out to. It is **not** always the block's own: a layer's drawable buffer is an array of the
+/// *union* of its drawable blocks, so a plain fill's 80-byte `FillDrawableUBO` is written into a
+/// 96-byte entry because the pattern variants are larger. WGSL sizes `array<T>` by `T`'s own size,
+/// so a struct left at 80 reads entry one at byte 80 where the producer wrote it at 96 -- a layer
+/// whose tiles are drawn with each other's matrices. [`crate::slots::stride`] is the answer to pass.
+///
+/// Padding the tail rather than taking WGSL's `@stride`, which was removed from the spec.
+///
 /// # Errors
 ///
 /// [`Unrepresentable`] when no padding can reconcile the two, which is a block this consumer must
 /// not pretend to read.
-pub fn declare(layout: &UboLayout) -> Result<String, Unrepresentable> {
-    if layout.align == 0 || !layout.stride.is_multiple_of(layout.align) {
+pub fn declare(layout: &UboLayout, entries_at: u32) -> Result<String, Unrepresentable> {
+    if layout.align == 0 || !entries_at.is_multiple_of(layout.align) {
         return Err(Unrepresentable::StrideUnaligned {
             block: layout.name,
-            stride: layout.stride,
+            stride: entries_at,
             align: layout.align,
+        });
+    }
+    let needs = align_to(layout.size, layout.align);
+    if entries_at < needs {
+        return Err(Unrepresentable::StrideTooSmall {
+            block: layout.name,
+            stride: entries_at,
+            needs,
         });
     }
 
@@ -192,6 +223,17 @@ pub fn declare(layout: &UboLayout) -> Result<String, Unrepresentable> {
         }
         let _ = writeln!(out, "    {}: {},", field.name, wgsl_type(field.kind));
         at = field.offset + field.kind.size();
+    }
+
+    // The tail, so WGSL's own array stride is the producer's. Zero words for a block whose fields
+    // already fill its entry, which is every block that is not a union member below its union's
+    // stride -- so this changes eight of the fifty and leaves the rest byte for byte.
+    let end = align_to(at, layout.align);
+    if entries_at > end {
+        let words = (entries_at - end) / 4;
+        if words > 0 {
+            let _ = writeln!(out, "    _tail: array<u32, {words}>,");
+        }
     }
 
     let _ = writeln!(out, "}}");

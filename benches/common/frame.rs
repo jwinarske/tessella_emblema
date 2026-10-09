@@ -30,14 +30,24 @@ use tessella_consume::slab::Slab;
 /// The view the frame draws.
 pub const VIEW: ViewId = ViewId(1);
 
-/// The layer group both tiles belong to.
+/// The layer group the two tiles belong to.
 pub const LAYER: i32 = 0;
+
+/// The layer drawn over it.
+///
+/// A second layer is what says the painter order is obeyed and that a descriptor set is per layer:
+/// `record::content` looks one up with `Which { view, layer }`, and with a single layer a `get` that
+/// ignored the layer would pass.
+pub const OVER: i32 = 1;
 
 /// The epoch the order and the camera agree on.
 pub const EPOCH: OrderEpoch = OrderEpoch(1);
 
-/// The two geometries, one per tile.
+/// The two geometries of the lower layer, one per tile.
 pub const GEOMETRIES: [GeometryId; 2] = [GeometryId(10), GeometryId(11)];
+
+/// The upper layer's one geometry, which covers the middle of the target and no tile.
+pub const ABOVE: GeometryId = GeometryId(12);
 
 /// The target's edge. Each tile's mask covers half of it.
 pub const SIDE: u32 = 64;
@@ -50,6 +60,28 @@ pub const SIDE: u32 = 64;
 /// and the bench reported the second when the first was possible. These two share no channel value
 /// in a different position, so the two failures cannot be confused.
 pub const COLORS: [[u8; 4]; 2] = [[255, 128, 64, 255], [32, 96, 192, 255]];
+
+/// What the upper layer is painted, which is neither tile's color nor the clear.
+///
+/// Opaque, and covering a band across the middle: so the order between the layers is readable
+/// straight off the pixels and needs no blend arithmetic to interpret. Reversed, the band would hold
+/// the tiles' colors instead.
+pub const ABOVE_COLOR: [u8; 4] = [16, 240, 112, 255];
+
+/// How much of the target's height the upper layer covers, either side of the middle.
+///
+/// A band rather than the whole target, so the lower layer is visible beside it -- a layer that
+/// covered everything would make "the upper layer drew" and "the lower layer did not" the same
+/// picture. Applied as a scale in that layer's own matrix, so its quad is the same as everyone
+/// else's.
+///
+/// A quarter, because the target is 64 and 64 / 4 is whole: the band is rows 24 through 39 and
+/// there is no pixel on a boundary to argue about.
+///
+/// A divisor rather than a fraction, and a `u16` so both users convert exactly: the matrix wants a
+/// float and `f32::from` of a `u16` is lossless, while the pixel count wants whole rows and gets
+/// them by dividing.
+pub const BAND_OF: u16 = 4;
 
 /// Where each tile's mask lands, as a fraction of the target's width.
 ///
@@ -83,7 +115,10 @@ impl Geometry {
     pub fn new() -> Self {
         let mut region: Vec<u8> = Vec::new();
         let mut refs = Vec::new();
-        for color in COLORS {
+        // Three drawables over one quad: the two tiles and the layer above them. What differs is
+        // the color each carries and the matrix its block holds -- the upper layer's squashes the
+        // quad into a band across the middle, which is why it needs no geometry of its own.
+        for color in [COLORS[0], COLORS[1], ABOVE_COLOR] {
             let mut at = |bytes: &[u8]| {
                 let offset = u32::try_from(region.len()).expect("a small region");
                 region.extend_from_slice(bytes);
@@ -191,8 +226,19 @@ pub fn write(capacity: usize) -> (Ring, Geometry) {
     let producer = ring.producer();
     for (at, id) in GEOMETRIES.iter().enumerate() {
         announce(producer, *id, &geometry.refs[at]);
-        used(producer, *id, tile(u32::try_from(at).expect("two tiles")));
+        used(
+            producer,
+            *id,
+            LAYER,
+            Some(tile(u32::try_from(at).expect("two tiles"))),
+        );
     }
+    // The layer above, with no tile of its own: a layer that covers the viewport rather than a
+    // tile's ground -- which is what `ViewUse::has_tile` of zero says, and what `Partition`'s "a
+    // tile absent here has no mask" leaves unclipped.
+    announce(producer, ABOVE, &geometry.refs[GEOMETRIES.len()]);
+    used(producer, ABOVE, OVER, None);
+
     clips(producer);
     uniforms(producer);
     order(producer);
@@ -280,17 +326,21 @@ fn stride_of(kind: AttributeDataType) -> u32 {
     }
 }
 
-/// The view's use of one geometry, which is where its tile comes from.
-fn used(producer: &mut Producer, id: GeometryId, at: TileId) {
+/// The view's use of one geometry, which is where its layer and its tile come from.
+///
+/// `None` for a drawable that covers the viewport. The tile field is then meaningless -- the ABI
+/// says it is "meaningful only when `has_tile` is set" -- so it is left at its default and the flag
+/// is what a consumer reads.
+fn used(producer: &mut Producer, id: GeometryId, layer: i32, at: Option<TileId>) {
     let use_ = ViewUse {
         geometry: id,
         view: VIEW,
-        layer_index: LAYER,
+        layer_index: layer,
         sub_layer_index: 0,
-        tile: at,
+        tile: at.unwrap_or_default(),
         render_pass: RenderPass::TRANSLUCENT,
         draw_flags: DrawFlags::default(),
-        has_tile: 1,
+        has_tile: u8::from(at.is_some()),
         _pad: [0; 5],
     };
     producer
@@ -327,23 +377,55 @@ fn clips(producer: &mut Producer) {
 
 /// The layer's two block buffers: a drawable entry per tile, and the evaluated properties.
 fn uniforms(producer: &mut Producer) {
-    // The drawable array, at the stride the *union* of a fill's drawable blocks sits at -- which is
-    // 96 where `FillDrawableUBO` is 80. See tessella_emblema#81: a consumer reading at the struct's
-    // own size finds entry one sixteen bytes early.
+    // The lower layer: one entry per tile, both placed by the identity.
+    //
+    // At the stride the *union* of a fill's drawable blocks sits at, which is 96 where
+    // `FillDrawableUBO` is 80 -- see #81. A consumer reading at the struct's own size finds entry
+    // one sixteen bytes early.
     let stride = ubo_layouts::FILL_DRAWABLE_UNION_UBO.stride as usize;
     let mut drawables = vec![0u8; stride * GEOMETRIES.len()];
     for at in 0..GEOMETRIES.len() {
-        let entry = &mut drawables[at * stride..(at + 1) * stride];
-        put(entry, &FILL_DRAWABLE_UBO, "matrix", &CLIP);
-        put(entry, &FILL_DRAWABLE_UBO, "color_t", &[0.0]);
-        put(entry, &FILL_DRAWABLE_UBO, "opacity_t", &[0.0]);
+        entry(&mut drawables[at * stride..(at + 1) * stride], &CLIP);
     }
-    ubo(producer, ubo_slots::ID_FILL_DRAWABLE_UBO, &drawables);
+    ubo(producer, LAYER, ubo_slots::ID_FILL_DRAWABLE_UBO, &drawables);
+    ubo(
+        producer,
+        LAYER,
+        ubo_slots::ID_FILL_EVALUATED_PROPS_UBO,
+        &props(),
+    );
 
-    // The evaluated properties, which a fill reads at entry zero whatever the drawable is.
+    // The upper layer: one entry, squashed into a band across the middle. Its own buffers at its
+    // own slots, because a layer's blocks are keyed by the layer -- a consumer that kept one set of
+    // them per view would draw this layer through the one below it.
+    let mut above = vec![0u8; stride];
+    let mut matrix = CLIP;
+    matrix[5] /= f32::from(BAND_OF);
+    entry(&mut above, &matrix);
+    ubo(producer, OVER, ubo_slots::ID_FILL_DRAWABLE_UBO, &above);
+    ubo(
+        producer,
+        OVER,
+        ubo_slots::ID_FILL_EVALUATED_PROPS_UBO,
+        &props(),
+    );
+}
+
+/// One drawable entry: where it is placed, and both interpolation factors at their first endpoint.
+fn entry(into: &mut [u8], matrix: &[f32; 16]) {
+    put(into, &FILL_DRAWABLE_UBO, "matrix", matrix);
+    put(into, &FILL_DRAWABLE_UBO, "color_t", &[0.0]);
+    put(into, &FILL_DRAWABLE_UBO, "opacity_t", &[0.0]);
+}
+
+/// The evaluated properties, which a fill reads at entry zero whatever the drawable is.
+///
+/// Zeros: every color here is a per-vertex attribute, and the block's own color is the fallback a
+/// layer with a constant paint would use. A layer that read it instead would draw black.
+fn props() -> Vec<u8> {
     let mut props = vec![0u8; FILL_EVALUATED_PROPS_UBO.stride as usize];
     put(&mut props, &FILL_EVALUATED_PROPS_UBO, "color", &[0.0; 4]);
-    ubo(producer, ubo_slots::ID_FILL_EVALUATED_PROPS_UBO, &props);
+    props
 }
 
 /// Writes floats into a block at the offset the ABI declares for a named field.
@@ -360,10 +442,10 @@ fn put(entry: &mut [u8], layout: &ubo_layouts::UboLayout, field: &str, values: &
     }
 }
 
-fn ubo(producer: &mut Producer, slot: u32, data: &[u8]) {
+fn ubo(producer: &mut Producer, layer: i32, slot: u32, data: &[u8]) {
     let update = tessella_capture_abi::envelope::UboUpdate {
         view: VIEW,
-        layer_index: LAYER,
+        layer_index: layer,
         slot,
         _pad: 0,
         data: Span {
@@ -378,7 +460,7 @@ fn ubo(producer: &mut Producer, slot: u32, data: &[u8]) {
 
 /// The painter order: both tiles, in tile order, each naming its own entry of the drawable buffer.
 fn order(producer: &mut Producer) {
-    let entries: Vec<OrderEntry> = GEOMETRIES
+    let mut entries: Vec<OrderEntry> = GEOMETRIES
         .iter()
         .enumerate()
         .map(|(at, id)| OrderEntry {
@@ -391,6 +473,16 @@ fn order(producer: &mut Producer) {
             _pad: [0; 3],
         })
         .collect();
+    // After them, which is what puts it on top: the order is the painter's.
+    entries.push(OrderEntry {
+        geometry: ABOVE,
+        draw_priority: 0,
+        layer_index: u32::try_from(OVER).expect("a non-negative layer"),
+        sub_layer_index: 0,
+        ubo_index: 0,
+        pass: RenderPass::TRANSLUCENT,
+        _pad: [0; 3],
+    });
     let mut payload = Vec::new();
     for entry in &entries {
         payload.extend_from_slice(entry.as_bytes());

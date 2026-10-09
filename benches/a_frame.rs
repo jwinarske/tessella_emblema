@@ -22,6 +22,13 @@
 //! the references swaps the picture, and a stencil that did nothing would leave the second
 //! drawable over the whole target.
 //!
+//! # What it does not catch
+//!
+//! A `TextureRef`'s `slot`. `descriptors::bound_from` places the views in the order the refs
+//! arrive and never reads the field, so making the two refs claim each other's slots changes
+//! nothing in the frame -- measured. That is #95 and a defect rather than a gap here: the bench
+//! cannot see it until the consumer places by slot.
+//!
 //! Run with `cargo bench --bench a_frame`.
 
 mod common;
@@ -32,19 +39,22 @@ mod frame;
 use std::collections::BTreeMap;
 
 use ash::vk;
-use tessella_capture_abi::envelope::{GeometryId, TileId};
+use tessella_capture_abi::envelope::{GeometryId, Rect16, TextureFilter, TextureId, TileId};
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_consume::host::Host;
 use tessella_consume::upload::Upload;
 use tessella_emblema::blocks::Blocks;
 use tessella_emblema::descriptors::Sets;
 use tessella_emblema::device::{self, Attachment};
+use tessella_emblema::images::Images;
 use tessella_emblema::pipelines::{Blend, Cache, Targets};
 use tessella_emblema::record::Program;
 use tessella_emblema::store::Store;
 use tessella_emblema::surface::Surface;
 use tessella_emblema::target::{self, Depth, Host as Host_};
-use tessella_emblema::{blocks, buffers, families, masks, pipelines, record, shaders, vertices};
+use tessella_emblema::{
+    blocks, buffers, descriptors, families, masks, pipelines, record, shaders, vertices,
+};
 use tessella_vk::{Buffer, Image, ImageView, Memory, Recorder};
 
 use common::Open;
@@ -204,11 +214,12 @@ fn run() -> Result<(), String> {
             uniforms: host.uploads().work().len(),
         }
     };
-    // Two batches, because the collapse is scoped to a layer: the two tiles share a program and
-    // collapse, and the layer above them is its own run however alike its program is.
-    if read.batches != 2 || read.drawables != 3 {
+    // Three batches, because the collapse is scoped to a layer: the two tiles share a program and
+    // collapse into one, and each layer above them is its own run -- the second because a layer
+    // breaks a run however alike its program is, the third because it is another family entirely.
+    if read.batches != 3 || read.drawables != 4 {
         return Err(format!(
-            "{} batches of {} drawables, wanted two of three",
+            "{} batches of {} drawables, wanted three of four",
             read.batches, read.drawables
         ));
     }
@@ -221,12 +232,13 @@ fn run() -> Result<(), String> {
     if !read.partitioned {
         return Err("two tiles at one zoom must fit the stencil byte".into());
     }
-    // Four: a drawable buffer and a properties buffer for each of the two layers.
-    if read.uniforms != 4 {
-        return Err(format!("{} uniform uploads, wanted four", read.uniforms));
+    // Eight: a drawable buffer and a properties buffer for each of the three layers, and the two
+    // images the sampling layer binds.
+    if read.uniforms != 8 {
+        return Err(format!("{} uploads, wanted eight", read.uniforms));
     }
     println!(
-        "  the stream            ok   {} records, 2 batches of 3 drawables, 2 masks, 4 uniforms",
+        "  the stream            ok   {} records, 3 batches of 4 drawables, 2 masks, 8 uploads",
         progress.records
     );
 
@@ -235,7 +247,7 @@ fn run() -> Result<(), String> {
     let resolved = frame::GEOMETRIES
         .iter()
         .copied()
-        .chain(core::iter::once(frame::ABOVE))
+        .chain([frame::ABOVE, frame::SAMPLER])
         .filter_map(|id| host.joiner().drawable(id, frame::VIEW))
         .flat_map(|drawable| drawable.geometry.attrs.clone())
         .filter(|desc| {
@@ -243,10 +255,10 @@ fn run() -> Result<(), String> {
                 .is_some()
         })
         .count();
-    if resolved != 9 {
-        return Err(format!("{resolved} of 9 attribute runs resolve"));
+    if resolved != 12 {
+        return Err(format!("{resolved} of 12 attribute runs resolve"));
     }
-    println!("  the slab              ok   9 attribute runs resolve against the region");
+    println!("  the slab              ok   12 attribute runs resolve against the region");
 
     let device = match Open::preferred() {
         Ok(device) => device,
@@ -320,10 +332,25 @@ fn draw(
             .map_err(|why| format!("slot {slot}: {why}"))?;
     }
 
+    // The textures the stream carried, each declared at the size it named and filled from the rows
+    // `Upload::rows` resolves. Both payload forms arrive -- one packed two-rect update and one
+    // whole-texture one -- and this is the one place that difference is applied rather than tested.
+    let mut images = Images::new();
+    let mut staged: Result<(), String> = Ok(());
+    device.submit(|record: Recorder<'_>| {
+        staged = stage(&mut images, gpu, record, host);
+    })?;
+    staged?;
+
     // The masks' own buffer: one matrix per tile, at the slot a clipping mask's block travels at.
-    let which = blocks::Which {
+    //
+    // Keyed at layer -1, which is the producer's own convention for a buffer that "belongs to the
+    // renderer rather than to any layer" -- `UboUpdate::layer_index` says so of the frame-wide
+    // blocks. It has to be a layer no content set uses: `Sets` holds one set per `Which`, so a mask
+    // keyed at layer zero would replace the set the first layer's batches bind.
+    let mask_at = blocks::Which {
         view: frame::VIEW,
-        layer: frame::LAYER,
+        layer: -1,
     };
     let order: Vec<(TileId, [f32; 16])> = host
         .clips(frame::VIEW)
@@ -335,13 +362,13 @@ fn draw(
         .flat_map(|(_, matrix)| matrix.iter().flat_map(|value| value.to_le_bytes()))
         .collect();
     blocks
-        .declare(gpu, which, MASK_SLOT, order.len(), 64)
+        .declare(gpu, mask_at, MASK_SLOT, order.len(), 64)
         .map_err(|why| format!("the mask buffer: {why}"))?;
     blocks
-        .replace(which, MASK_SLOT, &mask_bytes)
+        .replace(mask_at, MASK_SLOT, &mask_bytes)
         .map_err(|why| format!("the mask buffer: {why}"))?;
     blocks
-        .flush(which, MASK_SLOT, 0)
+        .flush(mask_at, MASK_SLOT, 0)
         .map_err(|why| format!("the mask buffer: {why}"))?;
 
     // The geometry, resolved out of the slab the stream pointed at rather than copied by the host.
@@ -350,7 +377,7 @@ fn draw(
     for id in frame::GEOMETRIES
         .iter()
         .copied()
-        .chain(core::iter::once(frame::ABOVE))
+        .chain([frame::ABOVE, frame::SAMPLER])
     {
         let drawable = host
             .joiner()
@@ -372,58 +399,143 @@ fn draw(
         plans.insert(id, plan);
     }
 
-    // The pipelines, built before the recording: `record::content` resolves a program through a
-    // closure, and building one inside it would need the cache mutably from a `&dyn Fn`.
+    // The pipelines and the sets, both before the recording: `record::content` resolves a program
+    // through a closure, and building one inside it would need the cache mutably from a `&dyn Fn`.
+    //
+    // A family's set is written while its layout is held, and the two families are done in turn --
+    // `Cache::layout` hands back a reference out of a `&mut self` borrow, so holding one family's
+    // layout while asking for another's does not compile. The same shape `Host::plan` had, and not
+    // a problem here: a set is written once per layer and after that only its handle is needed.
     let mut cache = Cache::new();
     let fill = families::family(BuiltIn::FillShader).ok_or("no fill family")?;
+    let raster = families::family(BuiltIn::RasterShader).ok_or("no raster family")?;
     let bindings = pipelines::bindings(fill, Surface::Plane);
-    let words = compile(
-        &shaders::module(
+    let raster_bindings = pipelines::bindings(raster, Surface::Plane);
+
+    // One pool for every layer, sized for the widest set among the families this frame draws --
+    // which is what `Sets` is for: "the pool is sized from the widest set rather than per family,
+    // because a pool is reset whole and sizing it per family would mean a pool per family". Two
+    // pools was the first shape here, and `record::content` takes one `Sets` -- so the raster's set
+    // was somewhere it could not look: "view ViewId(1) layer 2 has no descriptor set".
+    let widest = if raster_bindings.len() > bindings.len() {
+        &raster_bindings
+    } else {
+        &bindings
+    };
+    // Four: one per layer, and one for the masks at layer -1. A pool sized for three answers
+    // `ERROR_OUT_OF_POOL_MEMORY` on the fourth, which is what it did.
+    let mut sets = Sets::new(gpu, 4, widest).map_err(|why| format!("the pool: {why}"))?;
+
+    let program = {
+        let words = compile(
+            &shaders::module(
+                Surface::Plane,
+                fill.blocks,
+                fill.attributes,
+                fill.textures,
+                fill.body,
+            )
+            .map_err(|why| format!("the fill does not assemble: {why:?}"))?,
+        )?;
+        let key = pipelines::key(
+            BuiltIn::FillShader,
             Surface::Plane,
-            fill.blocks,
-            fill.attributes,
-            fill.textures,
-            fill.body,
-        )
-        .map_err(|why| format!("the fill does not assemble: {why:?}"))?,
-    )?;
-    let key = pipelines::key(
-        BuiltIn::FillShader,
-        Surface::Plane,
-        0,
-        plans
-            .get(&frame::GEOMETRIES[0])
-            .ok_or("the first geometry has no plan")?,
-        Blend::Alpha,
-    );
-    let pipeline = cache
-        .pipeline(gpu, &key, &bindings, &words, target.targets)
-        .map_err(|why| format!("the fill pipeline: {why}"))?;
-    let layout = cache
-        .layout(gpu, BuiltIn::FillShader, Surface::Plane, &bindings)
-        .map_err(|why| format!("the fill layout: {why}"))?;
-    let mut sets = Sets::new(gpu, 2, &bindings).map_err(|why| format!("the pool: {why}"))?;
-    // One set per layer, which is the shape `record::content` looks them up in: a batch's layer
-    // decides which set it binds, so a layer whose set was never written is a batch with nothing to
-    // bind -- and a lookup that ignored the layer would hand the upper layer the lower one's blocks
-    // and draw it through the wrong matrix.
-    for layer in [frame::LAYER, frame::OVER] {
+            0,
+            plans
+                .get(&frame::GEOMETRIES[0])
+                .ok_or("the first geometry has no plan")?,
+            Blend::Alpha,
+        );
+        let pipeline = cache
+            .pipeline(gpu, &key, &bindings, &words, target.targets)
+            .map_err(|why| format!("the fill pipeline: {why}"))?;
+        let layout = cache
+            .layout(gpu, BuiltIn::FillShader, Surface::Plane, &bindings)
+            .map_err(|why| format!("the fill layout: {why}"))?;
+
+        // One set per layer, which is the shape `record::content` looks them up in: a batch's layer
+        // decides which set it binds, so a layer whose set was never written is a batch with
+        // nothing to bind -- and a lookup that ignored the layer would hand a layer another's
+        // blocks and draw it through the wrong matrix.
+        for layer in [frame::LAYER, frame::OVER] {
+            let at = blocks::Which {
+                view: frame::VIEW,
+                layer,
+            };
+            if sets
+                .write(layout, &bindings, at, &blocks, &[])
+                .map_err(|why| format!("the set for layer {layer}: {why}"))?
+                == vk::DescriptorSet::null()
+            {
+                return Err(format!("the set for layer {layer} is null"));
+            }
+        }
+        Program {
+            pipeline,
+            layout: layout.pipeline(),
+            instances: 1,
+        }
+    };
+
+    // And the sampling layer's own program, which is a different family: its own module, its own
+    // bindings -- two more, for the image and the sampler -- and its own set, carrying the views
+    // the stream's `TextureRef`s name. One program for every batch would bind the fill's pipeline
+    // to a raster's vertex layout, which `vkCreateGraphicsPipelines` would not have built at all.
+    let raster_program = {
+        let words = compile(
+            &shaders::module(
+                Surface::Plane,
+                raster.blocks,
+                raster.attributes,
+                raster.textures,
+                raster.body,
+            )
+            .map_err(|why| format!("the raster does not assemble: {why:?}"))?,
+        )?;
+        let key = pipelines::key(
+            BuiltIn::RasterShader,
+            Surface::Plane,
+            0,
+            plans
+                .get(&frame::SAMPLER)
+                .ok_or("the sampling geometry has no plan")?,
+            Blend::Alpha,
+        );
+        let pipeline = cache
+            .pipeline(gpu, &key, &raster_bindings, &words, target.targets)
+            .map_err(|why| format!("the raster pipeline: {why}"))?;
+        let layout = cache
+            .layout(gpu, BuiltIn::RasterShader, Surface::Plane, &raster_bindings)
+            .map_err(|why| format!("the raster layout: {why}"))?;
+
+        // The textures it binds, as the stream named them: ids and filters off the `TextureRef`
+        // run, resolved to views by the store. A drawable naming a texture nobody uploaded is
+        // `Error::NoTexture` rather than a blank sampler.
+        let mut refs: Vec<(TextureId, TextureFilter)> = Vec::new();
+        for bound in &host
+            .joiner()
+            .drawable(frame::SAMPLER, frame::VIEW)
+            .ok_or("the sampling geometry is not used by the view")?
+            .geometry
+            .texture_refs
+        {
+            let filter = filter_of(bound.filter)
+                .ok_or_else(|| format!("{} is not a filter this build knows", bound.filter))?;
+            refs.push((bound.texture, filter));
+        }
+        let bound = descriptors::bound_from(&images, &refs)
+            .map_err(|why| format!("the sampling layer's textures: {why}"))?;
         let at = blocks::Which {
             view: frame::VIEW,
-            layer,
+            layer: frame::SAMPLED,
         };
-        if sets
-            .write(layout, &bindings, at, &blocks, &[])
-            .map_err(|why| format!("the set for layer {layer}: {why}"))?
-            == vk::DescriptorSet::null()
-        {
-            return Err(format!("the set for layer {layer} is null"));
+        sets.write(layout, &raster_bindings, at, &blocks, &bound)
+            .map_err(|why| format!("the raster set: {why}"))?;
+        Program {
+            pipeline,
+            layout: layout.pipeline(),
+            instances: 1,
         }
-    }
-    let program = Program {
-        pipeline,
-        layout: layout.pipeline(),
-        instances: 1,
     };
 
     // The mask pipeline and its own set, over the one storage binding its body declares.
@@ -439,10 +551,8 @@ fn draw(
         .map_err(|why| format!("the mask module: {why}"))?;
     let mask_pipeline = pipelines::build_mask(gpu, &mask_layout, &mask_module, target.targets)
         .map_err(|why| format!("the mask pipeline: {why}"))?;
-    let mut mask_sets =
-        Sets::new(gpu, 1, &mask_bindings).map_err(|why| format!("the mask pool: {why}"))?;
-    let mask_set = mask_sets
-        .write(&mask_layout, &mask_bindings, which, &blocks, &[])
+    let mask_set = sets
+        .write(&mask_layout, &mask_bindings, mask_at, &blocks, &[])
         .map_err(|why| format!("the mask set: {why}"))?;
 
     let found = host.plan(frame::VIEW).ok_or("no plan for the view")?;
@@ -485,7 +595,13 @@ fn draw(
                         partition,
                         view: frame::VIEW,
                     },
-                    &|_| Some(program),
+                    // By family, which is what a batch's key carries: a program is a pipeline and
+                    // the layout its set binds through, and the two families here share neither.
+                    &|batch| match BuiltIn::from_repr(batch.key.builtin_shader)? {
+                        BuiltIn::FillShader => Some(program),
+                        BuiltIn::RasterShader => Some(raster_program),
+                        _ => None,
+                    },
                 )
                 .map_err(|why| format!("recording: {why}"));
             },
@@ -498,17 +614,17 @@ fn draw(
         record.copy_to_buffer(&target.image, &target.readback, frame::SIDE, frame::SIDE);
     })?;
     let counts = counts?;
-    if counts.batches != 2 || counts.drawables != 3 || counts.draws != 3 {
+    if counts.batches != 3 || counts.drawables != 4 || counts.draws != 4 {
         return Err(format!(
             "{} batches, {} drawables, {} draws recorded",
             counts.batches, counts.drawables, counts.draws
         ));
     }
-    // Exactly one: the layer above covers the viewport rather than a tile, so it has no mask and
-    // is meant to be unclipped. Two would mean a tile's mask went missing.
-    if counts.unclipped != 1 {
+    // Two: the layer above and the sampling layer both cover the viewport rather than a tile, so
+    // neither has a mask. Three would mean a tile's mask went missing.
+    if counts.unclipped != 2 {
         return Err(format!(
-            "{} drawables drew unclipped, wanted one -- the layer that covers the viewport",
+            "{} drawables drew unclipped, wanted two -- the layers that cover the viewport",
             counts.unclipped
         ));
     }
@@ -518,6 +634,91 @@ fn draw(
     );
 
     halves(&target, target.targets.depth_stencil)
+}
+
+/// The filter a `TextureRef` names.
+///
+/// Matched here because the ABI has no decoder for it: `TextureUpdate::format` and `channel_type`
+/// both have a `from_repr` and `host` refuses a value neither enum knows, and this field is a bare
+/// `u32` -- so every backend writes this match itself. Filed as #95.
+///
+/// Zero is `Linear`, which the ABI states: "this was padding through R0, and zero is
+/// `TextureFilter::Linear`". Anything other than the two it names is `None` rather than defaulted,
+/// because defaulting is how a producer sending a third filter is read as sending the first.
+fn filter_of(raw: u32) -> Option<TextureFilter> {
+    match raw {
+        0 => Some(TextureFilter::Linear),
+        1 => Some(TextureFilter::Nearest),
+        _ => None,
+    }
+}
+
+/// Declares and fills every texture the stream sent, and leaves them readable by a shader.
+///
+/// `Images::upload` asks for a region's rows one at a time -- "given the region's index and row, it
+/// answers that row's pixels" -- and `Upload::rows` is what says where a row is: an offset and a
+/// stride per region, which differ between the two payload forms. A backend that read the wrong one
+/// would upload the right number of bytes to the right place from the wrong rows.
+fn stage<'d>(
+    images: &mut Images<'d>,
+    gpu: tessella_vk::Gpu<'d>,
+    record: Recorder<'_>,
+    host: &Host,
+) -> Result<(), String> {
+    for work in host.uploads().work() {
+        let Upload::Texture {
+            texture,
+            size,
+            shape,
+            rects,
+            bytes,
+        } = work
+        else {
+            continue;
+        };
+        let pixels = host
+            .uploads()
+            .bytes(bytes)
+            .ok_or("a texture upload's bytes are not in the host's buffer")?;
+        let rows = work
+            .rows()
+            .ok_or("a texture upload has no row layout")?
+            .map_err(|why| format!("texture {}: {why:?}", texture.0))?;
+
+        images
+            .declare(gpu, record, *texture, *size, shape.format, shape.channel)
+            .map_err(|why| format!("texture {}: {why}", texture.0))?;
+
+        // An empty rect list is one region covering the whole texture, which is what
+        // `upload::rows` answers for it -- so the rects handed to `Images` are the same list with
+        // that one substituted.
+        let whole = [Rect16 {
+            x: 0,
+            y: 0,
+            w: u16::try_from(size.width).map_err(|_| "a texture past 65535".to_string())?,
+            h: u16::try_from(size.height).map_err(|_| "a texture past 65535".to_string())?,
+        }];
+        let regions: &[Rect16] = if rects.is_empty() { &whole } else { rects };
+        let texel = shape.texel();
+        images
+            .upload(gpu, record, *texture, regions, &|index, row| {
+                let at = rows.get(index)?;
+                let width = usize::from(regions.get(index)?.w) * texel;
+                let start = at.at + usize::from(row) * at.stride;
+                pixels.get(start..start + width)
+            })
+            .map_err(|why| format!("texture {}: {why}", texture.0))?;
+
+        let held = images
+            .image(*texture)
+            .ok_or_else(|| format!("texture {} was not held", texture.0))?;
+        record.transition(
+            held,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+    }
+    Ok(())
 }
 
 /// The band holds the upper layer, and each half outside it holds its own tile.
@@ -530,23 +731,28 @@ fn draw(
 /// * the clear anywhere -- a mask wrote nothing, so nothing passed the stencil test there.
 fn halves(target: &Target<'_>, format: vk::Format) -> Result<(), String> {
     let pixels = target.read()?;
-    let mut seen = [0usize; 3];
+    let mut seen = [0usize; 4];
     for y in 0..frame::SIDE {
         for x in 0..frame::SIDE {
             let at = ((y * frame::SIDE + x) * 4) as usize;
             let found = [pixels[at], pixels[at + 1], pixels[at + 2], pixels[at + 3]];
 
-            // The band is the middle quarter of the height, which is whole rows: the target is 64
-            // and the upper layer's matrix divides the clip range by four, so it is rows 24 through
-            // 39 and no pixel sits on its edge. Integer arithmetic, because a pixel is an integer.
+            // Three bands and two halves, all on whole rows: the target is 64, the upper layer's
+            // matrix divides the clip range by four and the sampling layer's by eight, so the
+            // middle band is rows 24 through 39 and the top one rows 0 through 7. No pixel sits on
+            // an edge. Integer arithmetic, because a pixel is an integer.
             let middle = frame::SIDE / 2;
             let reach = frame::SIDE / u32::from(frame::BAND_OF) / 2;
-            let region = if y >= middle - reach && y < middle + reach {
+            let top = frame::SIDE / u32::from(frame::TOP_OF);
+            let region = if y < top {
+                3
+            } else if y >= middle - reach && y < middle + reach {
                 2
             } else {
                 usize::from(x >= frame::SIDE / 2)
             };
             let wanted = match region {
+                3 => frame::SAMPLED_COLOR,
                 2 => frame::ABOVE_COLOR,
                 side => frame::COLORS[side],
             };
@@ -558,6 +764,13 @@ fn halves(target: &Target<'_>, format: vk::Format) -> Result<(), String> {
                 return Err(format!(
                     "({x}, {y}) is still the clear, so nothing drew there -- which is what a mask \
                      that wrote nothing leaves behind"
+                ));
+            }
+            if region == 3 {
+                return Err(format!(
+                    "({x}, {y}) is in the sampled band and holds {found:?} rather than texel \
+                     (2, 2), so the texture reached the sampler wrongly -- the rows, the rects or \
+                     the view bound"
                 ));
             }
             if region == 2 {
@@ -585,15 +798,18 @@ fn halves(target: &Target<'_>, format: vk::Format) -> Result<(), String> {
             ));
         }
     }
-    let band = (frame::SIDE / u32::from(frame::BAND_OF)) as usize * frame::SIDE as usize;
-    let half = (frame::SIDE * frame::SIDE) as usize / 2 - band / 2;
-    if seen != [half, half, band] {
+    let row = frame::SIDE as usize;
+    let band = (frame::SIDE / u32::from(frame::BAND_OF)) as usize * row;
+    let sampled = (frame::SIDE / u32::from(frame::TOP_OF)) as usize * row;
+    let half = (row * row - band - sampled) / 2;
+    if seen != [half, half, band, sampled] {
         return Err(format!(
-            "{seen:?} texels, wanted {half} in each half and {band} in the band"
+            "{seen:?} texels, wanted {half} in each half, {band} in the band and {sampled} sampled"
         ));
     }
     println!(
-        "  the regions           ok   {half} texels a half, {band} in the band, on {format:?}"
+        "  the regions           ok   {half} a half, {band} in the band, {sampled} sampled, on \
+         {format:?}"
     );
     Ok(())
 }

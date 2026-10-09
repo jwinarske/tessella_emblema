@@ -53,13 +53,23 @@
 //! not tell a four-byte offset error until the bytes nothing binds were filled with a value that
 //! samples a *different* texel.
 //!
-//! It is still one-sided, and the same boundary is why. `raster_interleaved` catches an attribute
-//! read four bytes *late* -- that reads the skirt, which samples another texel -- and not one read
-//! four bytes *early*, which reads the position: as a coordinate that is 0.25 of a four-texel
-//! image, exactly the boundary between texels zero and one, and it resolves to texel one, which is
-//! the texel the case meant to read. Measured by zeroing every planned offset, which this bench
-//! then passed. Choosing inputs against that is tracked separately, because re-deriving a case's
-//! numbers and moving its path are two changes and only one can be reviewed at a time -- #84.
+//! `raster_interleaved` was one-sided for the same reason until #84: it caught an attribute read
+//! four bytes *late* and not one read four bytes *early*, because the position read as a coordinate
+//! landed on the texel boundary that resolves to the texel the case meant to read. Its three values
+//! now sample three texels, and the two directions give two different wrong pixels.
+//!
+//! # And the pass has to be sensitive to how the draw composites
+//!
+//! The target is cleared to an *opaque* color for the same reason. The pipelines are built
+//! `Blend::Unblended`, which this bench's note called deliberate -- and over the transparent black
+//! it used to clear to, it was unmeasurable: mbgl's alpha mode is premultiplied, so blending gives
+//! `src * 1 + 0 * (1 - srcAlpha)`, which is `src` for any alpha. Every case passed with
+//! `Blend::Alpha` too, and with `Additive`. Over an opaque clear both are caught on the first case
+//! that returns an alpha below 255.
+//!
+//! That also sharpened `symbol_below`, whose note said "nothing is drawn" and was wrong: with an
+//! opaque clear the pixel still reads zero, so the glyph's quad does cover it and the body wrote a
+//! transparent black. Three outcomes are distinguishable there now where two were.
 //!
 //! So a new case is not finished when it draws the expected pixel. Nudge each input to a
 //! neighbouring value and check the pixel moves: a texel of each image, each stream, each uniform
@@ -519,13 +529,14 @@ fn run() -> Result<usize, String> {
     let probe = Probe::new(&open)?;
     let mut cache = Cache::new();
 
-    // The control first. A cleared pass has to read black, or a right answer below could be
-    // whatever the mapped memory happened to hold.
+    // The control first. A cleared pass has to read the clear, or a right answer below could be
+    // whatever the mapped memory happened to hold -- and the clear is opaque now, so this also
+    // says the readback is showing the pass rather than a zeroed buffer.
     probe.draw(&open, None)?;
     let cleared = probe.pixel(SIDE / 2, SIDE / 2)?;
-    if cleared != [0, 0, 0, 0] {
+    if cleared != CLEARED {
         return Err(format!(
-            "a cleared pass reads {cleared:?}, so the readback is not showing the pass"
+            "a cleared pass reads {cleared:?} against {CLEARED:?}, so the readback is not showing the pass"
         ));
     }
 
@@ -840,15 +851,19 @@ fn cases() -> Vec<Case> {
         // A raster tile, which is the first case to sample anything.
         //
         // The texture is four texels square and every one is distinct, so the pixel says which
-        // was read rather than only that something was. The coordinate is a position of 819 under
+        // was read rather than only that something was. The coordinate is a position of 6144 under
         // a buffer scale of two:
         //
-        //   uv = ((819 / 8192) - 0.5) / 2 + 0.5 = 0.29999  ->  texel 1 of 4, which is
-        //                                                       (64, 32, 128, 128)
+        //   uv = ((6144 / 8192) - 0.5) / 2 + 0.5 = 0.625  ->  texel 2 of 4, which is
+        //                                                      (128, 64, 128, 128)
+        //
+        // Texel 2 rather than a nearer one, and the center of it rather than an edge, because the
+        // interleaved case below shares these numbers and has to be able to tell three values
+        // apart -- see it for which three.
         //
         // A buffer scale of two is what puts that formula under test. At one the recentering
         // cancels and `((t / 8192) - 0.5) / 1 + 0.5` is just `t / 8192`, so a body that dropped
-        // it would read the same texel; at two, dropping it gives 0.04999 and texel 0.
+        // it would read the same texel; at two, dropping it gives 0.375 and texel 1.
         //
         // Every color adjustment is set to its identity -- the spin a permutation that is no
         // permutation, no saturation shift, unit contrast, brightness from nothing to one -- and
@@ -860,10 +875,11 @@ fn cases() -> Vec<Case> {
         // and multiplying it back by the same alpha is the identity, and the case reads the texel
         // either way. With the two alphas different the division shows --
         //
-        //   unpremultiplied = (0.5, 0.25, 1.0),  alpha = 0.50196 * 0.5 = 0.25098
-        //   out             = (0.12549, 0.06275, 0.25098, 0.25098)  ->  32, 16, 64, 64
+        //   unpremultiplied = (1.0, 0.5, 1.0),  alpha = 0.50196 * 0.5 = 0.25098
+        //   out             = (0.25098, 0.12549, 0.25098, 0.25098)  ->  64, 32, 64, 64
         //
-        // -- and a body that skipped it reads (16, 8, 32, 64).
+        // -- and a body that skipped it multiplies the premultiplied color by the output alpha
+        // instead and reads (32, 16, 32, 64).
         Case {
             name: "raster",
             at: (SIDE / 2, SIDE / 2),
@@ -872,7 +888,7 @@ fn cases() -> Vec<Case> {
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
-                shorts(&[819, 819, 819, 819, 819, 819]),
+                shorts(&[COORDINATE; 6]),
                 FLAT_SKIRT.to_vec(),
             ],
             uniforms: vec![
@@ -915,7 +931,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
-            expect: [32, 16, 64, 64],
+            expect: [64, 32, 64, 64],
         },
         // The same picture from the same numbers, in the layout the producer actually sends.
         //
@@ -927,6 +943,25 @@ fn cases() -> Vec<Case> {
         // It expects `raster`'s pixel exactly. A stride or an offset read wrong does not fail,
         // it samples another vertex's bytes, and the two cases disagreeing is what says so. The
         // skirt's four bytes are present and bound by nothing, which is how they travel.
+        //
+        // # Three values, three texels
+        //
+        // The texture coordinate sits between the position and the skirt, so an offset read wrong
+        // in either direction lands on one of them -- and this case can only tell if all three
+        // sample a *different* texel. Under a buffer scale of two, `uv = t / 16384 + 0.25`:
+        //
+        //   the coordinate  6144  ->  0.625  ->  texel 2, dead center
+        //   the skirt      10240  ->  0.875  ->  texel 3, dead center     (read four bytes late)
+        //   the position       0  ->  0.25   ->  the texel 0 / 1 boundary (read four bytes early)
+        //
+        // The position is the interpolated attribute at the pixel read, which is zero at the
+        // target's center: `COVERING` spans clip space, so the center of the triangle's coverage
+        // is the midpoint of its own coordinates.
+        //
+        // It read 819 and 6144 once, which gave texel 1 for the coordinate -- and the position's
+        // 0.25 is the boundary *of* texel 1, which the hardware resolved to texel 1. So an early
+        // read drew the texel the case meant to read and the case passed. Measured: zeroing every
+        // offset `vertices::plan` produces left all twenty-seven cases green. #84.
         Case {
             name: "raster_interleaved",
             at: (SIDE / 2, SIDE / 2),
@@ -936,7 +971,7 @@ fn cases() -> Vec<Case> {
                 stride: 12,
                 offsets: &[0, 4, 8],
             },
-            streams: vec![interleaved(&COVERING, 819)],
+            streams: vec![interleaved(&COVERING, COORDINATE)],
             uniforms: vec![
                 block(&RASTER_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
                 block(
@@ -977,7 +1012,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
-            expect: [32, 16, 64, 64],
+            expect: [64, 32, 64, 64],
         },
         // The same texel through adjustments that are not identities, which is where the chain's
         // arithmetic shows rather than only its neutrality. Derived from `raster.hpp` by hand:
@@ -1219,10 +1254,21 @@ fn cases() -> Vec<Case> {
         },
         // The same glyph, read one texel over, outside the letter.
         //
-        // Nothing is drawn, and that is the assertion. The case above is what says the setup draws
-        // at all, and the pair is what separates the channels: `.a` through an identity-mapped
-        // view is 1.0 at *every* texel, so a body reading it would draw the fill color here too
-        // and the two cases would be indistinguishable.
+        // The fragment stage returns zero coverage, and that is the assertion. The case above is
+        // what says the setup draws at all, and the pair is what separates the channels: `.a`
+        // through an identity-mapped view is 1.0 at *every* texel, so a body reading it would draw
+        // the fill color here too and the two cases would be indistinguishable.
+        //
+        // "Nothing is drawn" is what this said, and the opaque clear disproved it: the pixel still
+        // reads zero rather than the clear, so the glyph's quad *does* cover it and the body wrote
+        // a transparent black over the clear. Which makes the expectation a stronger claim than it
+        // was -- three outcomes are now distinguishable where two were:
+        //
+        //   the clear          nothing covered the pixel
+        //   zero               covered, and the field gave no coverage   <- this case
+        //   the fill color     covered, and the field gave full coverage <- the case above
+        //
+        // Over a transparent clear the first two were the same pixel.
         //
         // The texel is 153 rather than nought, which is 0.6 -- below the ramp at
         // [0.71719, 0.78281] and so still no coverage, but *above* the [0.46719, 0.53281] the ramp
@@ -2200,20 +2246,34 @@ fn per_vertex(values: &[f32], vertices: usize) -> Vec<u8> {
         .collect()
 }
 
+/// The texture coordinate `raster` and `raster_interleaved` share.
+///
+/// Chosen so that the three values an interleaved offset can land on sample three *different*
+/// texels -- see `raster_interleaved` for the arithmetic and for what it read before. Under a
+/// buffer scale of two this is the dead center of texel 2 of a four-texel image.
+///
+/// Signed, because the attribute is: a raster's texture coordinate is declared `Short2` and the
+/// vertex format is `R16G16_SINT`, so the body reads whatever is here as an `i16`.
+const COORDINATE: i16 = 6144;
+
 /// The value in the skirt's four bytes, which nothing binds.
 ///
-/// Not zero, and not a value that samples the same texel as the texture coordinate does. An
-/// attribute offset read four bytes late lands here, and with a zero the case could not tell:
-/// `819` and `0` both reach texel one of a four-texel image once the buffer scale is applied, so
-/// the two layouts would draw the same pixel and a wrong offset would pass. `6144` reaches texel
-/// two.
-const SKIRT_FILLER: u16 = 6144;
+/// An attribute offset read four bytes late lands here, so this has to sample a texel that is
+/// neither the coordinate's nor the position's. Under a buffer scale of two it is the dead center
+/// of texel 3, where [`COORDINATE`] is texel 2 and the position reaches the texel 0 / 1 boundary.
+///
+/// Zero would not do, and nor would 6144 once that became the coordinate: both have been the value
+/// here, and each in turn made the late read draw the texel the case meant to read.
+///
+/// The flag itself is inert on a plane -- `curtain` returns zero there whatever it is handed -- so
+/// this changes nothing but which texel a misread offset finds.
+const SKIRT_FILLER: i16 = 10240;
 
 /// One interleaved raster stream: a position, a texture coordinate and a skirt flag per vertex.
 ///
 /// Laid out as `RasterVertex` is -- `[i16; 2]`, `[u16; 2]`, `u16` and a pad to twelve -- so the
 /// offsets a case names are the producer's own.
-fn interleaved(positions: &[i16], texture: u16) -> Vec<u8> {
+fn interleaved(positions: &[i16], texture: i16) -> Vec<u8> {
     let mut out = Vec::with_capacity(positions.len() / 2 * 12);
     // Stepped rather than chunked: `chunks_exact` with a constant draws a stable-only lint and
     // its suggested `as_chunks` is newer than the pinned toolchain, so neither form passes both.
@@ -2335,6 +2395,23 @@ const WHICH: blocks::Which = blocks::Which {
 
 /// The target's format, which is what the expected pixels are written in.
 const COLOR: vk::Format = vk::Format::R8G8B8A8_UNORM;
+
+/// What the target is cleared to before each case draws.
+///
+/// Opaque, and the whole point is that it is not transparent black. The pipelines are built
+/// `Blend::Unblended`, which the bench's own note said was deliberate -- and over a transparent
+/// clear it made no difference it could measure: mbgl's alpha mode is premultiplied,
+/// `Add{One, OneMinusSrcAlpha}`, so blending gives `src * 1 + 0 * (1 - srcAlpha)`, which is `src`
+/// for any alpha. Every case passed with `Blend::Alpha` as well. Over an opaque clear they differ,
+/// and the four cases returning an alpha below 255 are what measure it.
+///
+/// Thirds of a fifth, so each channel is an exact multiple of 1/255 and the conversion back is not
+/// a rounding question. No case's expected pixel is this, which is what lets a case that drew
+/// nothing be told from one that drew the clear's color.
+const CLEAR: [f32; 4] = [0.2, 0.4, 0.6, 1.0];
+
+/// The same color as the target's bytes, which is what a case reading the clear expects.
+const CLEARED: [u8; 4] = [51, 102, 153, 255];
 
 /// What the producer would have sent for this case's streams.
 ///
@@ -2562,7 +2639,7 @@ impl Probe<'_> {
                     layout: vk::ImageLayout::UNDEFINED,
                 },
                 &self.depth,
-                Some([0.0, 0.0, 0.0, 0.0]),
+                Some(CLEAR),
                 |record| {
                     if let Some(bound) = bound {
                         record.bind_pipeline(bound.pipeline);

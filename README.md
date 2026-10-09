@@ -111,10 +111,21 @@ shares both, so one attachment serves all three and is remade only on a resize. 
 in `target::LEAVES_IN`, which is `GENERAL`, because a dma-buf importer cannot be told a vendor's
 optimal layout.
 
-That completes #60's order. What is not here yet is the draw list itself: `tessella-consume` reads
-the stream and this crate can build every pipeline and every store, but nothing yet walks an
-`OrderUpdate` and records the draws, and descriptor sets are still allocated per bench rather than
-by the library.
+That completes #60's order, and #72 joined it to the draw list: `descriptors` writes the set a draw
+binds, `masks` holds the clip mask's shader, `pipelines::Cache` keeps a pipeline per key, and
+`record::content` walks a frame's batches and records them -- one pipeline and one descriptor set
+per batch, and the buffers, segments, slot and stencil masks per drawable.
+
+The stencil assignment itself is not here: `tessella_consume::stencil` partitions the byte into a
+field per zoom, which is the renderer-agnostic half and is shared rather than written again. A
+drawable with no mask draws with a compare mask of zero, so unclipped is a value rather than a
+second pipeline.
+
+What has not been drawn yet is a map. Every piece is checked on RADV and on V3D, and
+`benches/clip_masks.rs` draws through the library end to end -- but the frame it draws is a quad and
+a mask, not a style. The oracle for that is `benches/first_pixel.rs`, which still builds its own
+Vulkan inline for 26 cases; driving those through the library instead is what would say the join is
+right, and would retire about 3,200 lines of bench.
 `tessella-consume` (the reader, draw list and stencil partition) lives once in the tessella
 workspace and carries a texture update's channel type and payload shape, which the format and
 staging decisions both read.

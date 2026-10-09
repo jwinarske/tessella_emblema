@@ -204,9 +204,11 @@ fn run() -> Result<(), String> {
             uniforms: host.uploads().work().len(),
         }
     };
-    if read.batches != 1 || read.drawables != 2 {
+    // Two batches, because the collapse is scoped to a layer: the two tiles share a program and
+    // collapse, and the layer above them is its own run however alike its program is.
+    if read.batches != 2 || read.drawables != 3 {
         return Err(format!(
-            "{} batches of {} drawables, wanted one of two",
+            "{} batches of {} drawables, wanted two of three",
             read.batches, read.drawables
         ));
     }
@@ -219,11 +221,12 @@ fn run() -> Result<(), String> {
     if !read.partitioned {
         return Err("two tiles at one zoom must fit the stencil byte".into());
     }
-    if read.uniforms != 2 {
-        return Err(format!("{} uniform uploads, wanted two", read.uniforms));
+    // Four: a drawable buffer and a properties buffer for each of the two layers.
+    if read.uniforms != 4 {
+        return Err(format!("{} uniform uploads, wanted four", read.uniforms));
     }
     println!(
-        "  the stream            ok   {} records, 1 batch of 2 drawables, 2 masks, 2 uniforms",
+        "  the stream            ok   {} records, 2 batches of 3 drawables, 2 masks, 4 uniforms",
         progress.records
     );
 
@@ -231,17 +234,19 @@ fn run() -> Result<(), String> {
     // reference that does not resolve is a drawable that cannot be uploaded.
     let resolved = frame::GEOMETRIES
         .iter()
-        .filter_map(|id| host.joiner().drawable(*id, frame::VIEW))
+        .copied()
+        .chain(core::iter::once(frame::ABOVE))
+        .filter_map(|id| host.joiner().drawable(id, frame::VIEW))
         .flat_map(|drawable| drawable.geometry.attrs.clone())
         .filter(|desc| {
             tessella_consume::slab::resolve(&geometry.region, &geometry.slabs, desc.source)
                 .is_some()
         })
         .count();
-    if resolved != 6 {
-        return Err(format!("{resolved} of 6 attribute runs resolve"));
+    if resolved != 9 {
+        return Err(format!("{resolved} of 9 attribute runs resolve"));
     }
-    println!("  the slab              ok   6 attribute runs resolve against the region");
+    println!("  the slab              ok   9 attribute runs resolve against the region");
 
     let device = match Open::preferred() {
         Ok(device) => device,
@@ -342,7 +347,11 @@ fn draw(
     // The geometry, resolved out of the slab the stream pointed at rather than copied by the host.
     let mut store = Store::new();
     let mut plans: BTreeMap<GeometryId, vertices::Plan> = BTreeMap::new();
-    for id in frame::GEOMETRIES {
+    for id in frame::GEOMETRIES
+        .iter()
+        .copied()
+        .chain(core::iter::once(frame::ABOVE))
+    {
         let drawable = host
             .joiner()
             .drawable(id, frame::VIEW)
@@ -394,14 +403,22 @@ fn draw(
         .layout(gpu, BuiltIn::FillShader, Surface::Plane, &bindings)
         .map_err(|why| format!("the fill layout: {why}"))?;
     let mut sets = Sets::new(gpu, 2, &bindings).map_err(|why| format!("the pool: {why}"))?;
-    // Written for its effect: `record::content` finds it through `sets.get(which)` rather than
-    // being handed one, because a set is per layer and a batch is a run within a layer.
-    if sets
-        .write(layout, &bindings, which, &blocks, &[])
-        .map_err(|why| format!("the fill set: {why}"))?
-        == vk::DescriptorSet::null()
-    {
-        return Err("the fill set is null".into());
+    // One set per layer, which is the shape `record::content` looks them up in: a batch's layer
+    // decides which set it binds, so a layer whose set was never written is a batch with nothing to
+    // bind -- and a lookup that ignored the layer would hand the upper layer the lower one's blocks
+    // and draw it through the wrong matrix.
+    for layer in [frame::LAYER, frame::OVER] {
+        let at = blocks::Which {
+            view: frame::VIEW,
+            layer,
+        };
+        if sets
+            .write(layout, &bindings, at, &blocks, &[])
+            .map_err(|why| format!("the set for layer {layer}: {why}"))?
+            == vk::DescriptorSet::null()
+        {
+            return Err(format!("the set for layer {layer} is null"));
+        }
     }
     let program = Program {
         pipeline,
@@ -481,45 +498,61 @@ fn draw(
         record.copy_to_buffer(&target.image, &target.readback, frame::SIDE, frame::SIDE);
     })?;
     let counts = counts?;
-    if counts.batches != 1 || counts.drawables != 2 || counts.draws != 2 {
+    if counts.batches != 2 || counts.drawables != 3 || counts.draws != 3 {
         return Err(format!(
             "{} batches, {} drawables, {} draws recorded",
             counts.batches, counts.drawables, counts.draws
         ));
     }
-    if counts.unclipped != 0 {
+    // Exactly one: the layer above covers the viewport rather than a tile, so it has no mask and
+    // is meant to be unclipped. Two would mean a tile's mask went missing.
+    if counts.unclipped != 1 {
         return Err(format!(
-            "{} drawables drew unclipped, so a tile had no mask",
+            "{} drawables drew unclipped, wanted one -- the layer that covers the viewport",
             counts.unclipped
         ));
     }
     println!(
-        "  the recording         ok   {} batches, {} drawables, {} draws, none unclipped",
-        counts.batches, counts.drawables, counts.draws
+        "  the recording         ok   {} batches, {} drawables, {} draws, {} unclipped",
+        counts.batches, counts.drawables, counts.draws, counts.unclipped
     );
 
     halves(&target, target.targets.depth_stencil)
 }
 
-/// Each half of the target holds its own tile's color, and neither holds the other's.
+/// The band holds the upper layer, and each half outside it holds its own tile.
+///
+/// Three regions, which is what two layers and two tiles come to. Each is a different failure:
+///
+/// * the band holding a tile's color -- the layers drew in the wrong order, or the upper layer's
+///   set was the lower one's and it was placed by the lower one's matrix;
+/// * a half holding the other's color -- the tiles' references are crossed;
+/// * the clear anywhere -- a mask wrote nothing, so nothing passed the stencil test there.
 fn halves(target: &Target<'_>, format: vk::Format) -> Result<(), String> {
     let pixels = target.read()?;
-    let mut seen = [0usize; 2];
+    let mut seen = [0usize; 3];
     for y in 0..frame::SIDE {
         for x in 0..frame::SIDE {
             let at = ((y * frame::SIDE + x) * 4) as usize;
             let found = [pixels[at], pixels[at + 1], pixels[at + 2], pixels[at + 3]];
-            let side = usize::from(x >= frame::SIDE / 2);
-            if found == frame::COLORS[side] {
-                seen[side] += 1;
+
+            // The band is the middle quarter of the height, which is whole rows: the target is 64
+            // and the upper layer's matrix divides the clip range by four, so it is rows 24 through
+            // 39 and no pixel sits on its edge. Integer arithmetic, because a pixel is an integer.
+            let middle = frame::SIDE / 2;
+            let reach = frame::SIDE / u32::from(frame::BAND_OF) / 2;
+            let region = if y >= middle - reach && y < middle + reach {
+                2
+            } else {
+                usize::from(x >= frame::SIDE / 2)
+            };
+            let wanted = match region {
+                2 => frame::ABOVE_COLOR,
+                side => frame::COLORS[side],
+            };
+            if found == wanted {
+                seen[region] += 1;
                 continue;
-            }
-            if found == frame::COLORS[1 - side] {
-                return Err(format!(
-                    "({x}, {y}) is in half {side} and holds half {}'s color, so the references are \
-                     crossed",
-                    1 - side
-                ));
             }
             if found == CLEARED {
                 return Err(format!(
@@ -527,18 +560,40 @@ fn halves(target: &Target<'_>, format: vk::Format) -> Result<(), String> {
                      that wrote nothing leaves behind"
                 ));
             }
+            if region == 2 {
+                return Err(format!(
+                    "({x}, {y}) is in the band and holds {found:?} rather than the layer above, so \
+                     the layers drew in the wrong order or through the wrong blocks"
+                ));
+            }
+            if found == frame::COLORS[1 - region] {
+                return Err(format!(
+                    "({x}, {y}) is in half {region} and holds half {}'s color, so the references \
+                     are crossed",
+                    1 - region
+                ));
+            }
+            if found == frame::ABOVE_COLOR {
+                return Err(format!(
+                    "({x}, {y}) is outside the band and holds the layer above, so that layer was \
+                     placed by another layer's matrix -- which is what binding one set for every \
+                     layer does"
+                ));
+            }
             return Err(format!(
-                "({x}, {y}) holds {found:?}, which is neither tile's color nor the clear"
+                "({x}, {y}) holds {found:?}, which is nothing this frame draws"
             ));
         }
     }
-    let each = (frame::SIDE * frame::SIDE / 2) as usize;
-    if seen != [each, each] {
-        return Err(format!("{seen:?} texels of {each} in each half"));
+    let band = (frame::SIDE / u32::from(frame::BAND_OF)) as usize * frame::SIDE as usize;
+    let half = (frame::SIDE * frame::SIDE) as usize / 2 - band / 2;
+    if seen != [half, half, band] {
+        return Err(format!(
+            "{seen:?} texels, wanted {half} in each half and {band} in the band"
+        ));
     }
     println!(
-        "  the halves            ok   {each} texels of each tile's color in its own half, on \
-         {format:?}"
+        "  the regions           ok   {half} texels a half, {band} in the band, on {format:?}"
     );
     Ok(())
 }

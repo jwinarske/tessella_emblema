@@ -605,14 +605,16 @@ pub fn build<'d>(
     let attachments = [key.blend.attachment()];
     let blending = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
 
-    // The attachments by format, which is what replaces the render pass handle. The stencil format
-    // is the same attachment as the depth one -- these are packed formats, so naming it twice is
-    // naming one image twice.
+    // The attachments by format, which is what replaces the render pass handle. A packed
+    // depth-stencil format names the same attachment twice, because it is one image -- but a
+    // stencil-only format has no depth attachment at all, and `UNDEFINED` is how a pipeline says
+    // so. Declaring a depth format the rendering scope will not have is a mismatch, and
+    // `Recorder::begin_rendering` now omits that attachment for exactly the same reason.
     let colors = [targets.color];
     let mut rendering = vk::PipelineRenderingCreateInfo::default()
         .color_attachment_formats(&colors)
-        .depth_attachment_format(targets.depth_stencil)
-        .stencil_attachment_format(targets.depth_stencil);
+        .depth_attachment_format(depth_format(targets.depth_stencil))
+        .stencil_attachment_format(stencil_format(targets.depth_stencil));
 
     let create = vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)
@@ -628,6 +630,29 @@ pub fn build<'d>(
         .push_next(&mut rendering);
 
     Ok(gpu.graphics_pipeline(&create)?)
+}
+
+/// The depth attachment's format, or `UNDEFINED` where the format has no depth.
+fn depth_format(format: vk::Format) -> vk::Format {
+    if tessella_vk::aspects(format).contains(vk::ImageAspectFlags::DEPTH) {
+        format
+    } else {
+        vk::Format::UNDEFINED
+    }
+}
+
+/// The stencil attachment's format, or `UNDEFINED` where the format has no stencil.
+///
+/// Every format `device::depth_stencil_format` gives has a stencil, so this is `UNDEFINED` for
+/// nothing it can return -- written as the pair of [`depth_format`] because a reader checking one
+/// will ask about the other, and because a depth-only format is a legal thing to hand a pipeline
+/// that does not clip.
+fn stencil_format(format: vk::Format) -> vk::Format {
+    if tessella_vk::aspects(format).contains(vk::ImageAspectFlags::STENCIL) {
+        format
+    } else {
+        vk::Format::UNDEFINED
+    }
 }
 
 /// Why a pipeline could not be built.
@@ -761,8 +786,8 @@ pub fn build_mask<'d>(
     let colors = [targets.color];
     let mut rendering = vk::PipelineRenderingCreateInfo::default()
         .color_attachment_formats(&colors)
-        .depth_attachment_format(targets.depth_stencil)
-        .stencil_attachment_format(targets.depth_stencil);
+        .depth_attachment_format(depth_format(targets.depth_stencil))
+        .stencil_attachment_format(stencil_format(targets.depth_stencil));
 
     let create = vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)

@@ -55,7 +55,14 @@ fn declared(text: &str) -> Vec<Binding> {
         } else {
             panic!("a binding of an unrecognized kind: {line}");
         };
-        out.push(Binding { binding, kind });
+        // The slot is not read back from the text -- a module declares a binding number, not the
+        // slot the bytes arrive at -- so this leaves it out and `tests/block_slots.rs` is where the
+        // slots are checked.
+        out.push(Binding {
+            binding,
+            kind,
+            slot: None,
+        });
     }
     out.sort_unstable_by_key(|b| b.binding);
     out
@@ -89,10 +96,19 @@ fn every_module_declares_what_the_layout_describes() {
             let Some(text) = assembled(family, surface) else {
                 continue;
             };
-            let derived = pipelines::bindings(family, surface);
+            // The number and the kind, which is what a module declares. The slot a block's bytes
+            // arrive at is not in the text and cannot be: it is the producer's name for a buffer,
+            // not the shader's for a binding. `tests/block_slots.rs` is where those are checked.
+            let derived: Vec<(u32, Kind)> = pipelines::bindings(family, surface)
+                .iter()
+                .map(|b| (b.binding, b.kind))
+                .collect();
+            let from_text: Vec<(u32, Kind)> = declared(&text)
+                .iter()
+                .map(|b| (b.binding, b.kind))
+                .collect();
             assert_eq!(
-                declared(&text),
-                derived,
+                from_text, derived,
                 "{} on {surface:?}: the module and the descriptor layout disagree",
                 family.name
             );

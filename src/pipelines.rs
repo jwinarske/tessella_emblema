@@ -135,6 +135,12 @@ pub struct Binding {
     pub binding: u32,
     /// What is bound there.
     pub kind: Kind,
+    /// For a block, the slot its buffer arrives at; `None` for a texture or a sampler.
+    ///
+    /// A family's blocks are in different buffers -- `UboUpdate::slot` is which buffer, not which
+    /// entry -- so a binding that did not carry this could only be pointed at a layer's first one.
+    /// [`crate::slots`] is what resolves it, and `None` on a block means it could not.
+    pub slot: Option<u32>,
 }
 
 /// The descriptor set a module for this family and surface declares.
@@ -157,10 +163,11 @@ pub struct Binding {
 pub fn bindings(family: &Family, surface: Surface) -> Vec<Binding> {
     let mut out = Vec::new();
     // The family's blocks first, then the surface's, exactly as the module declares them.
-    for _ in family.blocks.iter().chain(surface.blocks()) {
+    for block in family.blocks.iter().chain(surface.blocks()) {
         out.push(Binding {
             binding: out.len() as u32,
             kind: Kind::StorageBuffer,
+            slot: crate::slots::of(block),
         });
     }
     // Then two bindings for every texture, the family's own first and the surface's after -- a
@@ -172,6 +179,7 @@ pub fn bindings(family: &Family, surface: Surface) -> Vec<Binding> {
             out.push(Binding {
                 binding: out.len() as u32,
                 kind,
+                slot: None,
             });
         }
     }

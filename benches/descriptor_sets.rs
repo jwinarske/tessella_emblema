@@ -44,12 +44,28 @@ const fn which(layer: i32) -> Which {
     }
 }
 
-/// A family's bindings, and a block buffer for it.
-fn blocks_for(device: &Open, which: Which, slots: usize) -> Result<Blocks<'_>, String> {
+/// One block buffer per storage binding, at the slot that binding's bytes arrive in.
+///
+/// Per binding rather than one buffer for the set: a family's blocks are separate buffers, which is
+/// what `UboUpdate::slot` names. One buffer here would make every binding point at it and the bench
+/// could not tell.
+fn blocks_for<'d>(
+    device: &'d Open,
+    which: Which,
+    bindings: &[pipelines::Binding],
+) -> Result<Blocks<'d>, String> {
     let mut blocks = Blocks::new();
-    blocks
-        .declare(device.gpu(), which, slots.max(1), 64)
-        .map_err(|why| format!("declare blocks: {why}"))?;
+    for binding in bindings
+        .iter()
+        .filter(|b| b.kind == pipelines::Kind::StorageBuffer)
+    {
+        let slot = binding
+            .slot
+            .ok_or_else(|| format!("binding {} carries no slot", binding.binding))?;
+        blocks
+            .declare(device.gpu(), which, slot, 4, 64)
+            .map_err(|why| format!("declare slot {slot}: {why}"))?;
+    }
     Ok(blocks)
 }
 
@@ -133,10 +149,6 @@ fn every_set_is_written(device: &Open) -> Result<(), String> {
             let layout = pipelines::layout(device.gpu(), &bindings)
                 .map_err(|why| format!("{who}: {why}"))?;
 
-            let blocks_count = bindings
-                .iter()
-                .filter(|b| b.kind == pipelines::Kind::StorageBuffer)
-                .count();
             let image_count = bindings
                 .iter()
                 .filter(|b| b.kind == pipelines::Kind::SampledImage)
@@ -144,7 +156,7 @@ fn every_set_is_written(device: &Open) -> Result<(), String> {
 
             let at = which(layer);
             layer += 1;
-            let blocks = blocks_for(device, at, blocks_count)?;
+            let blocks = blocks_for(device, at, &bindings)?;
             let (images, refs) = images_for(device, image_count)?;
             let bound =
                 descriptors::bound_from(&images, &refs).map_err(|why| format!("{who}: {why}"))?;
@@ -174,6 +186,67 @@ fn every_set_is_written(device: &Open) -> Result<(), String> {
         return Err("resetting the pool left sets behind".into());
     }
     println!("  the pool resets       ok   nothing allocated afterwards");
+    Ok(())
+}
+
+/// Each storage binding resolves its own slot, and a missing one is named.
+///
+/// The case for the defect this keying replaced. A family's blocks arrive in separate buffers --
+/// `UboUpdate::slot` is which buffer -- and this held one per layer and pointed every binding at it,
+/// so the second block's fields were read out of the first's bytes.
+///
+/// A descriptor set cannot be read back, so what is checkable here is which buffer each binding
+/// *asks* for: every slot but one is declared, and the write must refuse naming exactly the one left
+/// out. Against one buffer per layer the same write succeeded, whichever slot was missing.
+fn each_binding_resolves_its_own_slot(device: &Open) -> Result<(), String> {
+    let family = families::ALL
+        .iter()
+        .find(|f| f.name == "fill")
+        .ok_or("the fill family")?;
+    let bindings = pipelines::bindings(family, Surface::Plane);
+    let slots: Vec<u32> = bindings
+        .iter()
+        .filter(|b| b.kind == pipelines::Kind::StorageBuffer)
+        .filter_map(|b| b.slot)
+        .collect();
+    if slots.len() < 2 {
+        return Err(format!("fill declares {} block slots", slots.len()));
+    }
+    let layout =
+        pipelines::layout(device.gpu(), &bindings).map_err(|why| format!("layout: {why}"))?;
+    let mut sets = Sets::new(device.gpu(), 2, &bindings).map_err(|why| format!("sets: {why}"))?;
+
+    for missing in &slots {
+        let at = which(100 + i32::try_from(*missing).unwrap_or(0));
+        let mut blocks = Blocks::new();
+        for slot in slots.iter().filter(|slot| *slot != missing) {
+            blocks
+                .declare(device.gpu(), at, *slot, 4, 64)
+                .map_err(|why| format!("declare {slot}: {why}"))?;
+        }
+        match sets.write(&layout, &bindings, at, &blocks, &[]) {
+            Err(descriptors::Error::NoBlocks { slot, .. }) if slot == *missing => {}
+            other => {
+                return Err(format!(
+                    "slot {missing} missing of {slots:?} gave {other:?}"
+                ));
+            }
+        }
+    }
+    if sets.allocated() != 0 {
+        return Err("a refused write left a set allocated".into());
+    }
+
+    // And with every slot declared it writes, which is the other side: a check that refused
+    // everything would pass the loop above.
+    let at = which(120);
+    let blocks = blocks_for(device, at, &bindings)?;
+    sets.write(&layout, &bindings, at, &blocks, &[])
+        .map_err(|why| format!("all slots present: {why}"))?;
+    println!(
+        "  bindings per slot     ok   {} slots, each refused by name, then all written",
+        slots.len()
+    );
     Ok(())
 }
 
@@ -214,11 +287,7 @@ fn refusals(device: &Open) -> Result<(), String> {
     let mut sets = Sets::new(device.gpu(), 4, &bindings).map_err(|why| format!("sets: {why}"))?;
 
     let at = which(0);
-    let blocks_count = bindings
-        .iter()
-        .filter(|b| b.kind == pipelines::Kind::StorageBuffer)
-        .count();
-    let blocks = blocks_for(device, at, blocks_count)?;
+    let blocks = blocks_for(device, at, &bindings)?;
     let (images, refs) = images_for(device, 1)?;
     let bound = descriptors::bound_from(&images, &refs).map_err(|why| why.to_string())?;
 
@@ -233,7 +302,7 @@ fn refusals(device: &Open) -> Result<(), String> {
         Err(descriptors::Error::WrongTextureCount { wanted: 1, got: 2 }) => {}
         other => return Err(format!("two textures gave {other:?}")),
     }
-    // A layer with no block buffer.
+    // A layer with no block buffer at all.
     let empty = Blocks::new();
     match sets.write(&layout, &bindings, at, &empty, &bound) {
         Err(descriptors::Error::NoBlocks { .. }) => {}
@@ -272,6 +341,7 @@ fn main() {
         ("every_set_written", every_set_is_written as Case),
         ("two_samplers", the_filters_are_two_samplers),
         ("refusals", refusals),
+        ("bindings_per_slot", each_binding_resolves_its_own_slot),
     ] {
         if let Err(why) = case(&device) {
             println!("  {name:<21} FAIL {why}");

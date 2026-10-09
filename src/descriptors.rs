@@ -5,6 +5,16 @@
 //! layouts. This fills one in: the storage buffers from [`crate::blocks`], and the sampled images
 //! and samplers for the textures a drawable names.
 //!
+//! # A binding per buffer, not a buffer per set
+//!
+//! Every family declares at least two blocks and they arrive in *different buffers*: a fill layer's
+//! drawables at slot 2, its tile properties at 4, its evaluated properties at 5. So each storage
+//! binding is resolved on its own, through the slot [`crate::pipelines::bindings`] carries for it.
+//!
+//! This bound every storage binding to one buffer once, because [`crate::blocks`] held one per
+//! layer. Nothing failed: the set was complete, the pipeline was valid and the shader read a color
+//! out of a matrix's bytes.
+//!
 //! # The two samplers
 //!
 //! Filter comes off the wire. `TextureRef::filter` is per *binding* rather than per texture, and the
@@ -37,10 +47,22 @@ use crate::pipelines::{Binding, Kind, Layout};
 /// Why a set could not be written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// A binding named a block buffer the layer does not have.
+    /// A binding named a block buffer the layer does not have at that slot.
     NoBlocks {
         /// Which layer.
         which: Which,
+        /// Which of its slots.
+        slot: u32,
+    },
+    /// A storage binding whose block has no slot agreed.
+    ///
+    /// [`crate::slots`] resolves every block any family or surface here declares, which
+    /// `tests/block_slots.rs` checks one by one -- so this is a caller passing bindings it built
+    /// itself, and the alternative to reporting it is binding that descriptor to another block's
+    /// buffer.
+    UnknownSlot {
+        /// Which binding of the set.
+        binding: u32,
     },
     /// A binding named a texture with no image.
     NoTexture {
@@ -71,11 +93,14 @@ impl From<tessella_vk::Error> for Error {
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::NoBlocks { which } => write!(
+            Self::NoBlocks { which, slot } => write!(
                 f,
-                "view {:?} layer {} has no block buffer",
+                "view {:?} layer {} has no block buffer at slot {slot}",
                 which.view, which.layer
             ),
+            Self::UnknownSlot { binding } => {
+                write!(f, "binding {binding} is a block with no slot agreed")
+            }
             Self::NoTexture { slot } => write!(f, "texture slot {slot} has no image"),
             Self::WrongTextureCount { wanted, got } => {
                 write!(f, "the set has {wanted} texture bindings and {got} arrived")
@@ -171,8 +196,9 @@ impl<'d> Sets<'d> {
     /// # Errors
     ///
     /// [`Error::NoBlocks`] or [`Error::NoTexture`] for a resource the stores do not have,
-    /// [`Error::WrongTextureCount`] when the drawable names a different number of textures than the
-    /// family declares, and [`Error::Device`] when the pool refuses.
+    /// [`Error::UnknownSlot`] for a storage binding carrying no slot, [`Error::WrongTextureCount`]
+    /// when the drawable names a different number of textures than the family declares, and
+    /// [`Error::Device`] when the pool refuses.
     pub fn write(
         &mut self,
         layout: &Layout<'_>,
@@ -191,26 +217,37 @@ impl<'d> Sets<'d> {
                 got: textures.len(),
             });
         }
-        let buffer = blocks.buffer(which).ok_or(Error::NoBlocks { which })?;
         for (slot, bound) in textures.iter().enumerate() {
             if bound.view == vk::ImageView::null() {
                 return Err(Error::NoTexture { slot });
             }
         }
 
-        let set = self.pool.allocate(layout.set())?;
-
-        // The infos outlive the writes that point at them, which is why they are collected first.
-        let buffers: Vec<vk::DescriptorBufferInfo> = bindings
-            .iter()
-            .filter(|b| b.kind == Kind::StorageBuffer)
-            .map(|_| {
+        // Each storage binding's own buffer, resolved before anything is allocated: a set half
+        // written is a set that has to be freed, and the pool frees whole.
+        //
+        // Bound at offset zero with the whole range, which is why no
+        // `minStorageBufferOffsetAlignment` appears here or in `blocks`: one buffer per slot means
+        // there is no offset to align.
+        let mut buffers: Vec<vk::DescriptorBufferInfo> = Vec::with_capacity(bindings.len());
+        for binding in bindings.iter().filter(|b| b.kind == Kind::StorageBuffer) {
+            let slot = binding.slot.ok_or(Error::UnknownSlot {
+                binding: binding.binding,
+            })?;
+            let buffer = blocks
+                .buffer(which, slot)
+                .ok_or(Error::NoBlocks { which, slot })?;
+            buffers.push(
                 vk::DescriptorBufferInfo::default()
                     .buffer(buffer)
                     .offset(0)
-                    .range(vk::WHOLE_SIZE)
-            })
-            .collect();
+                    .range(vk::WHOLE_SIZE),
+            );
+        }
+
+        let set = self.pool.allocate(layout.set())?;
+
+        // The infos outlive the writes that point at them, which is why they are collected first.
         let pictures: Vec<vk::DescriptorImageInfo> = textures
             .iter()
             .map(|bound| {
@@ -240,7 +277,9 @@ impl<'d> Sets<'d> {
                 .descriptor_type(binding.kind.descriptor_type());
             writes.push(match binding.kind {
                 Kind::StorageBuffer => {
-                    let info = buffers.get(block).ok_or(Error::NoBlocks { which })?;
+                    let info = buffers.get(block).ok_or(Error::UnknownSlot {
+                        binding: binding.binding,
+                    })?;
                     block += 1;
                     write.buffer_info(core::slice::from_ref(info))
                 }

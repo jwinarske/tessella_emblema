@@ -46,6 +46,17 @@ static GLOBE_CAMERA_FIELDS: [UboField; 1] = [UboField {
     kind: UboFieldKind::Mat4,
 }];
 
+/// The key this crate holds the globe camera's buffer under.
+///
+/// Not a wire slot. Every other block arrives as an `UboUpdate`, whose `slot` is the buffer's
+/// identity -- see [`crate::slots`] -- and this one does not arrive at all: it is built here from
+/// `CameraUpdate::globe_matrix`, so no producer can name it and there is nothing to agree with.
+///
+/// It still needs a key, because the buffer sits beside the ones that do arrive. Chosen past
+/// mbgl's nought-to-ten, past the globe bend's eleven and past tessella's own 128, for the reason
+/// `terrain_ubo` gives for those: a number in a dump is then obviously not the producer's.
+pub const GLOBE_CAMERA_SLOT: u32 = 1 << 16;
+
 /// The unit sphere to clip, for a frame in globe mode.
 ///
 /// `CameraUpdate::globe_matrix`, narrowed to `f32`. One matrix for the whole frame rather than one

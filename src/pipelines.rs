@@ -397,17 +397,33 @@ pub struct Targets {
 /// The viewport and scissor, so one pipeline serves a ring of images of any size -- baking them
 /// would need a pipeline per target size, and #60's host may resize its ring.
 ///
-/// And the **stencil compare mask**, which is per tile. `stencil::partition` gives each tile an
-/// `Assignment` whose `read_mask` is its own zoom's field of the stencil byte, so a content draw
-/// comparing all eight bits would test bits belonging to another zoom -- and be clipped by a tile
-/// that is not its own. Baking it would mean a pipeline per tile.
+/// And the **stencil compare mask and reference**, which are per tile. `stencil::partition` gives
+/// each tile an `Assignment` whose `value` the draw compares against and whose `read_mask` is its
+/// own zoom's field of the stencil byte -- so a content draw comparing all eight bits would test
+/// bits belonging to another zoom, and one comparing another tile's value would be clipped by a
+/// tile that is not its own. Both differ per tile, so baking either means a pipeline per tile.
+///
+/// # The reference has to be declared, not merely set
+///
+/// It was set and not declared. [`crate::record::content`] calls `Recorder::stencil_reference` per
+/// drawable and the whole clipping scheme rests on it, but this array listed only the compare mask
+/// -- and a `vkCmdSet*` for state a pipeline did not declare dynamic is ignored, the pipeline's
+/// static value being used instead. That value is zero, so every content draw would have compared
+/// zero: a layer drawn exactly where the stencil is *not* its tile's value, which is everywhere
+/// except its own tile.
+///
+/// Measured rather than reasoned: RADV and V3D 7.1.7.0 both honor the call anyway, and
+/// `benches/clip_masks.rs` passes on both either way. Two drivers agreeing is not the spec
+/// agreeing, and this is the same shape as `maxPerStageDescriptor*` -- invalid usage that no driver
+/// has to report. The declaration is the fix; the bench cannot be.
 ///
 /// The *write* mask is not here. A content draw never writes the stencil, so zero is baked and
 /// cannot be set wrong at a call site.
-pub const CONTENT_DYNAMIC: [vk::DynamicState; 3] = [
+pub const CONTENT_DYNAMIC: [vk::DynamicState; 4] = [
     vk::DynamicState::VIEWPORT,
     vk::DynamicState::SCISSOR,
     vk::DynamicState::STENCIL_COMPARE_MASK,
+    vk::DynamicState::STENCIL_REFERENCE,
 ];
 
 /// The depth and stencil state for a view.
@@ -446,11 +462,18 @@ pub fn depth_stencil(attachment: Attachment) -> vk::PipelineDepthStencilStateCre
 
 /// The stencil state a content draw compares with, before the per-tile masks are set.
 ///
-/// `compare_mask` is zero here and set per draw from the tile's `read_mask` -- zero rather than
-/// `0xFF` deliberately: a pipeline whose dynamic compare mask was never set then compares no bits
-/// and the draw is clipped away entirely, which is a blank layer. `0xFF` baked would compare every
-/// bit and draw everywhere, which is a layer with no clipping -- the failure that looks like
-/// working.
+/// `compare_mask` is zero here and set per draw from the tile's `read_mask`. Zero because that is
+/// what [`crate::record::clipping`] returns for a drawable with no tile and what
+/// [`crate::record::content`] counts as unclipped, so "no clipping" has one spelling across the
+/// crate and the baked default agrees with it.
+///
+/// Not for the reason this once gave, which was backwards. It said a never-set compare mask
+/// "compares no bits and the draw is clipped away entirely, which is a blank layer". The stencil
+/// test compares `reference & compare_mask` with `stencil & compare_mask`, so a mask of zero makes
+/// both sides zero and `EQUAL` *passes* -- the draw covers everything. Measured on RADV and on
+/// V3D 7.1.7.0, from the same scene and the same unassigned reference that draws nothing with a
+/// real mask: 4096 of 4096 texels. `0xFF` baked against a stencil cleared to zero passes as well,
+/// so neither value fails closed and the old sentence's distinction did not exist.
 const CONTENT_COMPARE_MASK: u32 = 0;
 
 /// How a draw composites over the target.

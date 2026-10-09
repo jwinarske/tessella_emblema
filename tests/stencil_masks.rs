@@ -155,6 +155,14 @@ fn the_pipelines_bake_no_mask() {
 /// And neither sets the other's: a content draw that could set a write mask is a content draw that
 /// could erase the tile mask it is testing against, which is the failure `depth_stencil`'s zero
 /// write mask exists to make unreachable.
+///
+/// # Declared is the whole of it
+///
+/// This asserted the opposite for the reference -- that a content pipeline must *not* declare it,
+/// because "a content draw's reference is set, but as part of the draw rather than declared here".
+/// `vkCmdSetStencilReference` is how dynamic state is set and is ignored for state a pipeline did
+/// not declare dynamic, so that sentence described a call with no effect. See
+/// [`pipelines::CONTENT_DYNAMIC`] for what the static zero would have drawn.
 #[test]
 fn each_pipeline_declares_only_the_masks_it_sets() {
     let content = pipelines::CONTENT_DYNAMIC;
@@ -164,8 +172,8 @@ fn each_pipeline_declares_only_the_masks_it_sets() {
         "a content draw must not be able to write the stencil"
     );
     assert!(
-        !content.contains(&vk::DynamicState::STENCIL_REFERENCE),
-        "a content draw's reference is set, but as part of the draw rather than declared here"
+        content.contains(&vk::DynamicState::STENCIL_REFERENCE),
+        "record::content sets a reference per drawable, so it has to be declared dynamic"
     );
 
     let mask = pipelines::MASK_DYNAMIC;

@@ -173,3 +173,107 @@ fn a_fully_dirty_buffer_is_one_range() {
     assert_eq!(ranges.len(), 1);
     assert_eq!(ranges[0], 0..256);
 }
+
+/// A whole buffer arriving marks only the entries that changed.
+///
+/// What an `UboUpdate` delivers, and the reason `replace` exists: the producer sends a layer's
+/// buffer entire and `write` takes one entry, so before this there was no call that could apply
+/// what arrived.
+#[test]
+fn a_whole_buffer_marks_only_what_changed() {
+    let mut buffer = Consolidated::new(4, BLOCK);
+    // The first arrival differs from the zeros everywhere, so every entry is dirty.
+    let first: Vec<u8> = (0..4u8).flat_map(|at| vec![0x10 | at; BLOCK]).collect();
+    assert_eq!(buffer.replace(&first), Ok(4), "a fresh buffer is all new");
+    assert_eq!(buffer.dirty_entries(), 4);
+    buffer.flush(0);
+
+    // The same bytes again: nothing changed, so nothing is marked and a flush moves nothing.
+    assert_eq!(
+        buffer.replace(&first),
+        Ok(0),
+        "an identical buffer is clean"
+    );
+    assert!(
+        !buffer.is_dirty(),
+        "a still map re-sending its buffer must flush nothing"
+    );
+    assert_eq!(buffer.flush(0), [], "and nothing is owed");
+
+    // One entry different, and only that one is marked.
+    let mut second = first.clone();
+    second[2 * BLOCK] = 0xFF;
+    assert_eq!(buffer.replace(&second), Ok(1));
+    let ranges = buffer.flush(0);
+    assert_eq!(ranges.len(), 1, "one entry changed, so one range");
+    assert_eq!(
+        ranges[0],
+        2 * BLOCK..3 * BLOCK,
+        "the range covers entry two and nothing else"
+    );
+    assert_eq!(buffer.bytes()[2 * BLOCK], 0xFF);
+}
+
+/// A buffer of another size is refused rather than partly applied.
+///
+/// The record describes the whole buffer, so a length that disagrees is the producer and this
+/// consumer disagreeing about how many entries the layer has -- a *different buffer*, which is
+/// `blocks::declare`'s `Reshaped` and not damage to this one. Applying the overlap would leave the
+/// rest holding the last frame's drawables.
+#[test]
+fn a_buffer_of_another_size_is_refused() {
+    let mut buffer = Consolidated::new(4, BLOCK);
+    let filled = vec![0xAB; 4 * BLOCK];
+    buffer.replace(&filled).expect("the whole buffer");
+    buffer.flush(0);
+
+    for wrong in [3 * BLOCK, 5 * BLOCK, 4 * BLOCK - 1] {
+        assert_eq!(
+            buffer.replace(&vec![0xCD; wrong]),
+            Err(Rejected::NotTheBuffer {
+                expected: 4 * BLOCK,
+                got: wrong
+            })
+        );
+    }
+    assert!(
+        !buffer.is_dirty(),
+        "a refused arrival must not dirty anything"
+    );
+    assert!(
+        buffer.bytes().iter().all(|byte| *byte == 0xAB),
+        "and must not write anything"
+    );
+}
+
+/// Entries that change on either side of a clean one are two ranges, or one with a gap allowed.
+///
+/// `replace` feeds the same dirty set `write` does, so the merge rule is the one the rest of this
+/// module already tests -- this is the case that says a whole-buffer arrival reaches it.
+#[test]
+fn a_replaced_buffer_merges_like_any_other() {
+    let mut buffer = Consolidated::new(4, BLOCK);
+    let zeros = vec![0u8; 4 * BLOCK];
+    buffer.replace(&zeros).expect("the whole buffer");
+    buffer.flush(0);
+
+    let mut arrived = zeros.clone();
+    arrived[0] = 1;
+    arrived[2 * BLOCK] = 1;
+    assert_eq!(buffer.replace(&arrived), Ok(2));
+    assert_eq!(
+        buffer.flush(0).len(),
+        2,
+        "a clean entry between them splits"
+    );
+
+    let mut again = arrived.clone();
+    again[1] = 2;
+    again[2 * BLOCK + 1] = 2;
+    assert_eq!(buffer.replace(&again), Ok(2));
+    assert_eq!(
+        buffer.flush(BLOCK).len(),
+        1,
+        "a gap of one entry merges them"
+    );
+}

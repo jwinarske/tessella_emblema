@@ -312,6 +312,34 @@ impl<'d> Blocks<'d> {
         Ok(true)
     }
 
+    /// Takes a whole buffer for one slot, marking the entries whose bytes changed.
+    ///
+    /// What an `UboUpdate` carries: `Upload::Uniforms` is `(view, layer_index, slot, bytes)` and the
+    /// bytes are the buffer entire. [`Self::write`] takes one entry, which is the shape a *shadow*
+    /// wants and not the shape the wire has -- see [`crate::uniforms::Consolidated::replace`] for
+    /// why the dirty set comes from a comparison here rather than from the record.
+    ///
+    /// A slot with no buffer is `Ok(0)`, as for [`Self::write`]: the producer may send a layer this
+    /// frame has not declared.
+    ///
+    /// # The entry count is the caller's, and it comes from the bytes
+    ///
+    /// Nothing on the wire says how many entries a buffer has -- the stride comes from the layer's
+    /// family and arrives in the order, possibly after the uniforms. So a caller declares the slot
+    /// from `bytes.len()` and the granularity it wants to diff at, and a buffer whose *size*
+    /// changed is a different buffer: [`Self::declare`] answers [`Error::Reshaped`] and the caller
+    /// forgets the layer first. That is the same rule a texture's size follows.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Write`] when the data is not exactly this buffer's size.
+    pub fn replace(&mut self, which: Which, slot: u32, data: &[u8]) -> Result<usize, Error> {
+        let Some(held) = self.held.get_mut(&(which, slot)) else {
+            return Ok(0);
+        };
+        Ok(held.shadow.replace(data)?)
+    }
+
     /// Whether a buffer has writes the device has not seen.
     #[must_use]
     pub fn is_dirty(&self, which: Which, slot: u32) -> bool {

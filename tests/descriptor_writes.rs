@@ -70,13 +70,20 @@ fn the_refusals_name_what_was_missing() {
             view: ViewId(7),
             layer: 3,
         },
+        slot: 5,
     };
     let text = blocks.to_string();
     assert!(
-        text.contains('7') && text.contains('3'),
-        "a missing block buffer must name the view and the layer, got {text:?}"
+        text.contains('7') && text.contains('3') && text.contains('5'),
+        "a missing block buffer must name the view, the layer and the slot, got {text:?}"
     );
 
     let texture = Error::NoTexture { slot: 2 };
     assert!(texture.to_string().contains('2'));
+
+    // And a block binding with no slot, which is the one refusal that is about the bindings rather
+    // than about what the stores hold.
+    let unknown = Error::UnknownSlot { binding: 1 };
+    assert!(unknown.to_string().contains('1'));
+    assert_ne!(unknown, Error::UnknownSlot { binding: 0 });
 }

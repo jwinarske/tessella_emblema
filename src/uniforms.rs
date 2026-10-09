@@ -1,18 +1,25 @@
 //! A layer's consolidated buffer, and the smallest set of writes that brings the device level.
 //!
 //! §11.7 asks a consumer for sub-range buffer updates from the dirty ranges, not whole-buffer
-//! rewrites. A frame touches a handful of slots in a buffer holding hundreds, and rewriting all of
+//! rewrites. A frame touches a handful of entries in a buffer holding hundreds, and rewriting all of
 //! it is bandwidth a tiler does not have spare.
 //!
-//! So the buffer is shadowed here. Slots are written into the shadow, the slots touched since the
-//! last flush are remembered, and a flush turns those into contiguous byte ranges for the backend
-//! to copy. Nothing here touches a device: the shadow is the thing that makes a sub-range write
+//! So the buffer is shadowed here. Entries are written into the shadow, the entries touched since
+//! the last flush are remembered, and a flush turns those into contiguous byte ranges for the
+//! backend to copy. Nothing here touches a device: the shadow is the thing that makes a sub-range write
 //! expressible at all, since a device write needs its source contiguous and the producer's updates
 //! arrive scattered.
 //!
+//! # An entry, not a slot
+//!
+//! The wire has two numbers and `UboUpdate` spells them `slot` and `uboIndex`: the first is which of
+//! a layer's buffers, the second is which entry within it. This module is inside one buffer, so
+//! everything here is an *index* and the word slot does not appear. Both were called `slot` once,
+//! which put `blocks::write(which, slot, slot, ..)` in reach of a caller.
+//!
 //! # Why merging has a threshold rather than a rule
 //!
-//! Two dirty slots either side of a clean one can go as two writes or as one covering all three.
+//! Two dirty entries either side of a clean one can go as two writes or as one covering all three.
 //! One write moves more bytes; two pay the per-write overhead twice. Neither is right in general,
 //! so the gap a merge will cross is the caller's to set and this does not guess: a backend
 //! recording `vkCmdCopyBuffer` regions and one calling `vkCmdUpdateBuffer` have different answers,
@@ -26,23 +33,23 @@ use std::ops::Range;
 pub enum Rejected {
     /// The data is not one block.
     ///
-    /// A layer's blocks are one size, fixed when the buffer was made. A write of another length is
-    /// the producer and this consumer disagreeing about the layout, and writing it anyway puts the
-    /// right bytes at the wrong offsets for every slot after it -- which draws, and draws wrong.
+    /// A buffer's blocks are one size, fixed when it was made. A write of another length is the
+    /// producer and this consumer disagreeing about the layout, and writing it anyway puts the right
+    /// bytes at the wrong offsets for every entry after it -- which draws, and draws wrong.
     WrongLength {
         /// What the buffer's blocks are.
         expected: usize,
         /// What arrived.
         got: usize,
     },
-    /// The slot is past what this buffer can hold.
+    /// The index is past what this buffer can hold.
     ///
-    /// Refused rather than grown. The buffer's size comes from the view's own declaration, so a
-    /// slot past it is a stale order naming a drawable this layer no longer has, and growing to
+    /// Refused rather than grown. The buffer's size comes from the view's own declaration, so an
+    /// index past it is a stale order naming a drawable this layer no longer has, and growing to
     /// fit would hide that behind an allocation.
-    NoSuchSlot {
-        /// How many slots the buffer has.
-        slots: usize,
+    NoSuchIndex {
+        /// How many entries the buffer has.
+        entries: usize,
         /// Which was asked for.
         got: u32,
     },
@@ -57,28 +64,28 @@ pub struct Consolidated {
 }
 
 impl Consolidated {
-    /// A buffer of `slots` blocks of `block` bytes, zeroed.
+    /// A buffer of `entries` blocks of `block` bytes, zeroed.
     ///
-    /// Zeroed rather than uninitialized because a slot nothing has written yet is read by anything
+    /// Zeroed rather than uninitialized because an entry nothing has written yet is read by anything
     /// that names it before the producer fills it, and zeros are at least a defined picture.
     #[must_use]
-    pub fn new(slots: usize, block: usize) -> Self {
+    pub fn new(entries: usize, block: usize) -> Self {
         Self {
-            bytes: vec![0; slots * block],
+            bytes: vec![0; entries * block],
             block,
             dirty: BTreeSet::new(),
         }
     }
 
-    /// Bytes per slot.
+    /// Bytes per entry.
     #[must_use]
     pub fn block(&self) -> usize {
         self.block
     }
 
-    /// How many slots the buffer holds.
+    /// How many entries the buffer holds.
     #[must_use]
-    pub fn slots(&self) -> usize {
+    pub fn entries(&self) -> usize {
         self.bytes.len().checked_div(self.block).unwrap_or(0)
     }
 
@@ -88,37 +95,37 @@ impl Consolidated {
         &self.bytes
     }
 
-    /// Writes one slot, marking it dirty.
+    /// Writes one entry, marking it dirty.
     ///
-    /// Latest wins: a slot written twice before a flush carries the second write's bytes and is
-    /// still one dirty slot, which is the producer's own contract for a `UboUpdate`.
+    /// Latest wins: an entry written twice before a flush carries the second write's bytes and is
+    /// still one dirty entry, which is the producer's own contract for a `UboUpdate`.
     ///
     /// # Errors
     ///
-    /// [`Rejected`] when the data is not one block, or the slot is past the buffer. Nothing is
+    /// [`Rejected`] when the data is not one block, or the index is past the buffer. Nothing is
     /// written in either case.
-    pub fn write(&mut self, slot: u32, data: &[u8]) -> Result<(), Rejected> {
+    pub fn write(&mut self, index: u32, data: &[u8]) -> Result<(), Rejected> {
         if data.len() != self.block {
             return Err(Rejected::WrongLength {
                 expected: self.block,
                 got: data.len(),
             });
         }
-        // Checked, because `usize` is thirty-two bits on some targets this builds for and a slot
+        // Checked, because `usize` is thirty-two bits on some targets this builds for and an index
         // near `u32::MAX` times a block size then wraps to a small offset -- which passes the
-        // bounds test below and writes over slot zero. The arithmetic is the bounds check here,
+        // bounds test below and writes over entry zero. The arithmetic is the bounds check here,
         // not a step before it.
-        let at = (slot as usize)
+        let at = (index as usize)
             .checked_mul(self.block)
             .and_then(|at| (at.checked_add(self.block)? <= self.bytes.len()).then_some(at));
         let Some(at) = at else {
-            return Err(Rejected::NoSuchSlot {
-                slots: self.slots(),
-                got: slot,
+            return Err(Rejected::NoSuchIndex {
+                entries: self.entries(),
+                got: index,
             });
         };
         self.bytes[at..at + self.block].copy_from_slice(data);
-        self.dirty.insert(slot);
+        self.dirty.insert(index);
         Ok(())
     }
 
@@ -128,9 +135,9 @@ impl Consolidated {
         !self.dirty.is_empty()
     }
 
-    /// How many slots are dirty, for a consumer watching its own upload traffic.
+    /// How many entries are dirty, for a consumer watching its own upload traffic.
     #[must_use]
-    pub fn dirty_slots(&self) -> usize {
+    pub fn dirty_entries(&self) -> usize {
         self.dirty.len()
     }
 
@@ -140,16 +147,16 @@ impl Consolidated {
     /// it twice would have it copy the same bytes again. Ranges are in ascending order and do not
     /// overlap, so a backend can hand them straight to a region list.
     ///
-    /// `max_gap` of zero merges only slots that touch. A gap large enough to span the buffer
+    /// `max_gap` of zero merges only entries that touch. A gap large enough to span the buffer
     /// collapses everything to one range, which is the whole-buffer rewrite this exists to avoid --
     /// so it is a number worth choosing rather than defaulting.
     pub fn flush(&mut self, max_gap: usize) -> Vec<Range<usize>> {
         let mut out: Vec<Range<usize>> = Vec::with_capacity(self.dirty.len());
-        for slot in &self.dirty {
-            let at = *slot as usize * self.block;
+        for index in &self.dirty {
+            let at = *index as usize * self.block;
             let range = at..at + self.block;
             match out.last_mut() {
-                // The slots are ascending, so only the open run can ever be extended.
+                // The indexes are ascending, so only the open run can ever be extended.
                 Some(open) if range.start - open.end <= max_gap => open.end = range.end,
                 _ => out.push(range),
             }

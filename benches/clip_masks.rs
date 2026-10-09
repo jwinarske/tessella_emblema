@@ -38,6 +38,12 @@ use common::Open;
 type Case = fn(&Open) -> Result<(), String>;
 
 const SIDE: u32 = 64;
+
+/// The slot a clipping mask's matrices arrive at.
+///
+/// mbgl's own, through the generated constant: a mask is a shader family like any other and its
+/// block travels on `UboUpdate` like any other.
+const MASK_SLOT: u32 = tessella_capture_abi::generated::ubo_slots::ID_CLIPPING_MASK_UBO;
 const COLOR: vk::Format = vk::Format::B8G8R8A8_UNORM;
 /// The tile whose mask is drawn, and the one the partition is asked about.
 fn tile() -> TileId {
@@ -251,10 +257,11 @@ fn scene(device: &Open, matrix: [f32; 16]) -> Result<Scene<'_>, String> {
         attachment: Attachment::DepthStencil,
     };
 
-    // The mask declares one storage buffer and nothing else.
+    // The mask declares one storage buffer and nothing else, arriving at mbgl's own slot for it.
     let bindings = [Binding {
         binding: 0,
         kind: Kind::StorageBuffer,
+        slot: Some(MASK_SLOT),
     }];
     let mask_layout = pipelines::layout(gpu, &bindings).map_err(|why| format!("layout: {why}"))?;
 
@@ -287,14 +294,14 @@ fn scene(device: &Open, matrix: [f32; 16]) -> Result<Scene<'_>, String> {
     };
     let mut blocks = Blocks::new();
     blocks
-        .declare(gpu, which, 1, 64)
+        .declare(gpu, which, MASK_SLOT, 1, 64)
         .map_err(|why| format!("blocks: {why}"))?;
     let bytes: Vec<u8> = matrix.iter().flat_map(|f| f.to_le_bytes()).collect();
     blocks
-        .write(which, 0, &bytes)
+        .write(which, MASK_SLOT, 0, &bytes)
         .map_err(|why| format!("write matrix: {why}"))?;
     blocks
-        .flush(which, 0)
+        .flush(which, MASK_SLOT, 0)
         .map_err(|why| format!("flush: {why}"))?;
 
     let mut sets = Sets::new(gpu, 2, &bindings).map_err(|why| format!("sets: {why}"))?;

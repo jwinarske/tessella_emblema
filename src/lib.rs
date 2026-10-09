@@ -120,6 +120,7 @@ pub mod preamble;
 pub mod record;
 pub mod residency;
 pub mod shaders;
+pub mod slots;
 pub mod spec;
 mod spirv;
 pub mod store;

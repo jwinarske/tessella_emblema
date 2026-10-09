@@ -192,6 +192,9 @@ fn every_set_is_within_the_limits(device: &Open) -> Result<(), String> {
             .map(|at| pipelines::Binding {
                 binding: at as u32,
                 kind: Kind::StorageBuffer,
+                // A set layout is built from the kinds and the binding numbers; the slot is for
+                // writing a set, which this case never gets to.
+                slot: None,
             })
             .collect();
         if pipelines::layout(device.gpu(), &bindings).is_ok() {

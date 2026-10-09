@@ -15,6 +15,13 @@
 //! A single tile also gets a one-bit stencil field, where there are only two values and no
 //! reference can fail to match one: the same reason `benches/clip_masks.rs` covers four.
 
+// Each bench is its own crate and compiles this module separately, so whatever *that* bench does
+// not name reads as dead here -- `two_passes` uses the writers and none of the one-view scene's
+// constants, and `a_frame` the other way about. The alternative is a copy of the writers per scene,
+// which is the duplication this module exists to remove. `common/mod.rs` carries the same allow for
+// the same reason.
+#![allow(dead_code)]
+
 use tessella_capture_abi::envelope::{
     AttributeDesc, CameraUpdate, DrawFlags, Extent, GeometryAdd, GeometryId, OrderEntry,
     OrderEpoch, OrderUpdate, Rect16, Segment, SlabRef, Span, StencilTile, StencilTiles, TextureId,
@@ -142,6 +149,17 @@ const QUAD: [i16; 8] = [-1, -1, 1, -1, 1, 1, -1, 1];
 const INDEXES: [u16; 6] = [0, 1, 2, 0, 2, 3];
 
 impl Geometry {
+    /// One drawable's runs: the position, the packed color and the opacity, the indexes, then a
+    /// raster's texture coordinate and skirt.
+    ///
+    /// Six because two families read it: a fill takes the first three and the indexes, a raster
+    /// takes the position, the coordinate and the skirt. Which of them a drawable is decides which
+    /// it names, and `vertices::plan` refuses a mismatch.
+    #[must_use]
+    pub fn runs(&self, at: usize) -> &[SlabRef; 6] {
+        &self.refs[at]
+    }
+
     /// Lays both tiles' geometry into one region, as the producer packs a slab.
     #[must_use]
     pub fn new() -> Self {
@@ -318,6 +336,7 @@ pub fn write(capacity: usize) -> (Ring, Geometry) {
         used(
             producer,
             *id,
+            VIEW,
             LAYER,
             Some(tile(u32::try_from(at).expect("two tiles"))),
         );
@@ -335,7 +354,7 @@ pub fn write(capacity: usize) -> (Ring, Geometry) {
         refs[3],
         &[],
     );
-    used(producer, ABOVE, OVER, None);
+    used(producer, ABOVE, VIEW, OVER, None);
 
     // And the layer that samples: three `Short2` runs -- a position, a texture coordinate and a
     // skirt -- and both of the images its table declares.
@@ -349,13 +368,13 @@ pub fn write(capacity: usize) -> (Ring, Geometry) {
         refs[3],
         &TEXTURES,
     );
-    used(producer, SAMPLER, SAMPLED, None);
+    used(producer, SAMPLER, VIEW, SAMPLED, None);
     textures(producer);
 
     clips(producer);
     uniforms(producer);
     order(producer);
-    camera(producer);
+    camera(producer, VIEW);
     (ring, geometry)
 }
 
@@ -366,7 +385,7 @@ pub fn write(capacity: usize) -> (Ring, Geometry) {
 /// Taken from the table rather than guessed: `vertices::plan` refuses a descriptor whose declared
 /// type disagrees, which is how the first version of this fixture was caught claiming `UShort4`
 /// for a fill's `Float4` color.
-fn announce(
+pub fn announce(
     producer: &mut Producer,
     id: GeometryId,
     shader: BuiltIn,
@@ -453,7 +472,7 @@ fn announce(
 }
 
 /// How wide one attribute's vertex is, which is also its stride in this layout.
-fn stride_of(kind: AttributeDataType) -> u32 {
+pub fn stride_of(kind: AttributeDataType) -> u32 {
     match kind {
         AttributeDataType::Short2 => 4,
         AttributeDataType::Float4 => 16,
@@ -467,10 +486,10 @@ fn stride_of(kind: AttributeDataType) -> u32 {
 /// `None` for a drawable that covers the viewport. The tile field is then meaningless -- the ABI
 /// says it is "meaningful only when `has_tile` is set" -- so it is left at its default and the flag
 /// is what a consumer reads.
-fn used(producer: &mut Producer, id: GeometryId, layer: i32, at: Option<TileId>) {
+pub fn used(producer: &mut Producer, id: GeometryId, view: ViewId, layer: i32, at: Option<TileId>) {
     let use_ = ViewUse {
         geometry: id,
-        view: VIEW,
+        view,
         layer_index: layer,
         sub_layer_index: 0,
         tile: at.unwrap_or_default(),
@@ -553,7 +572,13 @@ fn textures(producer: &mut Producer) {
 }
 
 /// One texture's pixels, in whichever form the rects describe.
-fn texture(producer: &mut Producer, id: TextureId, rects: &[Rect16], packed: bool, pixels: &[u8]) {
+pub fn texture(
+    producer: &mut Producer,
+    id: TextureId,
+    rects: &[Rect16],
+    packed: bool,
+    pixels: &[u8],
+) {
     let mut held = [Rect16::default(); 4];
     held[..rects.len()].copy_from_slice(rects);
     let update = TextureUpdate {
@@ -617,9 +642,16 @@ fn uniforms(producer: &mut Producer) {
     for at in 0..GEOMETRIES.len() {
         entry(&mut drawables[at * stride..(at + 1) * stride], &CLIP);
     }
-    ubo(producer, LAYER, ubo_slots::ID_FILL_DRAWABLE_UBO, &drawables);
     ubo(
         producer,
+        VIEW,
+        LAYER,
+        ubo_slots::ID_FILL_DRAWABLE_UBO,
+        &drawables,
+    );
+    ubo(
+        producer,
+        VIEW,
         LAYER,
         ubo_slots::ID_FILL_EVALUATED_PROPS_UBO,
         &props(),
@@ -632,9 +664,16 @@ fn uniforms(producer: &mut Producer) {
     let mut matrix = CLIP;
     matrix[5] /= f32::from(BAND_OF);
     entry(&mut above, &matrix);
-    ubo(producer, OVER, ubo_slots::ID_FILL_DRAWABLE_UBO, &above);
     ubo(
         producer,
+        VIEW,
+        OVER,
+        ubo_slots::ID_FILL_DRAWABLE_UBO,
+        &above,
+    );
+    ubo(
+        producer,
+        VIEW,
         OVER,
         ubo_slots::ID_FILL_EVALUATED_PROPS_UBO,
         &props(),
@@ -660,12 +699,14 @@ fn uniforms(producer: &mut Producer) {
     );
     ubo(
         producer,
+        VIEW,
         SAMPLED,
         ubo_slots::ID_RASTER_DRAWABLE_UBO,
         &raster,
     );
     ubo(
         producer,
+        VIEW,
         SAMPLED,
         ubo_slots::ID_RASTER_EVALUATED_PROPS_UBO,
         &raster_paint(),
@@ -678,7 +719,7 @@ fn uniforms(producer: &mut Producer) {
 /// chain neutral the pixel is the texel, so what this frame says is which texel was sampled. The
 /// one difference is the opacity, which is one here -- the band is drawn over the tiles beneath it,
 /// and a half-transparent raster would make the expectation a blend.
-fn raster_paint() -> Vec<u8> {
+pub fn raster_paint() -> Vec<u8> {
     let mut paint = vec![0u8; ubo_layouts::RASTER_EVALUATED_PROPS_UBO.stride as usize];
     for (field, values) in [
         // `dot(rgb, spin.xyz)`, `dot(rgb, spin.zxy)`, `dot(rgb, spin.yzx)`, which leaves every
@@ -705,7 +746,7 @@ fn raster_paint() -> Vec<u8> {
 }
 
 /// One drawable entry: where it is placed, and both interpolation factors at their first endpoint.
-fn entry(into: &mut [u8], matrix: &[f32; 16]) {
+pub fn entry(into: &mut [u8], matrix: &[f32; 16]) {
     put(into, &FILL_DRAWABLE_UBO, "matrix", matrix);
     put(into, &FILL_DRAWABLE_UBO, "color_t", &[0.0]);
     put(into, &FILL_DRAWABLE_UBO, "opacity_t", &[0.0]);
@@ -715,14 +756,14 @@ fn entry(into: &mut [u8], matrix: &[f32; 16]) {
 ///
 /// Zeros: every color here is a per-vertex attribute, and the block's own color is the fallback a
 /// layer with a constant paint would use. A layer that read it instead would draw black.
-fn props() -> Vec<u8> {
+pub fn props() -> Vec<u8> {
     let mut props = vec![0u8; FILL_EVALUATED_PROPS_UBO.stride as usize];
     put(&mut props, &FILL_EVALUATED_PROPS_UBO, "color", &[0.0; 4]);
     props
 }
 
 /// Writes floats into a block at the offset the ABI declares for a named field.
-fn put(entry: &mut [u8], layout: &ubo_layouts::UboLayout, field: &str, values: &[f32]) {
+pub fn put(entry: &mut [u8], layout: &ubo_layouts::UboLayout, field: &str, values: &[f32]) {
     let found = layout
         .fields
         .iter()
@@ -735,9 +776,9 @@ fn put(entry: &mut [u8], layout: &ubo_layouts::UboLayout, field: &str, values: &
     }
 }
 
-fn ubo(producer: &mut Producer, layer: i32, slot: u32, data: &[u8]) {
+pub fn ubo(producer: &mut Producer, view: ViewId, layer: i32, slot: u32, data: &[u8]) {
     let update = tessella_capture_abi::envelope::UboUpdate {
-        view: VIEW,
+        view,
         layer_index: layer,
         slot,
         _pad: 0,
@@ -808,10 +849,10 @@ fn order(producer: &mut Producer) {
 /// Read from zeros rather than built field by field: a camera is a hundred and sixty bytes of
 /// matrices this fixture does not place geometry with -- every drawable carries its own -- and
 /// zeros are a camera the decode accepts.
-fn camera(producer: &mut Producer) {
+pub fn camera(producer: &mut Producer, view: ViewId) {
     let zeros = vec![0u8; core::mem::size_of::<CameraUpdate>()];
     let mut update = CameraUpdate::from_bytes(&zeros).expect("a camera reads from zeros");
-    update.view = VIEW;
+    update.view = view;
     update.order_epoch = EPOCH;
     producer
         .write(EnvelopeKind::CameraUpdate, update.as_bytes(), &[])

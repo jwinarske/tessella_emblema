@@ -88,3 +88,7 @@ naga = { version = "23", features = ["wgsl-in", "spv-out"] }
 [[bench]]
 name = "a_frame"
 harness = false
+
+[[bench]]
+name = "two_passes"
+harness = false

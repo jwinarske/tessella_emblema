@@ -172,6 +172,18 @@ impl<'d> Images<'d> {
         Some(&self.held.get(&texture)?.image)
     }
 
+    /// The image and the view a pass renders into, for a texture that is a render target.
+    ///
+    /// Both, because `target::Host` needs both: the image for the layout transitions and the view
+    /// for the rendering scope. [`Self::view`] gives the raw handle a descriptor wants, which is a
+    /// different question -- a pass needs the wrapper, because that is what carries the aspects its
+    /// attachments are named by.
+    #[must_use]
+    pub fn rendered(&self, texture: TextureId) -> Option<(&Image<'d>, &ImageView<'d>)> {
+        let held = self.held.get(&texture)?;
+        Some((&held.image, &held.view))
+    }
+
     /// The format a texture was made with.
     #[must_use]
     pub fn format(&self, texture: TextureId) -> Option<vk::Format> {
@@ -251,6 +263,82 @@ impl<'d> Images<'d> {
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         );
         record.clear(&image);
+
+        self.held.insert(
+            texture,
+            Held {
+                image,
+                view,
+                memory,
+                size,
+                format,
+                texel: textures::texel(pixel, channel),
+                staging: None,
+            },
+        );
+        Ok(true)
+    }
+
+    /// Makes the image an offscreen *view* draws into, rather than one the producer uploads.
+    ///
+    /// DR-25's render target. `ViewTarget` names it in `TextureUpdate`'s id space and says it is
+    /// "never the subject of one -- nothing uploads pixels to a render target", so it is held here
+    /// beside the uploaded textures for the reason that id space is shared: a drawable in the
+    /// parent view binds it by [`crate::descriptors::bound_from`] like any other, and that lookup
+    /// is by id.
+    ///
+    /// # What differs from [`Self::declare`]
+    ///
+    /// The usage, and nothing else about the image. A target needs `COLOR_ATTACHMENT` because a
+    /// pass renders into it, and does not need `TRANSFER_DST` because no copy ever fills it.
+    ///
+    /// And it records nothing. `declare` transitions to `TRANSFER_DST_OPTIMAL` and clears, because
+    /// an uploaded texture is sampled wherever its rects did not reach; a target is written whole
+    /// by the pass that owns it, and that pass states the layout it is taking the image *from* --
+    /// `target::Host::layout`, where `UNDEFINED` is the legal way to say the contents may go. So
+    /// this needs no command buffer, which is why it does not take one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoFormat`] for a pair with no format, [`Error::Reshaped`] when the texture exists at
+    /// another shape -- forget it first, which a parent resizing requires -- and [`Error::Device`]
+    /// when the device refuses.
+    pub fn declare_target(
+        &mut self,
+        gpu: Gpu<'d>,
+        texture: TextureId,
+        size: Extent,
+        pixel: TexturePixelType,
+        channel: TextureChannelDataType,
+    ) -> Result<bool, Error> {
+        let format =
+            device::texture_format(pixel, channel).ok_or(Error::NoFormat { pixel, channel })?;
+        if let Some(held) = self.held.get(&texture) {
+            if held.size == size && held.format == format {
+                return Ok(false);
+            }
+            return Err(Error::Reshaped {
+                size: held.size,
+                format: held.format,
+            });
+        }
+
+        let image = gpu.image(
+            size.width,
+            size.height,
+            format,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::SAMPLED,
+        )?;
+        let requirements = [image.requirements()];
+        let memory = gpu.allocate(
+            requirements[0].size,
+            &requirements,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        memory.bind_image(&image, 0)?;
+        let view = gpu.view(&image, format)?;
 
         self.held.insert(
             texture,

@@ -66,6 +66,9 @@ fn a_content_draw_does_not_write_the_stencil() {
         let state = pipelines::depth_stencil(attachment);
         for (side, face) in [("front", state.front), ("back", state.back)] {
             assert_eq!(face.write_mask, 0, "{side} writes the mask");
+            // The compare mask is dynamic now, set per draw from the tile's `read_mask`. See
+            // `tests/stencil_masks.rs` for why a baked one cannot be right.
+            assert_eq!(face.compare_mask, 0, "{side} bakes a compare mask");
             assert_eq!(face.fail_op, vk::StencilOp::KEEP, "{side} fail");
             assert_eq!(face.pass_op, vk::StencilOp::KEEP, "{side} pass");
             assert_eq!(face.depth_fail_op, vk::StencilOp::KEEP, "{side} depth fail");

@@ -1107,6 +1107,37 @@ impl<'c> Recorder<'c> {
         }
     }
 
+    /// Sets the stencil compare mask for both faces.
+    ///
+    /// A content draw's is the tile's `read_mask` -- its own zoom's field of the stencil byte. One
+    /// comparing all eight bits tests bits belonging to another zoom and is clipped by a tile that
+    /// is not its own.
+    pub fn stencil_compare_mask(&self, mask: u32) {
+        // SAFETY: the command buffer is recording.
+        unsafe {
+            self.device.cmd_set_stencil_compare_mask(
+                self.raw,
+                vk::StencilFaceFlags::FRONT_AND_BACK,
+                mask,
+            );
+        }
+    }
+
+    /// Sets the stencil write mask for both faces.
+    ///
+    /// A mask's is the tile's `write_mask` -- its own field, plus any ancestor field it replaces.
+    /// One writing all eight bits stamps over every other zoom's.
+    pub fn stencil_write_mask(&self, mask: u32) {
+        // SAFETY: the command buffer is recording.
+        unsafe {
+            self.device.cmd_set_stencil_write_mask(
+                self.raw,
+                vk::StencilFaceFlags::FRONT_AND_BACK,
+                mask,
+            );
+        }
+    }
+
     /// Binds vertex buffers from a first binding, each at its own offset.
     pub fn bind_vertex_buffers(&self, first: u32, buffers: &[vk::Buffer], offsets: &[u64]) {
         if buffers.is_empty() {

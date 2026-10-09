@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use tessella_capture_abi::envelope::{AttributeDesc, SlabRef};
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_capture_abi::generated::shader_attributes::{FILL_SHADER, RASTER_SHADER};
-use tessella_emblema::pipelines::key;
+use tessella_emblema::pipelines::{Blend, key};
 use tessella_emblema::surface::Surface;
 use tessella_emblema::vertices::{Plan, plan, plan_instanced};
 
@@ -48,12 +48,14 @@ fn the_same_drawable_twice_is_one_key() {
         Surface::Plane,
         0,
         &planned(12, 0, SOMEWHERE),
+        Blend::Alpha,
     );
     let b = key(
         BuiltIn::RasterShader,
         Surface::Plane,
         0,
         &planned(12, 0, SOMEWHERE),
+        Blend::Alpha,
     );
     assert_eq!(a, b);
 }
@@ -66,12 +68,14 @@ fn a_different_stride_is_a_different_pipeline() {
         Surface::Plane,
         0,
         &planned(12, 0, SOMEWHERE),
+        Blend::Alpha,
     );
     let b = key(
         BuiltIn::RasterShader,
         Surface::Plane,
         0,
         &planned(16, 0, SOMEWHERE),
+        Blend::Alpha,
     );
     assert_ne!(
         a, b,
@@ -86,12 +90,14 @@ fn a_different_offset_within_a_vertex_is_a_different_pipeline() {
         Surface::Plane,
         0,
         &planned(12, 0, SOMEWHERE),
+        Blend::Alpha,
     );
     let b = key(
         BuiltIn::RasterShader,
         Surface::Plane,
         0,
         &planned(12, 4, SOMEWHERE),
+        Blend::Alpha,
     );
     assert_ne!(a, b);
 }
@@ -99,9 +105,27 @@ fn a_different_offset_within_a_vertex_is_a_different_pipeline() {
 #[test]
 fn the_surface_and_the_permutation_each_separate_a_key() {
     let base = planned(12, 0, SOMEWHERE);
-    let flat = key(BuiltIn::RasterShader, Surface::Plane, 0, &base);
-    let bent = key(BuiltIn::RasterShader, Surface::Globe, 0, &base);
-    let varied = key(BuiltIn::RasterShader, Surface::Plane, 1, &base);
+    let flat = key(
+        BuiltIn::RasterShader,
+        Surface::Plane,
+        0,
+        &base,
+        Blend::Alpha,
+    );
+    let bent = key(
+        BuiltIn::RasterShader,
+        Surface::Globe,
+        0,
+        &base,
+        Blend::Alpha,
+    );
+    let varied = key(
+        BuiltIn::RasterShader,
+        Surface::Plane,
+        1,
+        &base,
+        Blend::Alpha,
+    );
     assert_ne!(flat, bent, "a different module");
     assert_ne!(flat, varied, "different specialization constants");
 }
@@ -110,8 +134,20 @@ fn the_surface_and_the_permutation_each_separate_a_key() {
 fn the_family_separates_a_key() {
     let base = planned(12, 0, SOMEWHERE);
     assert_ne!(
-        key(BuiltIn::RasterShader, Surface::Plane, 0, &base),
-        key(BuiltIn::HillshadeShader, Surface::Plane, 0, &base),
+        key(
+            BuiltIn::RasterShader,
+            Surface::Plane,
+            0,
+            &base,
+            Blend::Alpha
+        ),
+        key(
+            BuiltIn::HillshadeShader,
+            Surface::Plane,
+            0,
+            &base,
+            Blend::Alpha
+        ),
         "raster and hillshade declare the same attributes and are not the same shader"
     );
 }
@@ -129,13 +165,15 @@ fn where_the_bytes_live_does_not_separate_a_key() {
             BuiltIn::RasterShader,
             Surface::Plane,
             0,
-            &planned(12, 0, SOMEWHERE)
+            &planned(12, 0, SOMEWHERE),
+            Blend::Alpha
         ),
         key(
             BuiltIn::RasterShader,
             Surface::Plane,
             0,
-            &planned(12, 0, elsewhere)
+            &planned(12, 0, elsewhere),
+            Blend::Alpha
         ),
         "two drawables in different slabs share a pipeline"
     );
@@ -177,8 +215,14 @@ fn a_shorter_run_is_a_different_pipeline() {
     )
     .expect("a partial run is not an error");
     assert_ne!(
-        key(BuiltIn::FillShader, Surface::Plane, 0, &full),
-        key(BuiltIn::FillShader, Surface::Plane, 0, &partial)
+        key(BuiltIn::FillShader, Surface::Plane, 0, &full, Blend::Alpha),
+        key(
+            BuiltIn::FillShader,
+            Surface::Plane,
+            0,
+            &partial,
+            Blend::Alpha
+        )
     );
 }
 
@@ -191,12 +235,14 @@ fn the_key_caches() {
         Surface::Plane,
         0,
         &planned(12, 0, SOMEWHERE),
+        Blend::Alpha,
     );
     let strided = key(
         BuiltIn::RasterShader,
         Surface::Plane,
         0,
         &planned(16, 0, SOMEWHERE),
+        Blend::Alpha,
     );
     cache.insert(flat.clone(), 1);
     cache.insert(strided, 2);
@@ -208,6 +254,7 @@ fn the_key_caches() {
         Surface::Plane,
         0,
         &planned(12, 0, SOMEWHERE),
+        Blend::Alpha,
     );
     assert_eq!(cache.get(&again), Some(&1));
 }
@@ -221,6 +268,7 @@ fn the_layout_records_the_format_the_table_declared() {
         Surface::Plane,
         0,
         &planned(12, 0, SOMEWHERE),
+        Blend::Alpha,
     );
     assert_eq!(got.layout.len(), RASTER_SHADER.len());
     for slot in &got.layout {
@@ -243,8 +291,20 @@ fn the_input_rate_separates_a_key() {
         "the same bindings"
     );
     assert_ne!(
-        key(BuiltIn::RasterShader, Surface::Plane, 0, &per_vertex),
-        key(BuiltIn::RasterShader, Surface::Plane, 0, &per_instance),
+        key(
+            BuiltIn::RasterShader,
+            Surface::Plane,
+            0,
+            &per_vertex,
+            Blend::Alpha
+        ),
+        key(
+            BuiltIn::RasterShader,
+            Surface::Plane,
+            0,
+            &per_instance,
+            Blend::Alpha
+        ),
         "one advances per vertex and one per instance"
     );
 }

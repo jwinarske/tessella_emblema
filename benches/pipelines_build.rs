@@ -76,6 +76,7 @@ fn key_for(family: &families::Family, surface: Surface) -> Result<Key, String> {
         surface,
         permutation: 0,
         layout,
+        blend: pipelines::Blend::Alpha,
     })
 }
 

@@ -41,6 +41,7 @@ fn key(layout: Vec<Slot>) -> Key {
         surface: Surface::Plane,
         permutation: 0,
         layout,
+        blend: pipelines::Blend::Alpha,
     }
 }
 

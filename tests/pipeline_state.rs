@@ -81,30 +81,93 @@ fn a_content_draw_does_not_write_the_stencil() {
     }
 }
 
-/// The alpha factor does not premultiply a second time.
+/// Alpha blending is premultiplied, which is what the bodies return.
 ///
-/// `SRC_ALPHA` on color and `ONE` on alpha is premultiplied-correct compositing of a straight-alpha
-/// source. `SRC_ALPHA` on both -- the symmetric-looking choice -- squares the alpha, which darkens
-/// every blended edge in the map by an amount that reads as a style difference rather than a defect.
+/// mbgl's `alphaBlended` is `Add{One, OneMinusSrcAlpha}`, and `src = ONE` is the whole point: its
+/// fragment stages return premultiplied color -- `out_color = color * opacity` scales the alpha
+/// channel along with the others -- and this crate's bodies are transcribed from those and do the
+/// same. One of them says so: "the sheet is premultiplied, so the opacity and the fade scale it
+/// directly."
+///
+/// `SRC_ALPHA` is the symmetric-looking choice and it multiplies by alpha a second time, darkening
+/// every blended edge by an amount that reads as a style difference rather than a defect. This test
+/// asserted `SRC_ALPHA` until mbgl's own `color_mode.hpp` was read.
 #[test]
-fn the_alpha_factor_does_not_premultiply_twice() {
-    let state = pipelines::blend();
+fn alpha_blending_is_premultiplied() {
+    let state = pipelines::Blend::Alpha.attachment();
     assert_eq!(state.blend_enable, vk::TRUE);
-    assert_eq!(state.src_color_blend_factor, vk::BlendFactor::SRC_ALPHA);
+    assert_eq!(
+        state.src_color_blend_factor,
+        vk::BlendFactor::ONE,
+        "the source is already premultiplied; scaling it by alpha again darkens every edge"
+    );
     assert_eq!(
         state.dst_color_blend_factor,
         vk::BlendFactor::ONE_MINUS_SRC_ALPHA
     );
-    assert_eq!(
-        state.src_alpha_blend_factor,
-        vk::BlendFactor::ONE,
-        "the alpha channel must not be scaled by alpha again"
-    );
+    assert_eq!(state.src_alpha_blend_factor, vk::BlendFactor::ONE);
     assert_eq!(
         state.dst_alpha_blend_factor,
         vk::BlendFactor::ONE_MINUS_SRC_ALPHA
     );
     assert_eq!(state.color_write_mask, vk::ColorComponentFlags::RGBA);
+}
+
+/// Unblended writes the source through, which is what a readback oracle needs.
+///
+/// mbgl's `unblended`: a `Replace` function. A pixel read back is then what the fragment stage
+/// returned rather than what it returned composited over whatever the target held, which is the
+/// only way a derived-by-hand expected value means anything.
+#[test]
+fn unblended_replaces_the_target() {
+    let state = pipelines::Blend::Unblended.attachment();
+    assert_eq!(state.blend_enable, vk::FALSE);
+    assert_eq!(
+        state.color_write_mask,
+        vk::ColorComponentFlags::RGBA,
+        "unblended still writes every channel; `disabled` is the one that writes none"
+    );
+}
+
+/// Additive accumulates, which is what a heatmap does.
+#[test]
+fn additive_accumulates() {
+    let state = pipelines::Blend::Additive.attachment();
+    assert_eq!(state.blend_enable, vk::TRUE);
+    assert_eq!(state.src_color_blend_factor, vk::BlendFactor::ONE);
+    assert_eq!(
+        state.dst_color_blend_factor,
+        vk::BlendFactor::ONE,
+        "every contribution brightens the same texel"
+    );
+}
+
+/// The blend mode is in the pipeline key, because it is pipeline state.
+///
+/// Two layers of one family and permutation can pick different modes -- a heatmap accumulates where
+/// a fill composites -- so a cache keyed without it would hand the second the first's pipeline.
+///
+/// This guards the field's presence and no more: the equality is derived, so it holds as long as the
+/// field is there. What makes a pipeline's blend agree with its key is structural rather than
+/// tested -- `build` reads `key.blend` and takes no blend argument, so there is no way to build one
+/// that disagrees.
+#[test]
+fn the_blend_mode_is_part_of_the_key() {
+    use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
+    use tessella_emblema::surface::Surface;
+
+    let of = |blend| pipelines::Key {
+        shader: BuiltIn::FillShader,
+        surface: Surface::Plane,
+        permutation: 0,
+        layout: Vec::new(),
+        blend,
+    };
+    assert_ne!(
+        of(pipelines::Blend::Alpha),
+        of(pipelines::Blend::Additive),
+        "two modes must be two keys"
+    );
 }
 
 /// Nothing is culled.

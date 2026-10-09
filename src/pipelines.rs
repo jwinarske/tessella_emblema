@@ -62,6 +62,13 @@ pub struct Key {
     pub permutation: u64,
     /// The vertex input state, in slot order.
     pub layout: Vec<Slot>,
+    /// How the draw composites.
+    ///
+    /// In the key because it is pipeline state, for the same reason the vertex layout is: two
+    /// layers of one family and permutation can pick different `ColorMode`s -- a heatmap
+    /// accumulates where a fill composites -- and a cache keyed without this would hand the second
+    /// one the first's pipeline and blend it wrongly. Which draws.
+    pub blend: Blend,
 }
 
 /// The key for a drawable whose input has been planned.
@@ -71,11 +78,12 @@ pub struct Key {
 /// attribute is constant for this permutation and no descriptor arrived for it, and that difference
 /// is a different pipeline.
 #[must_use]
-pub fn key(shader: BuiltIn, surface: Surface, permutation: u64, plan: &Plan) -> Key {
+pub fn key(shader: BuiltIn, surface: Surface, permutation: u64, plan: &Plan, blend: Blend) -> Key {
     Key {
         shader,
         surface,
         permutation,
+        blend,
         layout: plan
             .bound
             .iter()
@@ -437,25 +445,65 @@ pub fn depth_stencil(attachment: Attachment) -> vk::PipelineDepthStencilStateCre
 /// working.
 const CONTENT_COMPARE_MASK: u32 = 0;
 
-/// Straight alpha blending over the target.
+/// How a draw composites over the target.
 ///
-/// `SRC_ALPHA, ONE_MINUS_SRC_ALPHA` on color and `ONE, ONE_MINUS_SRC_ALPHA` on alpha, which is
-/// premultiplied-correct compositing of a straight-alpha source: the color factor premultiplies as
-/// it blends, and the alpha factor must not premultiply again. mbgl's own default.
-///
-/// Per layer rather than per family is a later decision -- a few layers ask for additive, and the
-/// heatmap accumulates -- so this is the default a content pipeline gets and the place that choice
-/// will be threaded through.
-pub fn blend() -> vk::PipelineColorBlendAttachmentState {
-    vk::PipelineColorBlendAttachmentState::default()
-        .blend_enable(true)
-        .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
-        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-        .color_blend_op(vk::BlendOp::ADD)
-        .src_alpha_blend_factor(vk::BlendFactor::ONE)
-        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-        .alpha_blend_op(vk::BlendOp::ADD)
-        .color_write_mask(vk::ColorComponentFlags::RGBA)
+/// mbgl's four named `ColorMode`s, which is where these come from rather than from first
+/// principles: `include/mbgl/gfx/color_mode.hpp` has `unblended`, `alphaBlended`, `additive` and
+/// `disabled`, and a layer picks one. Per layer rather than per family, which is why this is a
+/// parameter of [`build`] and not a constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Blend {
+    /// The source replaces the target. mbgl's `unblended`.
+    ///
+    /// What the opaque pass uses, and what a readback oracle wants: the pixel is what the fragment
+    /// stage returned rather than what it returned composited over whatever was there.
+    Unblended,
+    /// Premultiplied alpha over the target. mbgl's `alphaBlended`, and the usual one.
+    #[default]
+    Alpha,
+    /// The source adds to the target. mbgl's `additive`.
+    ///
+    /// What a heatmap accumulates with, where every contribution brightens the same texel.
+    Additive,
+}
+
+impl Blend {
+    /// The attachment state this mode is.
+    ///
+    /// # Premultiplied, which is the part worth stating
+    ///
+    /// [`Self::Alpha`] is `src = ONE`, not `SRC_ALPHA`. mbgl's `alphaBlended` is
+    /// `Add{One, OneMinusSrcAlpha}` because its fragment stages return **premultiplied** color --
+    /// `out_color = color * opacity` scales the alpha channel along with the others, and this
+    /// crate's bodies are transcribed from those and do the same. One of them says so outright:
+    /// "the sheet is premultiplied, so the opacity and the fade scale it directly".
+    ///
+    /// `SRC_ALPHA` would multiply by alpha a second time, darkening every blended edge by an amount
+    /// that reads as a style difference rather than a defect. An earlier version of this crate had
+    /// exactly that, with a test asserting it.
+    pub fn attachment(self) -> vk::PipelineColorBlendAttachmentState {
+        let state = vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA);
+        match self {
+            Self::Unblended => state.blend_enable(false),
+            Self::Alpha => state
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::ONE)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .color_blend_op(vk::BlendOp::ADD)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .alpha_blend_op(vk::BlendOp::ADD),
+            Self::Additive => state
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::ONE)
+                .dst_color_blend_factor(vk::BlendFactor::ONE)
+                .color_blend_op(vk::BlendOp::ADD)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+                .alpha_blend_op(vk::BlendOp::ADD),
+        }
+    }
 }
 
 /// No culling.
@@ -482,7 +530,7 @@ const FRAGMENT_ENTRY: &core::ffi::CStr = c"fragment_main";
 /// points. The same handle is named twice rather than compiled twice.
 ///
 /// Everything not derived from the key is a decision with a reason beside it --
-/// [`depth_stencil`], [`blend`], [`rasterization`], and the dynamic viewport and scissor. The
+/// [`depth_stencil`], [`Blend::attachment`], [`rasterization`], and the dynamic viewport and scissor. The
 /// topology is a triangle list because every bucket this crate draws is indexed triangles; a line is
 /// a stroked quad pair and a circle is a quad, both tessellated by the producer.
 ///
@@ -523,7 +571,7 @@ pub fn build<'d>(
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
     let depth = depth_stencil(targets.attachment);
-    let attachments = [blend()];
+    let attachments = [key.blend.attachment()];
     let blending = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
 
     // The attachments by format, which is what replaces the render pass handle. The stencil format
@@ -618,9 +666,10 @@ pub fn depth_stencil_write() -> vk::PipelineDepthStencilStateCreateInfo<'static>
 
 /// A color blend state that writes no color at all.
 ///
-/// What a mask wants. The quad exists to put a number in the stencil buffer, and a mask that wrote
-/// color would paint a tile-sized rectangle over the frame -- once per tile, under every layer. An
-/// empty write mask is how a draw says it is only here for its side effects.
+/// What a mask wants, and mbgl's `disabled()`: a `Replace` function with every channel masked off.
+/// The quad exists to put a number in the stencil buffer, and a mask that wrote color would paint a
+/// tile-sized rectangle over the frame -- once per tile, under every layer. An empty write mask is
+/// how a draw says it is only here for its side effects.
 pub fn no_color() -> vk::PipelineColorBlendAttachmentState {
     vk::PipelineColorBlendAttachmentState::default()
         .blend_enable(false)

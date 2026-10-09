@@ -376,13 +376,23 @@ pub struct Targets {
     pub attachment: Attachment,
 }
 
-/// The viewport and scissor are set per draw, not baked.
+/// What a content pipeline sets per draw rather than baking.
 ///
-/// One pipeline then serves a ring of images of any size, which is the other half of what dynamic
-/// rendering buys: baking the viewport would need a pipeline per target size, and #60's host may
-/// resize its ring. The cost is two `vkCmdSet` calls per pass, which is not a measurement anyone
-/// needs to take.
-const DYNAMIC: [vk::DynamicState; 2] = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+/// The viewport and scissor, so one pipeline serves a ring of images of any size -- baking them
+/// would need a pipeline per target size, and #60's host may resize its ring.
+///
+/// And the **stencil compare mask**, which is per tile. `stencil::partition` gives each tile an
+/// `Assignment` whose `read_mask` is its own zoom's field of the stencil byte, so a content draw
+/// comparing all eight bits would test bits belonging to another zoom -- and be clipped by a tile
+/// that is not its own. Baking it would mean a pipeline per tile.
+///
+/// The *write* mask is not here. A content draw never writes the stencil, so zero is baked and
+/// cannot be set wrong at a call site.
+pub const CONTENT_DYNAMIC: [vk::DynamicState; 3] = [
+    vk::DynamicState::VIEWPORT,
+    vk::DynamicState::SCISSOR,
+    vk::DynamicState::STENCIL_COMPARE_MASK,
+];
 
 /// The depth and stencil state for a view.
 ///
@@ -400,7 +410,9 @@ pub fn depth_stencil(attachment: Attachment) -> vk::PipelineDepthStencilStateCre
         pass_op: vk::StencilOp::KEEP,
         depth_fail_op: vk::StencilOp::KEEP,
         compare_op: vk::CompareOp::EQUAL,
-        compare_mask: 0xFF,
+        compare_mask: CONTENT_COMPARE_MASK,
+        // A content draw never writes, so this is baked rather than dynamic: zero at a call site
+        // that cannot set it is one fewer thing to get wrong.
         write_mask: 0,
         reference: 0,
     };
@@ -415,6 +427,15 @@ pub fn depth_stencil(attachment: Attachment) -> vk::PipelineDepthStencilStateCre
         .front(keep)
         .back(keep)
 }
+
+/// The stencil state a content draw compares with, before the per-tile masks are set.
+///
+/// `compare_mask` is zero here and set per draw from the tile's `read_mask` -- zero rather than
+/// `0xFF` deliberately: a pipeline whose dynamic compare mask was never set then compares no bits
+/// and the draw is clipped away entirely, which is a blank layer. `0xFF` baked would compare every
+/// bit and draw everywhere, which is a layer with no clipping -- the failure that looks like
+/// working.
+const CONTENT_COMPARE_MASK: u32 = 0;
 
 /// Straight alpha blending over the target.
 ///
@@ -497,7 +518,7 @@ pub fn build<'d>(
     let viewport = vk::PipelineViewportStateCreateInfo::default()
         .viewport_count(1)
         .scissor_count(1);
-    let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&DYNAMIC);
+    let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&CONTENT_DYNAMIC);
     let raster = rasterization();
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
@@ -577,9 +598,14 @@ pub fn depth_stencil_write() -> vk::PipelineDepthStencilStateCreateInfo<'static>
         fail_op: vk::StencilOp::REPLACE,
         pass_op: vk::StencilOp::REPLACE,
         depth_fail_op: vk::StencilOp::REPLACE,
+        // Always, so the compare mask is never read and is left at zero.
         compare_op: vk::CompareOp::ALWAYS,
-        compare_mask: 0xFF,
-        write_mask: 0xFF,
+        compare_mask: 0,
+        // Set per tile from the `Assignment`'s `write_mask`: its own zoom's field, plus any
+        // ancestor field it replaces. Zero baked for the same reason the compare mask is -- a mask
+        // that never set it writes nothing, which is a missing mask rather than a mask over every
+        // other zoom's bits.
+        write_mask: 0,
         reference: 0,
     };
     vk::PipelineDepthStencilStateCreateInfo::default()
@@ -601,15 +627,16 @@ pub fn no_color() -> vk::PipelineColorBlendAttachmentState {
         .color_write_mask(vk::ColorComponentFlags::empty())
 }
 
-/// The reference is set per draw, not baked.
+/// What a mask pipeline sets per draw rather than baking.
 ///
-/// Appended to [`DYNAMIC`] for a mask pipeline: one pipeline draws every tile's mask and the
-/// reference is the only thing that differs between them, so baking it would mean a pipeline per
-/// tile -- 255 of them, remade whenever the counter resets.
-const DYNAMIC_WITH_STENCIL: [vk::DynamicState; 3] = [
+/// The viewport and scissor, as for content, plus the **reference and the write mask** -- which are
+/// the two halves of a tile's `Assignment` that a mask uses. One pipeline draws every tile's mask
+/// and both differ per tile, so baking either means a pipeline per tile.
+pub const MASK_DYNAMIC: [vk::DynamicState; 4] = [
     vk::DynamicState::VIEWPORT,
     vk::DynamicState::SCISSOR,
     vk::DynamicState::STENCIL_REFERENCE,
+    vk::DynamicState::STENCIL_WRITE_MASK,
 ];
 
 /// Builds the pipeline that draws clip masks.
@@ -643,8 +670,7 @@ pub fn build_mask<'d>(
     let viewport = vk::PipelineViewportStateCreateInfo::default()
         .viewport_count(1)
         .scissor_count(1);
-    let dynamic =
-        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&DYNAMIC_WITH_STENCIL);
+    let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&MASK_DYNAMIC);
     let raster = rasterization();
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);

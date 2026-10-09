@@ -23,6 +23,10 @@
 mod common;
 
 use ash::vk;
+use std::collections::{BTreeMap, BTreeSet};
+
+use tessella_capture_abi::envelope::TileId;
+use tessella_consume::stencil;
 use tessella_emblema::device::{self, Attachment};
 use tessella_emblema::pipelines::{self, Targets};
 use tessella_emblema::target::{self, Depth, Host};
@@ -35,8 +39,69 @@ type Case = fn(&Open) -> Result<(), String>;
 
 const SIDE: u32 = 64;
 const COLOR: vk::Format = vk::Format::B8G8R8A8_UNORM;
-/// The reference the mask is drawn under, standing in for one `masks::References` assignment.
-const REFERENCE: u32 = 7;
+/// The tile whose mask is drawn, and the one the partition is asked about.
+fn tile() -> TileId {
+    TileId {
+        z: 14,
+        x: 5,
+        y: 5,
+        overscaled_z: 14,
+        wrap: 0,
+    }
+}
+
+/// The partition over a cover of four tiles at one zoom.
+///
+/// Four rather than one, and that matters. A single tile gets a **one-bit** field, where there are
+/// only two values and no reference can fail to match one of them -- so the control below would be
+/// testing the complement rather than a mismatch. Four tiles need three bits, which leaves values
+/// the partition did not assign.
+///
+/// A cover of four tiles is also what a view actually has, where one is what no view has.
+fn cover() -> stencil::Partition {
+    let mut tiles = BTreeSet::new();
+    for x in 5..9u32 {
+        tiles.insert(TileId {
+            z: 14,
+            x,
+            y: 5,
+            overscaled_z: 14,
+            wrap: 0,
+        });
+    }
+    let mut groups = BTreeMap::new();
+    groups.insert(0i32, tiles.clone());
+    stencil::partition(&tiles, &groups, stencil::ALL_BITS)
+}
+
+/// The assignment `tessella_consume::stencil` gives the tile this bench draws.
+///
+/// Taken from the partition rather than invented, which is the point: an earlier version of this
+/// bench used a hardcoded reference and a full mask, and both are correct only in the fallback the
+/// partition falls back *to*.
+fn assignment() -> stencil::Assignment {
+    cover().tiles.get(&tile()).copied().unwrap_or_default()
+}
+
+/// A reference no tile in the cover was given.
+///
+/// What the control needs: a value that cannot match any mask under this field's read mask. Found
+/// by asking rather than assumed, because the field's width depends on the cover's size.
+fn unassigned() -> u32 {
+    let partition = cover();
+    let given: BTreeSet<u8> = partition.tiles.values().map(|a| a.value).collect();
+    let mask = assignment().read_mask;
+    (0..=u32::from(mask))
+        .find(|candidate| {
+            // Nothing in the cover compares equal to it under the read mask, and it is not the
+            // cleared zero either -- which every unmasked texel holds.
+            *candidate != 0
+                && given.iter().all(|value| {
+                    u32::from(*value) & u32::from(mask) != *candidate & u32::from(mask)
+                })
+        })
+        .unwrap_or(u32::from(mask) + 1)
+}
 
 /// A content shader that fills the target and is clipped only by the stencil.
 ///
@@ -285,6 +350,7 @@ fn mask_then_fill(
     scene: &Scene<'_>,
     reference: u32,
 ) -> Result<Vec<u8>, String> {
+    let given = assignment();
     let set = scene
         .sets
         .get(scene.which)
@@ -303,14 +369,18 @@ fn mask_then_fill(
             // Cleared to transparent, so any color in the result came from the fill.
             Some([0.0, 0.0, 0.0, 0.0]),
             |record| {
+                // The mask writes its own field: the assignment's value, through its write mask.
                 record.bind_pipeline(scene.mask_pipeline.raw());
                 record.bind_descriptor_set(scene.mask_layout.pipeline(), set);
-                record.stencil_reference(REFERENCE);
+                record.stencil_reference(u32::from(given.value));
+                record.stencil_write_mask(u32::from(given.write_mask));
                 record.draw(tessella_emblema::masks::VERTICES, 1, 0);
 
+                // And the content compares its own zoom's field, which is the read mask.
                 record.bind_pipeline(scene.fill_pipeline.raw());
                 record.bind_descriptor_set(scene.mask_layout.pipeline(), set);
                 record.stencil_reference(reference);
+                record.stencil_compare_mask(u32::from(given.read_mask));
                 record.draw(6, 1, 0);
             },
         );
@@ -337,7 +407,7 @@ fn white(found: &[u8]) -> (usize, usize) {
 fn a_mask_clips_the_fill(device: &Open) -> Result<(), String> {
     let owned = Owned::new(device.gpu())?;
     let scene = scene(device, placed(left_half(), -1.0, -1.0))?;
-    let found = mask_then_fill(device, &owned, &scene, REFERENCE)?;
+    let found = mask_then_fill(device, &owned, &scene, u32::from(assignment().value))?;
     let (total, left) = white(&found);
 
     let half = (SIDE * SIDE / 2) as usize;
@@ -372,7 +442,7 @@ fn a_mask_clips_the_fill(device: &Open) -> Result<(), String> {
 fn the_wrong_reference_draws_nothing(device: &Open) -> Result<(), String> {
     let owned = Owned::new(device.gpu())?;
     let scene = scene(device, placed(left_half(), -1.0, -1.0))?;
-    let found = mask_then_fill(device, &owned, &scene, REFERENCE + 1)?;
+    let found = mask_then_fill(device, &owned, &scene, unassigned())?;
     let (total, _) = white(&found);
     if total != 0 {
         return Err(format!(
@@ -390,7 +460,7 @@ fn the_wrong_reference_draws_nothing(device: &Open) -> Result<(), String> {
 fn a_whole_tile_mask_clips_nothing(device: &Open) -> Result<(), String> {
     let owned = Owned::new(device.gpu())?;
     let scene = scene(device, whole())?;
-    let found = mask_then_fill(device, &owned, &scene, REFERENCE)?;
+    let found = mask_then_fill(device, &owned, &scene, u32::from(assignment().value))?;
     let (total, _) = white(&found);
     let all = (SIDE * SIDE) as usize;
     if total != all {
@@ -408,6 +478,7 @@ fn a_whole_tile_mask_clips_nothing(device: &Open) -> Result<(), String> {
 /// stage returns transparent black and the clear is transparent black too -- which is why this
 /// checks the *alpha* of a texel the mask covers is still zero rather than comparing to the clear.
 fn the_mask_writes_no_color(device: &Open) -> Result<(), String> {
+    let given = assignment();
     let owned = Owned::new(device.gpu())?;
     let scene = scene(device, whole())?;
     let set = scene
@@ -430,7 +501,8 @@ fn the_mask_writes_no_color(device: &Open) -> Result<(), String> {
             |record| {
                 record.bind_pipeline(scene.mask_pipeline.raw());
                 record.bind_descriptor_set(scene.mask_layout.pipeline(), set);
-                record.stencil_reference(REFERENCE);
+                record.stencil_reference(u32::from(given.value));
+                record.stencil_write_mask(u32::from(given.write_mask));
                 record.draw(tessella_emblema::masks::VERTICES, 1, 0);
             },
         );

@@ -70,7 +70,7 @@ struct Target<'d> {
 }
 
 impl<'d> Target<'d> {
-    fn new(open: &'d Open) -> Result<Self, String> {
+    fn new(open: &'d Open, attachment: Attachment) -> Result<Self, String> {
         let gpu = open.gpu();
         let color = vk::Format::R8G8B8A8_UNORM;
         let image = gpu
@@ -112,13 +112,7 @@ impl<'d> Target<'d> {
             .bind(&readback, 0)
             .map_err(|why| format!("binding the readback: {why}"))?;
 
-        // Depth *and* stencil, though these layers are flat and `pipelines::depth_stencil`'s own
-        // note says a flat view should take a stencil-only format. It cannot: asked for
-        // `Attachment::StencilOnly` the device gives `S8_UINT`, whose view `Depth::new` builds with
-        // a depth aspect the image does not have -- and the stencil test then silently does
-        // nothing, so both drawables draw over the whole target and the last one wins. Measured
-        // here, by changing nothing else, and filed as #90.
-        let depth_stencil = device::depth_stencil_format(Attachment::DepthStencil, |format| {
+        let depth_stencil = device::depth_stencil_format(attachment, |format| {
             open.format_properties(format).optimal_tiling_features
         })
         .map_err(|why| format!("no depth-stencil format: {why:?}"))?;
@@ -135,7 +129,7 @@ impl<'d> Target<'d> {
             targets: Targets {
                 color,
                 depth_stencil,
-                attachment: Attachment::DepthStencil,
+                attachment,
             },
         })
     }
@@ -257,14 +251,34 @@ fn run() -> Result<(), String> {
         }
     };
     println!("  device: {} ({})", device.name, device.class);
-    draw(&device, &mut host, &geometry)
+
+    // Both attachments, because the stencil-only one was broken and nothing could see it: its view
+    // carried a depth aspect `S8_UINT` does not have, the stencil test then passed everywhere, and
+    // both drawables drew over the whole target. Tile one's color in both halves, measured. #90.
+    //
+    // Run as a pair rather than as one, so the two cannot drift: a fix to the aspects that worked
+    // only for the packed format would pass the first and fail the second.
+    //
+    // The pair is only two different things on a device that offers `S8_UINT` as a depth-stencil
+    // attachment, which is what `depth_stencil_format` asks. RADV does; V3D 7.1.7.0 does not, and
+    // falls back to `D24_UNORM_S8_UINT` for both -- so on the Pi this runs the same format twice
+    // and the stencil-only path is covered on RADV alone.
+    for attachment in [Attachment::DepthStencil, Attachment::StencilOnly] {
+        draw(&device, &mut host, &geometry, attachment)?;
+    }
+    Ok(())
 }
 
 /// Puts the frame on the device, records it, and reads the halves back.
 #[allow(clippy::too_many_lines)]
-fn draw(device: &Open, host: &mut Host, geometry: &frame::Geometry) -> Result<(), String> {
+fn draw(
+    device: &Open,
+    host: &mut Host,
+    geometry: &frame::Geometry,
+    attachment: Attachment,
+) -> Result<(), String> {
     let gpu = device.gpu();
-    let target = Target::new(device)?;
+    let target = Target::new(device, attachment)?;
 
     // The uniforms the stream carried, each at the slot it named. The entry count comes from the
     // bytes, which is the only place it is: nothing on the wire says it.
@@ -484,11 +498,11 @@ fn draw(device: &Open, host: &mut Host, geometry: &frame::Geometry) -> Result<()
         counts.batches, counts.drawables, counts.draws
     );
 
-    halves(&target)
+    halves(&target, target.targets.depth_stencil)
 }
 
 /// Each half of the target holds its own tile's color, and neither holds the other's.
-fn halves(target: &Target<'_>) -> Result<(), String> {
+fn halves(target: &Target<'_>, format: vk::Format) -> Result<(), String> {
     let pixels = target.read()?;
     let mut seen = [0usize; 2];
     for y in 0..frame::SIDE {
@@ -523,7 +537,8 @@ fn halves(target: &Target<'_>) -> Result<(), String> {
         return Err(format!("{seen:?} texels of {each} in each half"));
     }
     println!(
-        "  the halves            ok   {each} texels of each tile's color, each in its own half"
+        "  the halves            ok   {each} texels of each tile's color in its own half, on \
+         {format:?}"
     );
     Ok(())
 }

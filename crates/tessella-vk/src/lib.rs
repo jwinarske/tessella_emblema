@@ -217,6 +217,7 @@ impl<'d> Gpu<'d> {
         Ok(Image {
             device: self.device,
             raw,
+            aspects: aspects(format),
         })
     }
 
@@ -238,7 +239,7 @@ impl<'d> Gpu<'d> {
                     .image(image.raw)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
-                    .subresource_range(WHOLE_COLOR),
+                    .subresource_range(whole(format)),
                 None,
             )
         }
@@ -249,6 +250,7 @@ impl<'d> Gpu<'d> {
         Ok(ImageView {
             device: self.device,
             raw,
+            aspects: aspects(format),
         })
     }
 
@@ -375,7 +377,8 @@ impl<'d> Gpu<'d> {
 
     /// Creates a depth-stencil view of a whole image, destroyed when dropped.
     ///
-    /// Both aspects, for the reason [`WHOLE_DEPTH_STENCIL`] gives. As [`Self::view`], the image must
+    /// Over whichever aspects the format has, which [`aspects`] decides -- both for a packed
+    /// depth-stencil format, and the stencil alone for `S8_UINT`. As [`Self::view`], the image must
     /// already be bound to memory.
     ///
     /// # Errors
@@ -389,7 +392,7 @@ impl<'d> Gpu<'d> {
                     .image(image.raw)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
-                    .subresource_range(WHOLE_DEPTH_STENCIL),
+                    .subresource_range(whole(format)),
                 None,
             )
         }
@@ -400,6 +403,7 @@ impl<'d> Gpu<'d> {
         Ok(ImageView {
             device: self.device,
             raw,
+            aspects: aspects(format),
         })
     }
 
@@ -520,20 +524,46 @@ impl<'d> Gpu<'d> {
     }
 }
 
-/// Every depth and stencil level of an image.
+/// Which aspects a format has.
 ///
-/// Both aspects in one view, which is what a packed depth-stencil format wants: the rendering scope
-/// names the same view as its depth attachment and as its stencil attachment, because they are one
-/// image. A view of a single aspect could be one or the other and not both.
-const WHOLE_DEPTH_STENCIL: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
-    aspect_mask: vk::ImageAspectFlags::from_raw(
-        vk::ImageAspectFlags::DEPTH.as_raw() | vk::ImageAspectFlags::STENCIL.as_raw(),
-    ),
-    base_mip_level: 0,
-    level_count: 1,
-    base_array_layer: 0,
-    layer_count: 1,
-};
+/// Every view, every barrier and every attachment has to name the aspects of the image it is about,
+/// and naming one the format does not have is invalid usage that no driver has to report. This was
+/// a pair of constants -- `COLOR` for anything a texture does and `DEPTH | STENCIL` for an
+/// attachment -- and the second is wrong for a format with only one of them:
+///
+/// > asked for `Attachment::StencilOnly` the device gives `S8_UINT`, and `Depth::new` builds its
+/// > view with a depth aspect that format does not have -- so the stencil test silently passes
+/// > everywhere and both drawables draw over the whole target
+///
+/// Measured on RADV: `benches/a_frame.rs` put one tile's color in both halves. So the aspects are
+/// asked of the format rather than assumed from what the image is for.
+#[must_use]
+pub const fn aspects(format: vk::Format) -> vk::ImageAspectFlags {
+    match format {
+        vk::Format::S8_UINT => vk::ImageAspectFlags::STENCIL,
+        vk::Format::D16_UNORM_S8_UINT
+        | vk::Format::D24_UNORM_S8_UINT
+        | vk::Format::D32_SFLOAT_S8_UINT => vk::ImageAspectFlags::from_raw(
+            vk::ImageAspectFlags::DEPTH.as_raw() | vk::ImageAspectFlags::STENCIL.as_raw(),
+        ),
+        vk::Format::D16_UNORM | vk::Format::X8_D24_UNORM_PACK32 | vk::Format::D32_SFLOAT => {
+            vk::ImageAspectFlags::DEPTH
+        }
+        // Everything else is color, which is every format a texture on this wire arrives in.
+        _ => vk::ImageAspectFlags::COLOR,
+    }
+}
+
+/// Every level of an image, for whichever aspects it has.
+const fn whole(format: vk::Format) -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange {
+        aspect_mask: aspects(format),
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    }
+}
 
 /// Every color level and layer of an image, which is all any texture here has.
 ///
@@ -552,6 +582,8 @@ const WHOLE_COLOR: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
 pub struct Image<'d> {
     device: &'d ash::Device,
     raw: vk::Image,
+    /// The aspects its format has, so a barrier does not have to be told.
+    aspects: vk::ImageAspectFlags,
 }
 
 impl core::fmt::Debug for Image<'_> {
@@ -597,6 +629,8 @@ impl Drop for Image<'_> {
 pub struct ImageView<'d> {
     device: &'d ash::Device,
     raw: vk::ImageView,
+    /// The aspects it was made over, so a rendering scope does not have to be told.
+    aspects: vk::ImageAspectFlags,
 }
 
 impl core::fmt::Debug for ImageView<'_> {
@@ -943,7 +977,13 @@ impl<'c> Recorder<'c> {
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(image.raw)
-            .subresource_range(WHOLE_COLOR);
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: image.aspects,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
         // SAFETY: the command buffer is in the recording state -- `Recorder::new` says the caller has
         // begun it -- and the barrier is fully initialized and names an image of this device.
         unsafe {
@@ -1010,15 +1050,27 @@ impl<'c> Recorder<'c> {
             .store_op(vk::AttachmentStoreOp::DONT_CARE)
             .clear_value(cleared);
 
-        let info = vk::RenderingInfo::default()
+        // Each attachment only where the format has that aspect. A stencil-only view is not a legal
+        // depth attachment, and naming it as one was the other half of the defect `aspects` was
+        // added for: `S8_UINT` has no depth, and the scope that claimed it had the stencil test pass
+        // everywhere. A packed format names the same view twice, which is correct -- they are one
+        // image.
+        let mut info = vk::RenderingInfo::default()
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent: vk::Extent2D { width, height },
             })
             .layer_count(1)
-            .color_attachments(&colors)
-            .depth_attachment(&depth)
-            .stencil_attachment(&depth);
+            .color_attachments(&colors);
+        if depth_stencil.aspects.contains(vk::ImageAspectFlags::DEPTH) {
+            info = info.depth_attachment(&depth);
+        }
+        if depth_stencil
+            .aspects
+            .contains(vk::ImageAspectFlags::STENCIL)
+        {
+            info = info.stencil_attachment(&depth);
+        }
 
         // SAFETY: the command buffer is recording, the views belong to this device, and the info is
         // fully initialized and borrowed only for the call.

@@ -18,13 +18,15 @@
 use tessella_capture_abi::envelope::{
     AttributeDesc, CameraUpdate, DrawFlags, Extent, GeometryAdd, GeometryId, OrderEntry,
     OrderEpoch, OrderUpdate, Rect16, Segment, SlabRef, Span, StencilTile, StencilTiles, TextureId,
-    TextureRef, TextureUpdate, TileId, ViewId, ViewUse, WireRecord,
+    TextureRef, TextureUpdate, TileId, ViewDeclare, ViewId, ViewUse, WireRecord,
 };
 use tessella_capture_abi::generated::mbgl_enums::{AttributeDataType, BuiltIn};
 use tessella_capture_abi::generated::ubo_layouts::{FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO};
 use tessella_capture_abi::generated::{ubo_layouts, ubo_slots};
 use tessella_capture_abi::ring::{Producer, Ring};
-use tessella_capture_abi::{EnvelopeKind, RenderPass, TextureChannelDataType, TexturePixelType};
+use tessella_capture_abi::{
+    CameraMode, EnvelopeKind, RenderPass, TextureChannelDataType, TexturePixelType,
+};
 use tessella_consume::slab::Slab;
 
 /// The view the frame draws.
@@ -281,6 +283,22 @@ pub fn write(capacity: usize) -> (Ring, Geometry) {
     let geometry = Geometry::new();
     let mut ring = Ring::new(capacity);
     let producer = ring.producer();
+
+    // The view first, and that is a rule rather than a tidiness: DR-18 puts the per-view state on
+    // `ViewDeclare`, "ordered ahead of any `ViewUse` naming the view", and a use that arrives first
+    // is dropped and counted in `Progress::undeclared`. This fixture had no declaration at all
+    // until `host` started reading the record -- every drawable in the frame was dropped.
+    //
+    // `Producer` mode, because every placement here is a matrix the fixture sends: in consumer mode
+    // those are advisory and a tile's position comes from its own id instead.
+    let declare = ViewDeclare {
+        view: VIEW,
+        camera_mode: CameraMode::Producer as u8,
+        _reserved: [0; 3],
+    };
+    producer
+        .write(EnvelopeKind::ViewDeclare, declare.as_bytes(), &[])
+        .expect("room");
     let fill = [
         AttributeDataType::Short2,
         AttributeDataType::Float4,

@@ -188,11 +188,14 @@ fn run() -> Result<(), String> {
     let (mut ring, geometry) = frame::write(1 << 16);
     let mut host = Host::new();
     let progress = host.read(ring.consumer());
-    if progress.unknown != 0 || progress.malformed != 0 {
+    if progress.unknown != 0 || progress.malformed != 0 || progress.undeclared != 0 {
         return Err(format!(
-            "{} unknown and {} malformed of {} records",
-            progress.unknown, progress.malformed, progress.records
+            "{} unknown, {} malformed and {} naming an undeclared view, of {} records",
+            progress.unknown, progress.malformed, progress.undeclared, progress.records
         ));
+    }
+    if !host.declared(frame::VIEW) {
+        return Err("the view was not declared".into());
     }
     if !host.ready(frame::VIEW) {
         return Err("the camera and the order do not agree".into());

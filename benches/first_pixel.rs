@@ -93,7 +93,8 @@
 
 use ash::vk;
 use tessella_capture_abi::envelope::{
-    AttributeDesc, Extent, GeometryId, Rect16, SlabRef, TextureFilter, TextureId, ViewId,
+    AttributeDesc, Extent, GeometryId, Rect16, SlabRef, TextureFilter, TextureId, TextureRef,
+    ViewId,
 };
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_capture_abi::generated::shader_attributes::ShaderAttribute;
@@ -2786,15 +2787,26 @@ fn draw_case<'d>(
     // The filter is per binding on the wire -- `TextureRef::filter`, because one atlas is sampled
     // both ways in one frame -- so a case that wanted to check the filter itself would carry its
     // own, and none does yet.
-    let refs: Vec<(TextureId, TextureFilter)> = (0..case.images.len())
-        .map(|at| (TextureId(at as u64 + 1), TextureFilter::Nearest))
+    //
+    // The slot comes from the set's own bindings, in binding order, which is where #95 put the
+    // authority: a run built with ids counting from one and no slots would be placed by arrival
+    // again, which is the thing that stopped deciding anything.
+    let refs: Vec<TextureRef> = bindings
+        .iter()
+        .filter(|b| b.kind == pipelines::Kind::SampledImage)
+        .enumerate()
+        .map(|(at, binding)| TextureRef {
+            texture: TextureId(at as u64 + 1),
+            slot: binding.slot.expect("a texture binding carries its slot"),
+            filter: TextureFilter::Nearest as u32,
+        })
         .collect();
     let mut staged: Result<(), String> = Ok(());
     open.submit(|record: Recorder<'_>| {
         staged = stage(&mut images, gpu, record, case, &refs);
     })?;
     staged?;
-    let bound = descriptors::bound_from(&images, &refs)
+    let bound = descriptors::bound_from(&images, &bindings, &refs)
         .map_err(|why| format!("{}: textures: {why}", case.name))?;
 
     let pipeline = cache
@@ -2839,10 +2851,10 @@ fn stage<'d>(
     gpu: tessella_vk::Gpu<'d>,
     record: Recorder<'_>,
     case: &Case,
-    refs: &[(TextureId, TextureFilter)],
+    refs: &[TextureRef],
 ) -> Result<(), String> {
     for (at, image) in case.images.iter().enumerate() {
-        let (texture, _) = refs[at];
+        let texture = refs[at].texture;
         let (pixel, channel) = image.texels.kinds();
         images
             .declare(

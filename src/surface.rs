@@ -167,6 +167,20 @@ static TERRAIN_BLOCKS: [&UboLayout; 1] = [&TERRAIN_DRAWABLE_UBO];
 static NO_TEXTURES: [&str; 0] = [];
 static TERRAIN_TEXTURES: [&str; 1] = ["elevation"];
 
+static NO_TEXTURE_SLOTS: [u32; 0] = [];
+static TERRAIN_TEXTURE_SLOTS: [u32; 1] = [TERRAIN_ELEVATION_SLOT];
+
+/// The wire slot a raised family's elevation texture arrives at.
+///
+/// Hand-agreed, the way [`crate::slots`]'s four unpaired blocks are. A family's textures come from
+/// the generated table, which carries each one's slot -- but a surface's do not: the producer holds
+/// this as a private constant and publishes no table for it, so the number is agreed rather than
+/// derived.
+///
+/// Its own note there is the reason for the value: "past every slot mbgl's own families use, so a
+/// terrain variant's second texture cannot land on one the flat variant already reads."
+pub const TERRAIN_ELEVATION_SLOT: u32 = 8;
+
 /// What a vertex is placed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Surface {
@@ -212,6 +226,20 @@ impl Surface {
         match self {
             Self::Plane | Self::Globe | Self::GlobeAnchored => &NO_TEXTURES,
             Self::Terrain => &TERRAIN_TEXTURES,
+        }
+    }
+
+    /// The wire slot each of [`Self::textures`] arrives at, in the same order.
+    ///
+    /// Parallel to that rather than folded into it, because the two are different kinds of thing:
+    /// the name is this crate's, written into the module text, and the slot is the producer's. The
+    /// lengths are checked to agree in `tests/texture_slots.rs`, which is what a parallel array
+    /// needs.
+    #[must_use]
+    pub const fn texture_slots(self) -> &'static [u32] {
+        match self {
+            Self::Plane | Self::Globe | Self::GlobeAnchored => &NO_TEXTURE_SLOTS,
+            Self::Terrain => &TERRAIN_TEXTURE_SLOTS,
         }
     }
 

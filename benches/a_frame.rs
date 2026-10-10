@@ -22,12 +22,12 @@
 //! the references swaps the picture, and a stencil that did nothing would leave the second
 //! drawable over the whole target.
 //!
-//! # What it does not catch
+//! # The slots
 //!
-//! A `TextureRef`'s `slot`. `descriptors::bound_from` places the views in the order the refs
-//! arrive and never reads the field, so making the two refs claim each other's slots changes
-//! nothing in the frame -- measured. That is #95 and a defect rather than a gap here: the bench
-//! cannot see it until the consumer places by slot.
+//! The two refs' slots decide which atlas each sampler reads, and `descriptors::bound_from` places
+//! them by it. This did not hold once: the views went in the order the refs arrived, so making the
+//! two refs claim each other's slots changed nothing in the frame -- measured, and #95. Swapping
+//! them now moves the pixels, which is the check the frame could not make before.
 //!
 //! Run with `cargo bench --bench a_frame`.
 
@@ -39,7 +39,7 @@ mod frame;
 use std::collections::BTreeMap;
 
 use ash::vk;
-use tessella_capture_abi::envelope::{GeometryId, Rect16, TextureFilter, TextureId, TileId};
+use tessella_capture_abi::envelope::{GeometryId, Rect16, TileId};
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_consume::host::Host;
 use tessella_consume::upload::Upload;
@@ -511,22 +511,17 @@ fn draw(
             .layout(gpu, BuiltIn::RasterShader, Surface::Plane, &raster_bindings)
             .map_err(|why| format!("the raster layout: {why}"))?;
 
-        // The textures it binds, as the stream named them: ids and filters off the `TextureRef`
-        // run, resolved to views by the store. A drawable naming a texture nobody uploaded is
-        // `Error::NoTexture` rather than a blank sampler.
-        let mut refs: Vec<(TextureId, TextureFilter)> = Vec::new();
-        for bound in &host
+        // The textures it binds, as the stream named them: the `TextureRef` run straight through,
+        // placed by slot and resolved to views by the store. A drawable naming a texture nobody
+        // uploaded is `Error::NoTexture` rather than a blank sampler, and a filter this build does
+        // not know is `Error::BadFilter` rather than a guess.
+        let refs = &host
             .joiner()
             .drawable(frame::SAMPLER, frame::VIEW)
             .ok_or("the sampling geometry is not used by the view")?
             .geometry
-            .texture_refs
-        {
-            let filter = filter_of(bound.filter)
-                .ok_or_else(|| format!("{} is not a filter this build knows", bound.filter))?;
-            refs.push((bound.texture, filter));
-        }
-        let bound = descriptors::bound_from(&images, &refs)
+            .texture_refs;
+        let bound = descriptors::bound_from(&images, &raster_bindings, refs)
             .map_err(|why| format!("the sampling layer's textures: {why}"))?;
         let at = blocks::Which {
             view: frame::VIEW,
@@ -648,14 +643,6 @@ fn draw(
 /// Zero is `Linear`, which the ABI states: "this was padding through R0, and zero is
 /// `TextureFilter::Linear`". Anything other than the two it names is `None` rather than defaulted,
 /// because defaulting is how a producer sending a third filter is read as sending the first.
-fn filter_of(raw: u32) -> Option<TextureFilter> {
-    match raw {
-        0 => Some(TextureFilter::Linear),
-        1 => Some(TextureFilter::Nearest),
-        _ => None,
-    }
-}
-
 /// Declares and fills every texture the stream sent, and leaves them readable by a shader.
 ///
 /// `Images::upload` asks for a region's rows one at a time -- "given the region's index and row, it

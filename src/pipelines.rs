@@ -135,11 +135,19 @@ pub struct Binding {
     pub binding: u32,
     /// What is bound there.
     pub kind: Kind,
-    /// For a block, the slot its buffer arrives at; `None` for a texture or a sampler.
+    /// The wire slot whose resource belongs here, or `None` where it could not be resolved.
     ///
-    /// A family's blocks are in different buffers -- `UboUpdate::slot` is which buffer, not which
-    /// entry -- so a binding that did not carry this could only be pointed at a layer's first one.
-    /// [`crate::slots`] is what resolves it, and `None` on a block means it could not.
+    /// For a block, which buffer: a family's blocks are in different buffers -- `UboUpdate::slot`
+    /// is which buffer, not which entry -- so a binding that did not carry this could only be
+    /// pointed at a layer's first one. [`crate::slots`] is what resolves it.
+    ///
+    /// For a texture or its sampler, the `TextureRef::slot` the producer names it by. Both of a
+    /// texture's two bindings carry the same one, because one `TextureRef` fills both.
+    ///
+    /// Not [`Self::binding`], which is the `@binding(n)` of the module and counts from zero
+    /// through the whole set. A slot is the producer's number for the resource and nothing orders
+    /// the two together: a family's second texture is binding 2 or 4 and slot 1, and terrain's
+    /// elevation is the last binding of its set and slot 8.
     pub slot: Option<u32>,
 }
 
@@ -172,14 +180,20 @@ pub fn bindings(family: &Family, surface: Surface) -> Vec<Binding> {
     }
     // Then two bindings for every texture, the family's own first and the surface's after -- a
     // family's samplers are a property of the shader rather than of what it is drawn on.
-    // The two counts rather than the two iterators, which have different item types. The binding
-    // number is still `out.len()`, which is the part that must not become a formula.
-    for _ in 0..family.textures.len() + surface.textures().len() {
+    // The slots rather than the two counts: they are the one thing both halves have, a family's
+    // from its generated table and a surface's hand-agreed beside its names. The binding number is
+    // still `out.len()`, which is the part that must not become a formula.
+    let slots = family
+        .textures
+        .iter()
+        .map(|texture| texture.binding)
+        .chain(surface.texture_slots().iter().copied());
+    for slot in slots {
         for kind in [Kind::SampledImage, Kind::Sampler] {
             out.push(Binding {
                 binding: out.len() as u32,
                 kind,
-                slot: None,
+                slot: Some(slot),
             });
         }
     }

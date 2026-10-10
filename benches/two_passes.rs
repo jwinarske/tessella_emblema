@@ -26,9 +26,6 @@
 //! to report, the same position as the stencil reference in #83 and the pipeline's declared depth
 //! format in #90: the transition is required and no bench can be what requires it.
 //!
-//! And a `TextureRef`'s slot, for #95's reason -- `bound_from` places by array order. So the parent
-//! asserts that its first image *is* the target rather than reading it off the picture.
-//!
 //! Run with `cargo bench --bench two_passes`.
 
 mod common;
@@ -40,7 +37,7 @@ mod frame;
 mod passes;
 
 use ash::vk;
-use tessella_capture_abi::envelope::{Rect16, TextureFilter, TextureId, ViewId};
+use tessella_capture_abi::envelope::{Rect16, ViewId};
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_consume::host::Host;
 use tessella_consume::upload::Upload;
@@ -282,20 +279,29 @@ fn draw(
             .layout(gpu, BuiltIn::RasterShader, Surface::Plane, &raster_bindings)
             .map_err(|why| format!("the parent's layout: {why}"))?;
 
-        let mut refs: Vec<(TextureId, TextureFilter)> = Vec::new();
-        for bound in &host
+        let refs = &host
             .joiner()
             .drawable(passes::SAMPLES, passes::PARENT)
             .ok_or("the parent's geometry is not used")?
             .geometry
-            .texture_refs
-        {
-            refs.push((bound.texture, filter_of(bound.filter)?));
+            .texture_refs;
+        // The target has to be the image the raster's *first* sampler reads, because that is the
+        // one the body samples. Asked by slot rather than by position in the run: that is what
+        // `bound_from` places by, so a run in another order is bound the same way and this guard
+        // follows it instead of fixing the order in place.
+        let wants = raster_bindings
+            .iter()
+            .find(|b| b.kind == pipelines::Kind::SampledImage)
+            .and_then(|b| b.slot)
+            .ok_or("the raster set declares no texture")?;
+        let at_first = refs.iter().find(|r| r.slot == wants).map(|r| r.texture);
+        if at_first != Some(passes::TARGET) {
+            return Err(format!(
+                "the raster's first sampler is slot {wants}, which the parent names {at_first:?} \
+                 rather than the target"
+            ));
         }
-        if refs.first().map(|(id, _)| *id) != Some(passes::TARGET) {
-            return Err(format!("the parent's first image is {:?}", refs.first()));
-        }
-        let bound = descriptors::bound_from(&images, &refs)
+        let bound = descriptors::bound_from(&images, &raster_bindings, refs)
             .map_err(|why| format!("the parent's textures: {why}"))?;
         let at = blocks::Which {
             view: passes::PARENT,
@@ -624,13 +630,4 @@ fn compile_family(family: &families::Family) -> Result<Vec<u32>, String> {
     .map_err(|why| format!("validation: {why:?}"))?;
     naga::back::spv::write_vec(&parsed, &info, &naga::back::spv::Options::default(), None)
         .map_err(|why| format!("spirv: {why}"))
-}
-
-/// The filter a `TextureRef` names, which the ABI gives no decoder for -- see #95.
-fn filter_of(raw: u32) -> Result<TextureFilter, String> {
-    match raw {
-        0 => Ok(TextureFilter::Linear),
-        1 => Ok(TextureFilter::Nearest),
-        other => Err(format!("{other} is not a filter this build knows")),
-    }
 }

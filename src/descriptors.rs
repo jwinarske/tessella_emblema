@@ -37,7 +37,7 @@
 use std::collections::BTreeMap;
 
 use ash::vk;
-use tessella_capture_abi::envelope::TextureFilter;
+use tessella_capture_abi::envelope::{TextureFilter, TextureRef};
 use tessella_vk::{DescriptorPool, Gpu, Sampler};
 
 use crate::blocks::{Blocks, Which};
@@ -66,8 +66,47 @@ pub enum Error {
     },
     /// A binding named a texture with no image.
     NoTexture {
-        /// Which slot of the drawable's texture list.
+        /// Which position of the set's texture bindings.
         slot: usize,
+    },
+    /// A texture binding carrying no slot.
+    ///
+    /// Every family's textures come from the generated table and every surface's from
+    /// [`crate::surface::Surface::texture_slots`], so a binding built by
+    /// [`crate::pipelines::bindings`] always has one. This is a caller passing bindings it built
+    /// itself, and the alternative to reporting it is placing an image by its position again.
+    NoTextureSlot {
+        /// Which binding of the set.
+        binding: u32,
+    },
+    /// Two `TextureRef`s claiming one slot.
+    ///
+    /// The second would overwrite the first, and which of the two images the shader then reads
+    /// would be whichever the producer happened to send last.
+    DuplicateTextureSlot {
+        /// The slot named twice.
+        slot: u32,
+    },
+    /// A `TextureRef` naming a slot the set has no binding for.
+    UndeclaredTextureSlot {
+        /// The slot nothing declares.
+        slot: u32,
+    },
+    /// A texture binding no `TextureRef` named.
+    ///
+    /// A descriptor the shader reads and nothing filled -- the same fault
+    /// [`Self::WrongTextureCount`] catches by counting, found instead by the slot that stayed
+    /// empty, which says *which* one.
+    UnfilledTextureSlot {
+        /// The slot nothing claimed.
+        slot: u32,
+    },
+    /// A `TextureRef` whose filter discriminant this build does not know.
+    BadFilter {
+        /// The slot it named.
+        slot: u32,
+        /// The discriminant that did not decode.
+        raw: u32,
     },
     /// The set's bindings and the textures given do not agree about how many there are.
     ///
@@ -101,7 +140,23 @@ impl core::fmt::Display for Error {
             Self::UnknownSlot { binding } => {
                 write!(f, "binding {binding} is a block with no slot agreed")
             }
-            Self::NoTexture { slot } => write!(f, "texture slot {slot} has no image"),
+            Self::NoTexture { slot } => write!(f, "texture binding {slot} has no image"),
+            Self::NoTextureSlot { binding } => {
+                write!(f, "binding {binding} is a texture with no slot agreed")
+            }
+            Self::DuplicateTextureSlot { slot } => {
+                write!(f, "two textures claim slot {slot}")
+            }
+            Self::UndeclaredTextureSlot { slot } => {
+                write!(f, "no binding of this set takes a texture at slot {slot}")
+            }
+            Self::UnfilledTextureSlot { slot } => {
+                write!(f, "nothing named the texture at slot {slot}")
+            }
+            Self::BadFilter { slot, raw } => write!(
+                f,
+                "slot {slot}'s filter is {raw}, which is not one this build knows"
+            ),
             Self::WrongTextureCount { wanted, got } => {
                 write!(f, "the set has {wanted} texture bindings and {got} arrived")
             }
@@ -192,6 +247,10 @@ impl<'d> Sets<'d> {
     /// for each storage binding, then the image and the sampler for each texture. A binding left
     /// unwritten is a descriptor the shader reads and nothing filled, so a missing resource is an
     /// error rather than a skipped write.
+    ///
+    /// `textures` is consumed by position, one entry per `SampledImage` binding in binding order,
+    /// which is what [`bound_from`] returns. The slot is read there rather than here: this walks
+    /// the bindings once and a lookup per binding would ask the same question again.
     ///
     /// # Errors
     ///
@@ -321,29 +380,71 @@ impl<'d> Sets<'d> {
     }
 }
 
-/// The image views a drawable's textures are, from the texture store.
+/// The image views a drawable's textures are, placed where the set's bindings take them.
 ///
 /// Split out because a drawable names textures by [`tessella_capture_abi::envelope::TextureId`] and
 /// a set wants views, and the lookup can fail -- which is a producer naming a texture it never
 /// uploaded, not a device problem.
 ///
+/// # Placed by slot, not by arrival
+///
+/// The returned list is in the order [`Sets::write`] consumes it: one entry per `SampledImage`
+/// binding, in binding order. Which `TextureRef` lands at which is decided by its `slot` against
+/// the binding's, so the order the run arrives in does not matter.
+///
+/// It used to. This built the list in the order the refs arrived, which was right only because
+/// `encode_raster` happens to emit them in slot order -- #95 measured it by negating the slots in
+/// a fixture, so the two refs claimed each other's, and the frame came out unchanged on both
+/// attachment formats. A field on the wire that decides which image a shader samples was being
+/// thrown away.
+///
 /// # Errors
 ///
-/// [`Error::NoTexture`] naming the first slot whose texture the store does not hold.
+/// [`Error::NoTextureSlot`] for a texture binding carrying no slot,
+/// [`Error::DuplicateTextureSlot`] for two refs claiming one, [`Error::UndeclaredTextureSlot`] for
+/// a ref naming a slot the set has no binding for, [`Error::UnfilledTextureSlot`] for a binding no
+/// ref named, [`Error::BadFilter`] for a filter discriminant this build does not know, and
+/// [`Error::NoTexture`] for a texture the store does not hold.
 pub fn bound_from(
     images: &Images<'_>,
-    refs: &[(tessella_capture_abi::envelope::TextureId, TextureFilter)],
+    bindings: &[Binding],
+    refs: &[TextureRef],
 ) -> Result<Vec<Bound>, Error> {
-    refs.iter()
-        .enumerate()
-        .map(|(slot, (texture, filter))| {
-            images
-                .view(*texture)
-                .map(|view| Bound {
-                    view,
-                    filter: *filter,
-                })
-                .ok_or(Error::NoTexture { slot })
+    // The slots this set takes a texture at, in binding order. The sampler bindings carry the same
+    // slots and are left out: one `TextureRef` fills both, and `Sets::write` reads this list once
+    // per kind.
+    let wanted: Vec<(u32, u32)> = bindings
+        .iter()
+        .filter(|b| b.kind == Kind::SampledImage)
+        .map(|b| {
+            b.slot
+                .map(|slot| (b.binding, slot))
+                .ok_or(Error::NoTextureSlot { binding: b.binding })
         })
+        .collect::<Result<_, _>>()?;
+
+    let mut found: Vec<Option<Bound>> = vec![None; wanted.len()];
+    for bound in refs {
+        let filter = bound.filter().ok_or(Error::BadFilter {
+            slot: bound.slot,
+            raw: bound.filter,
+        })?;
+        let at = wanted
+            .iter()
+            .position(|(_, slot)| *slot == bound.slot)
+            .ok_or(Error::UndeclaredTextureSlot { slot: bound.slot })?;
+        if found[at].is_some() {
+            return Err(Error::DuplicateTextureSlot { slot: bound.slot });
+        }
+        let view = images
+            .view(bound.texture)
+            .ok_or(Error::NoTexture { slot: at })?;
+        found[at] = Some(Bound { view, filter });
+    }
+
+    found
+        .into_iter()
+        .zip(&wanted)
+        .map(|(bound, (_, slot))| bound.ok_or(Error::UnfilledTextureSlot { slot: *slot }))
         .collect()
 }

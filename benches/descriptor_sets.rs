@@ -22,7 +22,7 @@
 mod common;
 
 use ash::vk;
-use tessella_capture_abi::envelope::{Extent, TextureFilter, TextureId, ViewId};
+use tessella_capture_abi::envelope::{Extent, TextureFilter, TextureId, TextureRef, ViewId};
 use tessella_capture_abi::generated::mbgl_enums::{TextureChannelDataType, TexturePixelType};
 use tessella_emblema::blocks::{Blocks, Which};
 use tessella_emblema::descriptors::{self, Sets};
@@ -70,13 +70,22 @@ fn blocks_for<'d>(
 }
 
 /// One image per texture the family declares, each actually created.
-fn images_for(
-    device: &Open,
-    count: usize,
-) -> Result<(Images<'_>, Vec<(TextureId, TextureFilter)>), String> {
+/// The slots a set takes a texture at, in binding order.
+fn texture_slots(bindings: &[pipelines::Binding]) -> Vec<u32> {
+    bindings
+        .iter()
+        .filter(|b| b.kind == pipelines::Kind::SampledImage)
+        .filter_map(|b| b.slot)
+        .collect()
+}
+
+fn images_for<'d>(
+    device: &'d Open,
+    slots: &[u32],
+) -> Result<(Images<'d>, Vec<TextureRef>), String> {
     let mut images = Images::new();
     let mut refs = Vec::new();
-    for at in 0..count {
+    for (at, slot) in slots.iter().enumerate() {
         let texture = TextureId(at as u64 + 1);
         device.submit(|record: Recorder<'_>| {
             let _ = images.declare(
@@ -106,7 +115,11 @@ fn images_for(
         } else {
             TextureFilter::Nearest
         };
-        refs.push((texture, filter));
+        refs.push(TextureRef {
+            texture,
+            slot: *slot,
+            filter: filter as u32,
+        });
     }
     Ok((images, refs))
 }
@@ -149,17 +162,17 @@ fn every_set_is_written(device: &Open) -> Result<(), String> {
             let layout = pipelines::layout(device.gpu(), &bindings)
                 .map_err(|why| format!("{who}: {why}"))?;
 
-            let image_count = bindings
-                .iter()
-                .filter(|b| b.kind == pipelines::Kind::SampledImage)
-                .count();
+            // The slots the set takes a texture at, which is what a run has to name. Taken from
+            // the bindings rather than counted 0..n: a family's come from its generated table and
+            // terrain's elevation is slot 8, so a count would build a run no set declares.
+            let image_slots = texture_slots(&bindings);
 
             let at = which(layer);
             layer += 1;
             let blocks = blocks_for(device, at, &bindings)?;
-            let (images, refs) = images_for(device, image_count)?;
-            let bound =
-                descriptors::bound_from(&images, &refs).map_err(|why| format!("{who}: {why}"))?;
+            let (images, refs) = images_for(device, &image_slots)?;
+            let bound = descriptors::bound_from(&images, &bindings, &refs)
+                .map_err(|why| format!("{who}: {why}"))?;
 
             let set = sets
                 .write(&layout, &bindings, at, &blocks, &bound)
@@ -276,6 +289,50 @@ fn the_filters_are_two_samplers(device: &Open) -> Result<(), String> {
 }
 
 /// The refusals, and that none leaves a half-written set behind.
+/// The same run in another order binds the same images.
+///
+/// This is #95's contract stated positively. The defect it names was that `bound_from` placed by
+/// arrival, which is right only while the producer emits in slot order -- `encode_raster` does, so
+/// no fixture here distinguished the two. Reversing a run with its slots intact is what does: place
+/// by arrival and the two images swap, place by slot and nothing moves.
+///
+/// `raster` because it is the one family here with two textures whose slots differ.
+fn an_out_of_order_run(device: &Open) -> Result<(), String> {
+    let family = families::ALL
+        .iter()
+        .find(|f| f.name == "raster")
+        .ok_or("the raster family")?;
+    let bindings = pipelines::bindings(family, Surface::Plane);
+    let slots = texture_slots(&bindings);
+    if slots.len() != 2 {
+        return Err(format!("raster declares {} textures", slots.len()));
+    }
+    let (images, refs) = images_for(device, &slots)?;
+
+    let forward = descriptors::bound_from(&images, &bindings, &refs)
+        .map_err(|why| format!("in order: {why}"))?;
+    let mut backward_refs = refs.clone();
+    backward_refs.reverse();
+    let backward = descriptors::bound_from(&images, &bindings, &backward_refs)
+        .map_err(|why| format!("reversed: {why}"))?;
+
+    if forward != backward {
+        return Err(format!(
+            "the run reversed bound differently: {forward:?} then {backward:?}"
+        ));
+    }
+    // And the two entries really are distinguishable, or the comparison above proves nothing: the
+    // images are different textures and `images_for` alternates the filters.
+    if forward[0] == forward[1] {
+        return Err("both bindings got the same image and filter".into());
+    }
+    println!(
+        "  out of order          ok   slots {slots:?} reversed, bound the same, {} distinct",
+        forward.len()
+    );
+    Ok(())
+}
+
 fn refusals(device: &Open) -> Result<(), String> {
     let family = families::ALL
         .iter()
@@ -288,8 +345,10 @@ fn refusals(device: &Open) -> Result<(), String> {
 
     let at = which(0);
     let blocks = blocks_for(device, at, &bindings)?;
-    let (images, refs) = images_for(device, 1)?;
-    let bound = descriptors::bound_from(&images, &refs).map_err(|why| why.to_string())?;
+    let slots = texture_slots(&bindings);
+    let (images, refs) = images_for(device, &slots)?;
+    let bound =
+        descriptors::bound_from(&images, &bindings, &refs).map_err(|why| why.to_string())?;
 
     // Too few textures for the set's bindings.
     match sets.write(&layout, &bindings, at, &blocks, &[]) {
@@ -312,16 +371,57 @@ fn refusals(device: &Open) -> Result<(), String> {
         return Err("a refused write left a set allocated".into());
     }
     // A texture the store does not hold.
-    match descriptors::bound_from(&images, &[(TextureId(99), TextureFilter::Linear)]) {
+    let absent = TextureRef {
+        texture: TextureId(99),
+        slot: slots[0],
+        filter: TextureFilter::Linear as u32,
+    };
+    match descriptors::bound_from(&images, &bindings, &[absent]) {
         Err(descriptors::Error::NoTexture { slot: 0 }) => {}
         other => return Err(format!("an absent texture gave {other:?}")),
+    }
+    // A run naming a slot this set has no binding for.
+    match descriptors::bound_from(
+        &images,
+        &bindings,
+        &[TextureRef {
+            slot: 31,
+            ..refs[0]
+        }],
+    ) {
+        Err(descriptors::Error::UndeclaredTextureSlot { slot: 31 }) => {}
+        other => return Err(format!("an undeclared slot gave {other:?}")),
+    }
+    // Two refs claiming one slot. Caught before the one left empty is noticed, because the
+    // duplicate is the thing that went wrong and the hole is its consequence.
+    match descriptors::bound_from(&images, &bindings, &[refs[0], refs[0]]) {
+        Err(descriptors::Error::DuplicateTextureSlot { slot }) if slot == slots[0] => {}
+        other => return Err(format!("a duplicate slot gave {other:?}")),
+    }
+    // A binding nothing named.
+    match descriptors::bound_from(&images, &bindings, &[]) {
+        Err(descriptors::Error::UnfilledTextureSlot { slot }) if slot == slots[0] => {}
+        other => return Err(format!("an unfilled slot gave {other:?}")),
+    }
+    // A filter discriminant this build does not know, which the ABI now decodes -- so this is
+    // refused rather than guessed. #95's other half.
+    match descriptors::bound_from(
+        &images,
+        &bindings,
+        &[TextureRef {
+            filter: 9,
+            ..refs[0]
+        }],
+    ) {
+        Err(descriptors::Error::BadFilter { raw: 9, slot }) if slot == slots[0] => {}
+        other => return Err(format!("an unknown filter gave {other:?}")),
     }
 
     // And the good write still works afterwards.
     sets.write(&layout, &bindings, at, &blocks, &bound)
         .map_err(|why| format!("after the refusals: {why}"))?;
     println!(
-        "  refusals              ok   four refused, none left a set, a good write still works"
+        "  refusals              ok   eight refused, none left a set, a good write still works"
     );
     Ok(())
 }
@@ -340,6 +440,7 @@ fn main() {
     for (name, case) in [
         ("every_set_written", every_set_is_written as Case),
         ("two_samplers", the_filters_are_two_samplers),
+        ("out_of_order", an_out_of_order_run),
         ("refusals", refusals),
         ("bindings_per_slot", each_binding_resolves_its_own_slot),
     ] {

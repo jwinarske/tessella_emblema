@@ -168,7 +168,10 @@ pub fn content(
 ) -> Result<Counts, Error> {
     let mut counts = Counts::default();
 
-    for batch in batches.iter() {
+    for at in painted(batches) {
+        let Some(batch) = batches.get(at) else {
+            continue;
+        };
         let Some(found) = program(&batch) else {
             counts.undrawn += 1;
             continue;
@@ -223,6 +226,99 @@ pub fn content(
     Ok(counts)
 }
 
+/// The batches in the order they are painted, which is not the order they arrive.
+///
+/// # Topmost first is what arrives
+///
+/// A producer sorts each pass by depth slot ascending, which puts the *topmost* layer first, and
+/// `Placed::sort_key` on tessella's side is explicit that this is deliberate and that acting on
+/// it is the consumer's job:
+///
+/// > mbgl does not paint that way: it draws front-to-back against a depth buffer, with each layer
+/// > at its own slot, so a lower layer is rejected where a higher one already covered. [...] A
+/// > consumer with no depth buffer therefore cannot paint the order as given; it has to reverse
+/// > each translucent run itself.
+///
+/// This pass has no depth buffer to order with. `Attachment::StencilOnly` is what a view of flat
+/// layers takes -- deliberately, because a depth attachment is more for a tiler to write back --
+/// and even a view with an extrusion, which does get `Attachment::DepthStencil`, puts every draw
+/// at the same depth, because nothing here assigns a per-layer depth range. So the reversal is
+/// unconditional rather than a fallback for the flat case.
+///
+/// Measured before it was written: with the fixture emitting the producer's order, `a_frame`'s
+/// sampled band came out holding a lower layer's color over the top one. See #101.
+///
+/// # What is not reversed
+///
+/// The inside of a layer's run. Between layers the order is front-to-back and has to be turned
+/// around; within one it is already the order mbgl paints in -- a fill's triangles then its
+/// outline, a symbol's sprites then its halo then its letters, an extrusion's roof then the walls
+/// raised on it. tessella's note names the trap too, which is that getting this wrong hides:
+///
+/// > Reversing per drawable is invisible for as long as a layer's parts agree in color, which is
+/// > why it survived.
+///
+/// So this reverses the *sequence of runs* and leaves each run as it was given. The opaque pass is
+/// left alone entirely: front-to-back is the order it wants, and with no depth buffer an opaque
+/// draw is simply painted over.
+///
+/// Returns indices rather than batches so the borrow stays with the caller, and one small
+/// allocation per frame rather than one per batch.
+fn painted(batches: &Batches) -> Vec<usize> {
+    let mut out = Vec::with_capacity(batches.len());
+    let mut at = 0;
+    while at < batches.len() {
+        let Some(first) = batches.get(at) else {
+            break;
+        };
+        let pass = first.key.pass;
+        // A pass's batches are contiguous, because the producer sorts by pass before anything
+        // else. Found by scanning rather than assumed to be two: a pass this build does not know
+        // is then its own run and is painted in the order it arrived.
+        //
+        // Starts past the batch that opened the run, so the scan advances whatever the comparison
+        // says. A run that could come back empty is an outer loop that never progresses, and a
+        // mutation of the layer comparison below proved that the hard way: it did not fail the
+        // tests, it exhausted memory and the runner killed the process.
+        let mut end = at + 1;
+        while batches.get(end).is_some_and(|batch| batch.key.pass == pass) {
+            end += 1;
+        }
+
+        if pass & TRANSLUCENT != 0 {
+            // The runs of one layer each, collected so they can be emitted back to front.
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            let mut start = at;
+            while start < end {
+                let Some(batch) = batches.get(start) else {
+                    break;
+                };
+                let layer = batch.key.layer_index;
+                let mut stop = start + 1;
+                while stop < end
+                    && batches
+                        .get(stop)
+                        .is_some_and(|other| other.key.layer_index == layer)
+                {
+                    stop += 1;
+                }
+                runs.push((start, stop));
+                start = stop;
+            }
+            for (start, stop) in runs.into_iter().rev() {
+                out.extend(start..stop);
+            }
+        } else {
+            out.extend(at..end);
+        }
+        at = end;
+    }
+    out
+}
+
+/// `RenderPass::TRANSLUCENT`, which `batch::Key::pass` carries as its bits.
+const TRANSLUCENT: u8 = tessella_capture_abi::RenderPass::TRANSLUCENT.bits();
+
 /// The layer a batch belongs to, as a block buffer is keyed.
 ///
 /// `Which::layer` is an `i32` because `UboUpdate::layer_index` is; a batch's is a `u32` because
@@ -259,4 +355,146 @@ pub fn clipping(
         .map_or((0, 0), |assignment| {
             (u32::from(assignment.value), u32::from(assignment.read_mask))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TRANSLUCENT, painted};
+    use tessella_capture_abi::RenderPass;
+    use tessella_capture_abi::envelope::{GeometryId, OrderEntry};
+    use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
+    use tessella_consume::batch::{Batches, Program, collapse_into};
+
+    fn entry(geometry: u64, layer: u32, pass: RenderPass) -> OrderEntry {
+        OrderEntry {
+            geometry: GeometryId(geometry),
+            draw_priority: 0,
+            layer_index: layer,
+            sub_layer_index: 0,
+            ubo_index: 0,
+            pass,
+            _pad: [0; 3],
+        }
+    }
+
+    /// Collapses with each geometry's shader taken from its id, so an order can ask for two
+    /// batches inside one layer -- which is what a fill and its outline are.
+    fn batches_of(order: &[OrderEntry]) -> Batches {
+        let mut batches = Batches::new();
+        collapse_into(order, &mut batches, |id| {
+            Some(Program {
+                builtin_shader: match id.0 % 2 {
+                    0 => BuiltIn::FillShader as i32,
+                    _ => BuiltIn::FillOutlineShader as i32,
+                },
+                permutation_key: 0,
+                texture_refs: &[],
+            })
+        });
+        batches
+    }
+
+    fn layers_of(batches: &Batches, order: &[usize]) -> Vec<u32> {
+        order
+            .iter()
+            .map(|at| batches.get(*at).expect("a batch").key.layer_index)
+            .collect()
+    }
+
+    /// A translucent pass is painted with its layer runs reversed.
+    ///
+    /// The producer sends the topmost layer first; with no depth buffer this pass has to turn
+    /// that around. Three layers, one batch each, so what this pins is the run *sequence*.
+    #[test]
+    fn the_translucent_runs_are_painted_back_to_front() {
+        let order = [
+            entry(0, 2, RenderPass::TRANSLUCENT),
+            entry(2, 1, RenderPass::TRANSLUCENT),
+            entry(4, 0, RenderPass::TRANSLUCENT),
+        ];
+        let batches = batches_of(&order);
+        assert_eq!(batches.len(), 3, "a layer boundary breaks a collapse");
+        assert_eq!(
+            layers_of(&batches, &painted(&batches)),
+            vec![0, 1, 2],
+            "the bottom layer is painted first"
+        );
+    }
+
+    /// And a run of more than one batch keeps its own order.
+    ///
+    /// The trap tessella's `sort_key` names: "Reversing per drawable is invisible for as long as a
+    /// layer's parts agree in color, which is why it survived." A fill and its outline are two
+    /// batches of one layer, and the outline has to follow the fill -- so the run sequence
+    /// reverses and the inside of a run does not.
+    ///
+    /// `benches/a_frame.rs` cannot catch this: every layer there is a single batch, so a run's
+    /// internal order is one element and reversing it is a no-op. This is where it is held.
+    #[test]
+    fn a_run_of_two_batches_keeps_its_order() {
+        // Layer 1 is a fill then its outline; layer 0 is one fill. Topmost first, as sent.
+        let order = [
+            entry(0, 1, RenderPass::TRANSLUCENT),
+            entry(1, 1, RenderPass::TRANSLUCENT),
+            entry(2, 0, RenderPass::TRANSLUCENT),
+        ];
+        let batches = batches_of(&order);
+        assert_eq!(batches.len(), 3, "the outline is its own batch");
+
+        let order = painted(&batches);
+        assert_eq!(
+            layers_of(&batches, &order),
+            vec![0, 1, 1],
+            "layer 0 first, then layer 1's two batches"
+        );
+        // The fill before its outline, which is the order it arrived in.
+        let shaders: Vec<i32> = order
+            .iter()
+            .map(|at| batches.get(*at).expect("a batch").key.builtin_shader)
+            .collect();
+        assert_eq!(
+            shaders,
+            vec![
+                BuiltIn::FillShader as i32,
+                BuiltIn::FillShader as i32,
+                BuiltIn::FillOutlineShader as i32,
+            ],
+            "the outline follows the fill it outlines, reversal or not"
+        );
+    }
+
+    /// The opaque pass is painted as it arrives, and a mixed order keeps its passes apart.
+    ///
+    /// Front-to-back is the order the opaque pass wants, so there is nothing to turn around. The
+    /// producer sorts by pass before anything else, so the two never interleave.
+    #[test]
+    fn the_opaque_pass_is_left_alone() {
+        let order = [
+            entry(0, 2, RenderPass::OPAQUE),
+            entry(2, 1, RenderPass::OPAQUE),
+            entry(4, 2, RenderPass::TRANSLUCENT),
+            entry(6, 1, RenderPass::TRANSLUCENT),
+        ];
+        let batches = batches_of(&order);
+        assert_eq!(batches.len(), 4);
+
+        let drawn = painted(&batches);
+        assert_eq!(
+            layers_of(&batches, &drawn),
+            vec![2, 1, 1, 2],
+            "the opaque pass as given, then the translucent one reversed"
+        );
+        assert_eq!(
+            batches.get(drawn[0]).expect("a batch").key.pass,
+            RenderPass::OPAQUE.bits(),
+            "and the opaque pass still comes first"
+        );
+        assert_eq!(TRANSLUCENT, 2, "which is the bit this file tests against");
+    }
+
+    /// No batches is no draws, rather than a panic.
+    #[test]
+    fn an_empty_frame_paints_nothing() {
+        assert_eq!(painted(&Batches::new()), Vec::<usize>::new());
+    }
 }

@@ -56,6 +56,13 @@ pub const SAMPLED: i32 = 2;
 /// ignored the layer would pass.
 pub const OVER: i32 = 1;
 
+/// Layers in this fixture's style: `LAYER`, `OVER` and `SAMPLED`.
+///
+/// What a depth slot is measured against, and tessella#373's reason for sending it on the order:
+/// the entries cannot supply it, because a style layer that draws nothing this frame is absent
+/// from them.
+pub const LAYERS: u32 = 3;
+
 /// The epoch the order and the camera agree on.
 pub const EPOCH: OrderEpoch = OrderEpoch(1);
 
@@ -792,7 +799,17 @@ pub fn ubo(producer: &mut Producer, view: ViewId, layer: i32, slot: u32, data: &
         .expect("room");
 }
 
-/// The painter order: both tiles, in tile order, each naming its own entry of the drawable buffer.
+/// The draw order as a producer sends it: **topmost layer first within a pass**.
+///
+/// Not the painter's order, which is what this sent until #101. tessella sorts each pass by depth
+/// slot ascending, and a slot runs opposite the style index, so the top layer leads -- and
+/// `Placed::sort_key` is explicit that a consumer without a depth buffer "has to reverse each
+/// translucent run itself". Sending the painter's order instead meant this fixture asserted the
+/// convention the consumer had invented: `record::painted` was absent and nothing noticed, because
+/// the stream it was driven with was already the order it drew in.
+///
+/// Sorted by the slot rather than written out in that order, so the fixture states the rule rather
+/// than a sequence that happens to satisfy it.
 fn order(producer: &mut Producer) {
     let mut entries: Vec<OrderEntry> = GEOMETRIES
         .iter()
@@ -807,7 +824,8 @@ fn order(producer: &mut Producer) {
             _pad: [0; 3],
         })
         .collect();
-    // After them, which is what puts them on top: the order is the painter's.
+    // Emitted after them and sorted below, which is what puts them on top. The sort is the
+    // producer's, not the painter's -- see the note on `order` itself.
     entries.push(OrderEntry {
         geometry: ABOVE,
         draw_priority: 0,
@@ -826,6 +844,14 @@ fn order(producer: &mut Producer) {
         pass: RenderPass::TRANSLUCENT,
         _pad: [0; 3],
     });
+    // Ascending depth slot, which `tessella_capture_abi::envelope::depth_slot` defines against
+    // the style's layer count -- the same count this fixture puts on the `OrderUpdate`.
+    entries.sort_by_key(|entry| {
+        tessella_capture_abi::envelope::depth_slot(
+            i32::try_from(entry.layer_index).expect("a small layer index"),
+            LAYERS,
+        )
+    });
     let mut payload = Vec::new();
     for entry in &entries {
         payload.extend_from_slice(entry.as_bytes());
@@ -837,10 +863,7 @@ fn order(producer: &mut Producer) {
             offset: 0,
             count: u32::try_from(entries.len()).expect("two"),
         },
-        // Three layers in this fixture's style -- `LAYER`, `OVER` and `SAMPLED`. What a depth
-        // slot is measured against, and tessella#373's reason for sending it: the entries cannot
-        // supply it, because a style layer that draws nothing this frame is absent from them.
-        layer_count: 3,
+        layer_count: LAYERS,
     };
     producer
         .write(EnvelopeKind::OrderUpdate, update.as_bytes(), &payload)

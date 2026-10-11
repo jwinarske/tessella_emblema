@@ -239,14 +239,27 @@ pub fn content(
 /// > consumer with no depth buffer therefore cannot paint the order as given; it has to reverse
 /// > each translucent run itself.
 ///
-/// This pass has no depth buffer to order with. `Attachment::StencilOnly` is what a view of flat
-/// layers takes -- deliberately, because a depth attachment is more for a tiler to write back --
-/// and even a view with an extrusion, which does get `Attachment::DepthStencil`, puts every draw
-/// at the same depth, because nothing here assigns a per-layer depth range. So the reversal is
-/// unconditional rather than a fallback for the flat case.
+/// This pass has no depth buffer to order with. Every draw lands at the same depth, because
+/// nothing here assigns a per-layer depth range -- and a view of flat layers takes
+/// `Attachment::StencilOnly`, where on some devices there is no depth aspect to write at all. So
+/// the reversal is unconditional rather than a fallback for the flat case.
 ///
 /// Measured before it was written: with the fixture emitting the producer's order, `a_frame`'s
 /// sampled band came out holding a lower layer's color over the top one. See #101.
+///
+/// # Both passes, not only the translucent one
+///
+/// #101 reversed the translucent runs and left the opaque pass as it arrived, on the reasoning
+/// that front-to-back is the order it wants. That is true *against a depth buffer* and false
+/// without one: with nothing to reject a covered fragment, a lower opaque layer drawn later simply
+/// paints over the higher one. Marking this fixture's layers `RenderPass::OPAQUE` put a lower
+/// layer's color in the sampled band, the same failure #101 opened with.
+///
+/// For opaque geometry the two are equivalent in output -- painting back-to-front and testing
+/// front-to-back both leave the nearest layer visible -- so the reversal is the correct answer
+/// here and the depth buffer is the faster one. #103 is the faster one, measured at 89% of a
+/// sixteen-layer frame on V3D, and when it lands the opaque arm goes back to front-to-back because
+/// it will have something to be rejected by.
 ///
 /// # What is not reversed
 ///
@@ -258,9 +271,7 @@ pub fn content(
 /// > Reversing per drawable is invisible for as long as a layer's parts agree in color, which is
 /// > why it survived.
 ///
-/// So this reverses the *sequence of runs* and leaves each run as it was given. The opaque pass is
-/// left alone entirely: front-to-back is the order it wants, and with no depth buffer an opaque
-/// draw is simply painted over.
+/// So this reverses the *sequence of runs* within each pass and leaves each run as it was given.
 ///
 /// Returns indices rather than batches so the borrow stays with the caller, and one small
 /// allocation per frame rather than one per batch.
@@ -285,39 +296,32 @@ fn painted(batches: &Batches) -> Vec<usize> {
             end += 1;
         }
 
-        if pass & TRANSLUCENT != 0 {
-            // The runs of one layer each, collected so they can be emitted back to front.
-            let mut runs: Vec<(usize, usize)> = Vec::new();
-            let mut start = at;
-            while start < end {
-                let Some(batch) = batches.get(start) else {
-                    break;
-                };
-                let layer = batch.key.layer_index;
-                let mut stop = start + 1;
-                while stop < end
-                    && batches
-                        .get(stop)
-                        .is_some_and(|other| other.key.layer_index == layer)
-                {
-                    stop += 1;
-                }
-                runs.push((start, stop));
-                start = stop;
+        // The runs of one layer each, collected so they can be emitted back to front.
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut start = at;
+        while start < end {
+            let Some(batch) = batches.get(start) else {
+                break;
+            };
+            let layer = batch.key.layer_index;
+            let mut stop = start + 1;
+            while stop < end
+                && batches
+                    .get(stop)
+                    .is_some_and(|other| other.key.layer_index == layer)
+            {
+                stop += 1;
             }
-            for (start, stop) in runs.into_iter().rev() {
-                out.extend(start..stop);
-            }
-        } else {
-            out.extend(at..end);
+            runs.push((start, stop));
+            start = stop;
+        }
+        for (start, stop) in runs.into_iter().rev() {
+            out.extend(start..stop);
         }
         at = end;
     }
     out
 }
-
-/// `RenderPass::TRANSLUCENT`, which `batch::Key::pass` carries as its bits.
-const TRANSLUCENT: u8 = tessella_capture_abi::RenderPass::TRANSLUCENT.bits();
 
 /// The layer a batch belongs to, as a block buffer is keyed.
 ///
@@ -359,7 +363,7 @@ pub fn clipping(
 
 #[cfg(test)]
 mod tests {
-    use super::{TRANSLUCENT, painted};
+    use super::painted;
     use tessella_capture_abi::RenderPass;
     use tessella_capture_abi::envelope::{GeometryId, OrderEntry};
     use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
@@ -463,12 +467,18 @@ mod tests {
         );
     }
 
-    /// The opaque pass is painted as it arrives, and a mixed order keeps its passes apart.
+    /// The opaque pass reverses too, and a mixed order keeps its passes apart.
     ///
-    /// Front-to-back is the order the opaque pass wants, so there is nothing to turn around. The
-    /// producer sorts by pass before anything else, so the two never interleave.
+    /// This test asserted the opposite when it was written, and was wrong. Front-to-back is the
+    /// order the opaque pass wants *against a depth buffer*; with nothing to reject a covered
+    /// fragment, a lower opaque layer drawn later paints over the higher one. Marking `a_frame`'s
+    /// layers `RenderPass::OPAQUE` put a lower layer's color in the sampled band, which is the
+    /// same failure #101 opened with.
+    ///
+    /// The producer sorts by pass before anything else, so the two never interleave and each is
+    /// reversed within itself.
     #[test]
-    fn the_opaque_pass_is_left_alone() {
+    fn the_opaque_pass_reverses_within_itself() {
         let order = [
             entry(0, 2, RenderPass::OPAQUE),
             entry(2, 1, RenderPass::OPAQUE),
@@ -481,15 +491,14 @@ mod tests {
         let drawn = painted(&batches);
         assert_eq!(
             layers_of(&batches, &drawn),
-            vec![2, 1, 1, 2],
-            "the opaque pass as given, then the translucent one reversed"
+            vec![1, 2, 1, 2],
+            "each pass bottom layer first, and the opaque pass still ahead of the translucent one"
         );
         assert_eq!(
             batches.get(drawn[0]).expect("a batch").key.pass,
             RenderPass::OPAQUE.bits(),
             "and the opaque pass still comes first"
         );
-        assert_eq!(TRANSLUCENT, 2, "which is the bit this file tests against");
     }
 
     /// No batches is no draws, rather than a panic.

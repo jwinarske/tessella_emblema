@@ -304,7 +304,7 @@ pub fn half(from: f32, to: f32) -> [f32; 16] {
 /// uses it, the clips and the uniforms follow, and the camera comes last because it is what commits
 /// the frame -- §11.7's "hold `CameraUpdate` until its `orderEpoch` is held".
 #[must_use]
-pub fn write(capacity: usize) -> (Ring, Geometry) {
+pub fn write(capacity: usize, pass: RenderPass) -> (Ring, Geometry) {
     let geometry = Geometry::new();
     let mut ring = Ring::new(capacity);
     let producer = ring.producer();
@@ -346,6 +346,7 @@ pub fn write(capacity: usize) -> (Ring, Geometry) {
             VIEW,
             LAYER,
             Some(tile(u32::try_from(at).expect("two tiles"))),
+            pass,
         );
     }
     // The layer above, with no tile of its own: a layer that covers the viewport rather than a
@@ -361,7 +362,7 @@ pub fn write(capacity: usize) -> (Ring, Geometry) {
         refs[3],
         &[],
     );
-    used(producer, ABOVE, VIEW, OVER, None);
+    used(producer, ABOVE, VIEW, OVER, None, pass);
 
     // And the layer that samples: three `Short2` runs -- a position, a texture coordinate and a
     // skirt -- and both of the images its table declares.
@@ -375,12 +376,12 @@ pub fn write(capacity: usize) -> (Ring, Geometry) {
         refs[3],
         &TEXTURES,
     );
-    used(producer, SAMPLER, VIEW, SAMPLED, None);
+    used(producer, SAMPLER, VIEW, SAMPLED, None, pass);
     textures(producer);
 
     clips(producer);
     uniforms(producer);
-    order(producer);
+    order(producer, pass);
     camera(producer, VIEW);
     (ring, geometry)
 }
@@ -493,14 +494,21 @@ pub fn stride_of(kind: AttributeDataType) -> u32 {
 /// `None` for a drawable that covers the viewport. The tile field is then meaningless -- the ABI
 /// says it is "meaningful only when `has_tile` is set" -- so it is left at its default and the flag
 /// is what a consumer reads.
-pub fn used(producer: &mut Producer, id: GeometryId, view: ViewId, layer: i32, at: Option<TileId>) {
+pub fn used(
+    producer: &mut Producer,
+    id: GeometryId,
+    view: ViewId,
+    layer: i32,
+    at: Option<TileId>,
+    pass: RenderPass,
+) {
     let use_ = ViewUse {
         geometry: id,
         view,
         layer_index: layer,
         sub_layer_index: 0,
         tile: at.unwrap_or_default(),
-        render_pass: RenderPass::TRANSLUCENT,
+        render_pass: pass,
         draw_flags: DrawFlags::default(),
         has_tile: u8::from(at.is_some()),
         _pad: [0; 5],
@@ -810,7 +818,7 @@ pub fn ubo(producer: &mut Producer, view: ViewId, layer: i32, slot: u32, data: &
 ///
 /// Sorted by the slot rather than written out in that order, so the fixture states the rule rather
 /// than a sequence that happens to satisfy it.
-fn order(producer: &mut Producer) {
+fn order(producer: &mut Producer, pass: RenderPass) {
     let mut entries: Vec<OrderEntry> = GEOMETRIES
         .iter()
         .enumerate()
@@ -820,7 +828,7 @@ fn order(producer: &mut Producer) {
             layer_index: u32::try_from(LAYER).expect("a non-negative layer"),
             sub_layer_index: 0,
             ubo_index: u32::try_from(at).expect("two tiles"),
-            pass: RenderPass::TRANSLUCENT,
+            pass,
             _pad: [0; 3],
         })
         .collect();
@@ -832,7 +840,7 @@ fn order(producer: &mut Producer) {
         layer_index: u32::try_from(OVER).expect("a non-negative layer"),
         sub_layer_index: 0,
         ubo_index: 0,
-        pass: RenderPass::TRANSLUCENT,
+        pass,
         _pad: [0; 3],
     });
     entries.push(OrderEntry {
@@ -841,7 +849,7 @@ fn order(producer: &mut Producer) {
         layer_index: u32::try_from(SAMPLED).expect("a non-negative layer"),
         sub_layer_index: 0,
         ubo_index: 0,
-        pass: RenderPass::TRANSLUCENT,
+        pass,
         _pad: [0; 3],
     });
     // Ascending depth slot, which `tessella_capture_abi::envelope::depth_slot` defines against

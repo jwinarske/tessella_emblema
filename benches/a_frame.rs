@@ -39,6 +39,7 @@ mod frame;
 use std::collections::BTreeMap;
 
 use ash::vk;
+use tessella_capture_abi::RenderPass;
 use tessella_capture_abi::envelope::{GeometryId, Rect16, TileId};
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_consume::host::Host;
@@ -183,9 +184,29 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    // Both passes, because the opaque one was drawn in the wrong order and nothing here could see
+    // it: every entry this fixture sent was `TRANSLUCENT`, so `record::painted`'s opaque arm had no
+    // coverage at all. Marking them `OPAQUE` by hand put a lower layer's color in the sampled band.
+    //
+    // The expected picture is the same either way, which is what makes the pair worth running: for
+    // opaque geometry, painting back to front and testing front to back both leave the nearest
+    // layer visible, so a consumer that gets one pass right and the other wrong fails exactly one
+    // of these two.
+    for (name, pass) in [
+        ("opaque", RenderPass::OPAQUE),
+        ("translucent", RenderPass::TRANSLUCENT),
+    ] {
+        println!("  the {name} pass");
+        one_pass(pass)?;
+    }
+    Ok(())
+}
+
+/// The whole frame -- stream then draws -- for one render pass.
+fn one_pass(pass: RenderPass) -> Result<(), String> {
     // The stream half first, which needs no device: a frame that did not decode is a frame there is
     // no point drawing, and the two failures look nothing alike.
-    let (mut ring, geometry) = frame::write(1 << 16);
+    let (mut ring, geometry) = frame::write(1 << 16, pass);
     let mut host = Host::new();
     let progress = host.read(ring.consumer());
     if progress.unknown != 0 || progress.malformed != 0 || progress.undeclared != 0 {

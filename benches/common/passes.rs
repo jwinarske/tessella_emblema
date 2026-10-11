@@ -138,7 +138,7 @@ fn child(producer: &mut Producer, geometry: &Geometry) {
         refs[3],
         &[],
     );
-    frame::used(producer, DRAWN, CHILD, LAYER, None);
+    frame::used(producer, DRAWN, CHILD, LAYER, None, RenderPass::TRANSLUCENT);
 
     let stride = ubo_layouts::FILL_DRAWABLE_UNION_UBO.stride as usize;
     let mut drawable = vec![0u8; stride];
@@ -174,7 +174,14 @@ fn parent(producer: &mut Producer, geometry: &Geometry) {
         // second, which the raster declares and `fade_t` of zero does not read.
         &[TARGET, PARENT_IMAGE],
     );
-    frame::used(producer, SAMPLES, PARENT, LAYER, None);
+    frame::used(
+        producer,
+        SAMPLES,
+        PARENT,
+        LAYER,
+        None,
+        RenderPass::TRANSLUCENT,
+    );
 
     let mut drawable = vec![0u8; ubo_layouts::RASTER_DRAWABLE_UBO.stride as usize];
     frame::put(

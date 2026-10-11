@@ -226,7 +226,8 @@ fn commit(producer: &mut Producer, view: ViewId, geometry: GeometryId) {
             offset: 0,
             count: u32::try_from(entries.len()).expect("one"),
         },
-        _pad: 0,
+        // One layer per view here, which is `LAYER`.
+        layer_count: 1,
     };
     producer
         .write(EnvelopeKind::OrderUpdate, update.as_bytes(), &payload)

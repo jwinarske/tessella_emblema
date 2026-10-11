@@ -837,7 +837,10 @@ fn order(producer: &mut Producer) {
             offset: 0,
             count: u32::try_from(entries.len()).expect("two"),
         },
-        _pad: 0,
+        // Three layers in this fixture's style -- `LAYER`, `OVER` and `SAMPLED`. What a depth
+        // slot is measured against, and tessella#373's reason for sending it: the entries cannot
+        // supply it, because a style layer that draws nothing this frame is absent from them.
+        layer_count: 3,
     };
     producer
         .write(EnvelopeKind::OrderUpdate, update.as_bytes(), &payload)

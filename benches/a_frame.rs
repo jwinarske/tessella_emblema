@@ -305,7 +305,7 @@ fn one_pass(pass: RenderPass) -> Result<(), String> {
     // falls back to `D24_UNORM_S8_UINT` for both -- so on the Pi this runs the same format twice
     // and the stencil-only path is covered on RADV alone.
     for attachment in [Attachment::DepthStencil, Attachment::StencilOnly] {
-        draw(&device, &mut host, &geometry, attachment)?;
+        draw(&device, &mut host, &geometry, attachment, pass)?;
     }
     Ok(())
 }
@@ -317,6 +317,7 @@ fn draw(
     host: &mut Host,
     geometry: &frame::Geometry,
     attachment: Attachment,
+    pass: RenderPass,
 ) -> Result<(), String> {
     let gpu = device.gpu();
     let target = Target::new(device, attachment)?;
@@ -469,6 +470,7 @@ fn draw(
                 .get(&frame::GEOMETRIES[0])
                 .ok_or("the first geometry has no plan")?,
             Blend::Alpha,
+            pipelines::Depth::of(pass.bits()),
         );
         let pipeline = cache
             .pipeline(gpu, &key, &bindings, &words, target.targets)
@@ -524,6 +526,7 @@ fn draw(
                 .get(&frame::SAMPLER)
                 .ok_or("the sampling geometry has no plan")?,
             Blend::Alpha,
+            pipelines::Depth::of(pass.bits()),
         );
         let pipeline = cache
             .pipeline(gpu, &key, &raster_bindings, &words, target.targets)
@@ -576,6 +579,18 @@ fn draw(
 
     let found = host.plan(frame::VIEW).ok_or("no plan for the view")?;
     let partition = found.clips.partition();
+    // Built from the stream: the layer count is the order's and the range is the camera's, which
+    // is the only place either arrives. `None` on a stencil-only attachment, where there is no
+    // depth aspect to band -- so this frame is drawn both ways and must come out the same.
+    let bands = match attachment {
+        Attachment::DepthStencil => found
+            .layer_count
+            .and_then(|layers| record::DepthRange::new(layers, found.camera.depth_range_size)),
+        Attachment::StencilOnly => None,
+    };
+    if bands.is_none() && attachment == Attachment::DepthStencil {
+        return Err("the stream carried no layer count or no depth range".into());
+    }
     let mut counts = Err("the recording did not run".to_string());
     device.submit(|record: Recorder<'_>| {
         target::frame(
@@ -613,6 +628,13 @@ fn draw(
                         joiner: found.joiner,
                         partition,
                         view: frame::VIEW,
+                        // The bands where the attachment has depth to put them in, which is what
+                        // lets the opaque pass keep the order it arrived in. On a stencil-only
+                        // attachment there is no depth aspect, so `painted` reverses instead --
+                        // and the two must give the same picture, which is what running both
+                        // attachments checks. #103.
+                        depth: bands,
+                        size: (frame::SIDE, frame::SIDE),
                     },
                     // By family, which is what a batch's key carries: a program is a pipeline and
                     // the layout its set binds through, and the two families here share neither.

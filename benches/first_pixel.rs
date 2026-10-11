@@ -2715,7 +2715,16 @@ fn draw_case<'d>(
     })
     .map_err(|why| format!("{} needs a format this device refuses: {why:?}", case.name))?;
 
-    let key = pipelines::key(case.family, case.surface, 0, &plan, Blend::Unblended);
+    // `Depth::Write` because a case is one draw with nothing behind it: the arm that writes is
+    // the one a single draw exercises, and no case here has a second layer to be rejected by.
+    let key = pipelines::key(
+        case.family,
+        case.surface,
+        0,
+        &plan,
+        Blend::Unblended,
+        pipelines::Depth::Write,
+    );
     let bindings = pipelines::bindings(found, case.surface);
 
     // The geometry, through the store the frame loop uses.

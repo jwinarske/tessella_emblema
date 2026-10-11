@@ -139,6 +139,79 @@ pub struct Scene<'a, 'd> {
     pub partition: &'a Partition,
     /// The view being drawn.
     pub view: ViewId,
+    /// How a layer's drawables are placed in the depth range, or `None` to place none.
+    ///
+    /// `None` is a frame with no depth to order with: a view whose attachment is
+    /// `Attachment::StencilOnly`, or an order that carried no layer count so no slot can be
+    /// computed. The draws then all land at the viewport's default range and
+    /// the painting order turns the passes around instead.
+    pub depth: Option<DepthRange>,
+    /// The target's size, for the viewport each depth band is set through.
+    pub size: (u32, u32),
+}
+
+/// What divides the depth range between a view's layers.
+///
+/// §11.7 asks for "opaque layers front-to-back with depth writes per `pass` + `opaquePassCutoff`",
+/// and this is the per-layer half of it: each layer gets a band of the range and the slot says
+/// which, so a nearer layer's fragments reject the ones behind them.
+///
+/// # The band is the consumer's to choose
+///
+/// tessella's `depth_slot` says so in as many words -- "The absolute base is a consumer-side depth
+/// mapping and mbgl's own count includes groups this frontend does not model, so what is
+/// reproduced here is the ordering, not mbgl's particular integers." So this divides
+/// `CameraUpdate::depth_range_size` evenly by the layer count rather than reproducing mbgl's
+/// epsilon arithmetic, which would need two constants the ABI does not publish.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DepthRange {
+    /// Layers in the style, from `OrderUpdate::layer_count` by way of `Frame::layer_count`.
+    pub layers: core::num::NonZeroU32,
+    /// The range the layers divide, from `CameraUpdate::depth_range_size`.
+    pub size: f32,
+}
+
+impl DepthRange {
+    /// The range a view divides, or `None` where it divides nothing.
+    ///
+    /// A `size` that is not positive and finite orders no layers: every band would be the same
+    /// zero-width slice and every drawable would land on one depth, which is the state this pass
+    /// was already in. `CameraUpdate::depth_range_size` is zero from a producer that does not set
+    /// it -- the field was there before anything read it -- so this is a real input and not a
+    /// defensive check. The caller then leaves [`Scene::depth`] `None` and the painting order turns the
+    /// opaque pass around instead, which is correct without depth.
+    #[must_use]
+    pub fn new(layers: core::num::NonZeroU32, size: f32) -> Option<Self> {
+        (size.is_finite() && size > 0.0).then_some(Self { layers, size })
+    }
+
+    /// The band a layer's drawables are placed in, as `(near, far)`.
+    ///
+    /// Slot zero is the top of the style and nearest, which is the direction
+    /// `tessella_capture_abi::envelope::depth_slot` counts in -- so a band's `near` grows with the
+    /// slot and the opaque pass, drawn front to back, rejects what is behind it.
+    ///
+    /// A vertex stage emitting clip-space `z` of zero lands exactly on `near`, which is what gives
+    /// a layer a depth without any shader knowing which layer it is in.
+    #[must_use]
+    pub fn band(self, layer_index: u32) -> (f32, f32) {
+        let layers = self.layers.get();
+        let slot = tessella_capture_abi::envelope::depth_slot(
+            i32::try_from(layer_index).unwrap_or(i32::MAX),
+            layers,
+        );
+        // `f64` for the division and back, because a style of many layers divides a range smaller
+        // than one into bands whose ends must stay ordered: at 2,048 layers an `f32` band is near
+        // the last place it can hold and two adjacent slots could round together.
+        let width = f64::from(self.size) / f64::from(layers);
+        let near = width * f64::from(slot);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "both are products of a range at most one and a slot below the layer count, \
+                      so each is inside 0.0..=1.0 and `viewport_in` clamps regardless"
+        )]
+        (near as f32, (near + width) as f32)
+    }
 }
 
 impl core::fmt::Debug for Scene<'_, '_> {
@@ -168,7 +241,7 @@ pub fn content(
 ) -> Result<Counts, Error> {
     let mut counts = Counts::default();
 
-    for at in painted(batches) {
+    for at in painted(batches, scene.depth.is_some()) {
         let Some(batch) = batches.get(at) else {
             continue;
         };
@@ -187,6 +260,14 @@ pub fn content(
 
         record.bind_pipeline(found.pipeline);
         record.bind_descriptor_set(found.layout, set);
+
+        // Per batch, because a batch is one layer: `batch::Key` carries `layer_index` and collapse
+        // is scoped to `(layer, pass)`, so every drawable in a run belongs in one band. Set through
+        // the viewport rather than the shader, so no family's module has to know its layer.
+        if let Some(range) = scene.depth {
+            let (near, far) = range.band(batch.key.layer_index);
+            record.viewport_in(scene.size.0, scene.size.1, near, far);
+        }
 
         for (geometry, slot) in batch.geometries.iter().zip(batch.ubo_indexes) {
             let (buffers, offsets) = scene.store.bindings(*geometry).ok_or(Error::NotResident {
@@ -247,19 +328,24 @@ pub fn content(
 /// Measured before it was written: with the fixture emitting the producer's order, `a_frame`'s
 /// sampled band came out holding a lower layer's color over the top one. See #101.
 ///
-/// # Both passes, not only the translucent one
+/// # The opaque pass depends on whether depth orders the frame
 ///
-/// #101 reversed the translucent runs and left the opaque pass as it arrived, on the reasoning
-/// that front-to-back is the order it wants. That is true *against a depth buffer* and false
-/// without one: with nothing to reject a covered fragment, a lower opaque layer drawn later simply
-/// paints over the higher one. Marking this fixture's layers `RenderPass::OPAQUE` put a lower
-/// layer's color in the sampled band, the same failure #101 opened with.
+/// `depth_orders` is [`Scene::depth`] being set. With it, the opaque pass is left as it arrives:
+/// front-to-back is the order it wants, each layer is in its own band, and a nearer layer rejects
+/// what is behind it -- which is the early-out, 89% of a sixteen-layer frame on V3D in #104.
 ///
-/// For opaque geometry the two are equivalent in output -- painting back-to-front and testing
-/// front-to-back both leave the nearest layer visible -- so the reversal is the correct answer
-/// here and the depth buffer is the faster one. #103 is the faster one, measured at 89% of a
-/// sixteen-layer frame on V3D, and when it lands the opaque arm goes back to front-to-back because
-/// it will have something to be rejected by.
+/// Without it the opaque pass is reversed too. #101 left it alone on the reasoning that
+/// front-to-back is what it wants, which is true *against a depth buffer* and false without one:
+/// with nothing to reject a covered fragment, a lower opaque layer drawn later paints over the
+/// higher one. Marking the fixture's layers `RenderPass::OPAQUE` put a lower layer's color in the
+/// sampled band, the same failure #101 opened with.
+///
+/// For opaque geometry the two agree in output -- painting back-to-front and testing front-to-back
+/// both leave the nearest layer visible -- so neither is a compromise. One is faster and needs a
+/// depth attachment; the other needs nothing.
+///
+/// The translucent pass is reversed either way. It is painted back to front and does not write
+/// depth, so there is nothing for a depth buffer to order it by.
 ///
 /// # What is not reversed
 ///
@@ -275,7 +361,7 @@ pub fn content(
 ///
 /// Returns indices rather than batches so the borrow stays with the caller, and one small
 /// allocation per frame rather than one per batch.
-fn painted(batches: &Batches) -> Vec<usize> {
+fn painted(batches: &Batches, depth_orders: bool) -> Vec<usize> {
     let mut out = Vec::with_capacity(batches.len());
     let mut at = 0;
     while at < batches.len() {
@@ -315,13 +401,20 @@ fn painted(batches: &Batches) -> Vec<usize> {
             runs.push((start, stop));
             start = stop;
         }
-        for (start, stop) in runs.into_iter().rev() {
-            out.extend(start..stop);
+        if depth_orders && pass & OPAQUE != 0 {
+            out.extend(at..end);
+        } else {
+            for (start, stop) in runs.into_iter().rev() {
+                out.extend(start..stop);
+            }
         }
         at = end;
     }
     out
 }
+
+/// `RenderPass::OPAQUE`, which `batch::Key::pass` carries as its bits.
+const OPAQUE: u8 = tessella_capture_abi::RenderPass::OPAQUE.bits();
 
 /// The layer a batch belongs to, as a block buffer is keyed.
 ///
@@ -363,7 +456,7 @@ pub fn clipping(
 
 #[cfg(test)]
 mod tests {
-    use super::painted;
+    use super::{DepthRange, painted};
     use tessella_capture_abi::RenderPass;
     use tessella_capture_abi::envelope::{GeometryId, OrderEntry};
     use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
@@ -419,7 +512,7 @@ mod tests {
         let batches = batches_of(&order);
         assert_eq!(batches.len(), 3, "a layer boundary breaks a collapse");
         assert_eq!(
-            layers_of(&batches, &painted(&batches)),
+            layers_of(&batches, &painted(&batches, false)),
             vec![0, 1, 2],
             "the bottom layer is painted first"
         );
@@ -445,7 +538,7 @@ mod tests {
         let batches = batches_of(&order);
         assert_eq!(batches.len(), 3, "the outline is its own batch");
 
-        let order = painted(&batches);
+        let order = painted(&batches, false);
         assert_eq!(
             layers_of(&batches, &order),
             vec![0, 1, 1],
@@ -488,7 +581,7 @@ mod tests {
         let batches = batches_of(&order);
         assert_eq!(batches.len(), 4);
 
-        let drawn = painted(&batches);
+        let drawn = painted(&batches, false);
         assert_eq!(
             layers_of(&batches, &drawn),
             vec![1, 2, 1, 2],
@@ -501,9 +594,72 @@ mod tests {
         );
     }
 
+    /// With depth to order it, the opaque pass keeps the order it arrived in.
+    ///
+    /// Front-to-back is what it wants once each layer is in its own band: the nearest layer draws
+    /// first and writes, and the ones behind it are rejected rather than painted over. That is the
+    /// early-out, and leaving the order alone is what lets it happen -- a reversed opaque pass
+    /// would draw the farthest layer first and every nearer one would pass the test and shade.
+    ///
+    /// The translucent pass is reversed either way, because it does not write depth and so has
+    /// nothing to be ordered by.
+    #[test]
+    fn depth_leaves_the_opaque_pass_front_to_back() {
+        let order = [
+            entry(0, 2, RenderPass::OPAQUE),
+            entry(2, 1, RenderPass::OPAQUE),
+            entry(4, 2, RenderPass::TRANSLUCENT),
+            entry(6, 1, RenderPass::TRANSLUCENT),
+        ];
+        let batches = batches_of(&order);
+        assert_eq!(
+            layers_of(&batches, &painted(&batches, true)),
+            vec![2, 1, 1, 2],
+            "the opaque pass as sent, the translucent one reversed"
+        );
+        assert_eq!(
+            layers_of(&batches, &painted(&batches, false)),
+            vec![1, 2, 1, 2],
+            "and without depth both are reversed"
+        );
+    }
+
+    /// A layer's band is its slot's share of the range, nearest at slot zero.
+    #[test]
+    fn a_band_follows_the_depth_slot() {
+        let range = DepthRange {
+            layers: core::num::NonZeroU32::new(4).expect("four layers"),
+            size: 1.0,
+        };
+        // Slot zero is the top of the style and nearest, so the last layer index leads.
+        let (near, far) = range.band(3);
+        assert!(
+            (near - 0.0).abs() < 1e-6,
+            "the top layer is nearest: {near}"
+        );
+        assert!((far - 0.25).abs() < 1e-6, "one band wide: {far}");
+
+        let (near, _) = range.band(0);
+        assert!(
+            (near - 0.75).abs() < 1e-6,
+            "and the style's first layer is deepest: {near}"
+        );
+
+        // Every band inside the range, and ordered by slot.
+        let mut last = -1.0f32;
+        for layer in [3, 2, 1, 0] {
+            let (near, far) = range.band(layer);
+            assert!(near > last, "bands ascend with the slot");
+            assert!((0.0..=1.0).contains(&near) && (0.0..=1.0).contains(&far));
+            assert!(far > near, "a band has width");
+            last = near;
+        }
+    }
+
     /// No batches is no draws, rather than a panic.
     #[test]
     fn an_empty_frame_paints_nothing() {
-        assert_eq!(painted(&Batches::new()), Vec::<usize>::new());
+        assert_eq!(painted(&Batches::new(), false), Vec::<usize>::new());
+        assert_eq!(painted(&Batches::new(), true), Vec::<usize>::new());
     }
 }

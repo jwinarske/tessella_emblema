@@ -56,6 +56,12 @@ pub const SAMPLED: i32 = 2;
 /// ignored the layer would pass.
 pub const OVER: i32 = 1;
 
+/// The depth range the layers divide, as `tessella_orchestrate::camera::DEFAULT_DEPTH_RANGE` is.
+///
+/// That constant is the producer's and this crate does not depend on it, so the number is agreed
+/// rather than imported -- the same arrangement as the terrain elevation slot in `surface`.
+pub const DEPTH_RANGE: f32 = 0.988_281_25;
+
 /// Layers in this fixture's style: `LAYER`, `OVER` and `SAMPLED`.
 ///
 /// What a depth slot is measured against, and tessella#373's reason for sending it on the order:
@@ -888,6 +894,11 @@ pub fn camera(producer: &mut Producer, view: ViewId) {
     let mut update = CameraUpdate::from_bytes(&zeros).expect("a camera reads from zeros");
     update.view = view;
     update.order_epoch = EPOCH;
+    // A real depth range, because zero is what a camera read from zeros carries and a zero range
+    // divides into bands of no width -- every layer on one depth, which orders nothing. The value
+    // is the producer's own `DEFAULT_DEPTH_RANGE`, measured from the oracle's frame.
+    update.depth_range_size = DEPTH_RANGE;
+    update.opaque_pass_cutoff = LAYERS;
     producer
         .write(EnvelopeKind::CameraUpdate, update.as_bytes(), &[])
         .expect("room");

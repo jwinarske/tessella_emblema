@@ -1088,6 +1088,20 @@ impl<'c> Recorder<'c> {
     /// Both are dynamic state, which is what lets one pipeline serve a ring of any size --
     /// `tessella_emblema::pipelines` says why. The viewport's y runs down, matching the clip space
     /// naga emits.
+    pub fn viewport(&self, width: u32, height: u32) {
+        self.viewport_in(width, height, 0.0, 1.0);
+    }
+
+    /// The same, with the depth range a draw's clip-space `z` is mapped into.
+    ///
+    /// `vkCmdSetViewport` carries the range, so a per-layer depth band costs one more call rather
+    /// than a pipeline: `near` and `far` are `minDepth` and `maxDepth`, and a vertex stage emitting
+    /// `z` of zero lands exactly on `near`. That is what puts a layer's drawables at their own
+    /// depth without any shader knowing the layer -- see `record::content`.
+    ///
+    /// Both must be inside `0.0..=1.0` and `near` may exceed `far`, which Vulkan allows and this
+    /// does not use. A range outside the unit interval is invalid usage no driver has to report, so
+    /// this clamps rather than trusting the caller: the alternative is a silently unbounded depth.
     #[expect(
         clippy::cast_precision_loss,
         reason = "a u32 to f32 cast is exact below 2^24, and a viewport is bounded by \
@@ -1095,14 +1109,14 @@ impl<'c> Recorder<'c> {
                   RADV, all three orders of magnitude inside it. A target larger than 16,777,216 \
                   pixels on a side is not a thing this pass can be handed."
     )]
-    pub fn viewport(&self, width: u32, height: u32) {
+    pub fn viewport_in(&self, width: u32, height: u32, near: f32, far: f32) {
         let viewports = [vk::Viewport {
             x: 0.0,
             y: 0.0,
             width: width as f32,
             height: height as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
+            min_depth: near.clamp(0.0, 1.0),
+            max_depth: far.clamp(0.0, 1.0),
         }];
         let scissors = [vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },

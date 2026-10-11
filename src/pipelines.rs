@@ -69,6 +69,51 @@ pub struct Key {
     /// accumulates where a fill composites -- and a cache keyed without this would hand the second
     /// one the first's pipeline and blend it wrongly. Which draws.
     pub blend: Blend,
+    /// Whether the draw writes depth.
+    ///
+    /// In the key for the reason [`Self::blend`] is: it is pipeline state, the two passes of one
+    /// frame want different values of it, and a cache keyed without it would hand the translucent
+    /// pass the opaque pass's pipeline. Which draws, and occludes what follows it.
+    pub depth: Depth,
+}
+
+/// Whether a draw writes the depth it tests against.
+///
+/// §11.7's split, as pipeline state: "opaque layers front-to-back with depth writes per `pass` +
+/// `opaquePassCutoff`". The opaque pass writes, so a nearer layer rejects the ones behind it --
+/// which is the early-out, measured at 89% of a sixteen-layer frame on V3D in #104. The
+/// translucent pass tests and does not write: it is painted back to front and a translucent layer
+/// must not occlude the one in front of it.
+///
+/// Not a dynamic state, though `VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE` is core in Vulkan 1.3 and
+/// V3D reports 1.3. This crate does not create the device -- `check_dynamic_rendering` takes the
+/// device's answer as a bool -- so it cannot enable a feature, only ask whether one is there. Two
+/// pipelines is the cost of not assuming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Depth {
+    /// Tested and written, which is the opaque pass.
+    #[default]
+    Write,
+    /// Tested and not written, which is the translucent pass.
+    TestOnly,
+}
+
+impl Depth {
+    /// Which a pass draws with, from `batch::Key::pass`.
+    ///
+    /// `RenderPass` is a bitflag and a drawable can be in both passes -- the background is
+    /// `Opaque | Translucent` -- but an `OrderEntry` carries one bit, because `DrawOrder::resolve`
+    /// expands such a drawable into one entry per pass. So this reads the one bit that is set, and
+    /// anything that is not the opaque bit is treated as translucent: a pass this build does not
+    /// know must not be given depth writes on the strength of not being recognized.
+    #[must_use]
+    pub fn of(pass: u8) -> Self {
+        if pass & tessella_capture_abi::RenderPass::OPAQUE.bits() != 0 {
+            Self::Write
+        } else {
+            Self::TestOnly
+        }
+    }
 }
 
 /// The key for a drawable whose input has been planned.
@@ -78,12 +123,20 @@ pub struct Key {
 /// attribute is constant for this permutation and no descriptor arrived for it, and that difference
 /// is a different pipeline.
 #[must_use]
-pub fn key(shader: BuiltIn, surface: Surface, permutation: u64, plan: &Plan, blend: Blend) -> Key {
+pub fn key(
+    shader: BuiltIn,
+    surface: Surface,
+    permutation: u64,
+    plan: &Plan,
+    blend: Blend,
+    depth: Depth,
+) -> Key {
     Key {
         shader,
         surface,
         permutation,
         blend,
+        depth,
         layout: plan
             .bound
             .iter()
@@ -450,7 +503,10 @@ pub const CONTENT_DYNAMIC: [vk::DynamicState; 4] = [
 /// `KEEP` on every stencil op and `EQUAL` as the compare: a content draw reads the mask and does not
 /// write it. Whoever draws the masks sets its own stencil state, which is a later slice -- this is
 /// the state the *content* pipelines want.
-pub fn depth_stencil(attachment: Attachment) -> vk::PipelineDepthStencilStateCreateInfo<'static> {
+pub fn depth_stencil(
+    attachment: Attachment,
+    depth: Depth,
+) -> vk::PipelineDepthStencilStateCreateInfo<'static> {
     let keep = vk::StencilOpState {
         fail_op: vk::StencilOp::KEEP,
         pass_op: vk::StencilOp::KEEP,
@@ -462,12 +518,14 @@ pub fn depth_stencil(attachment: Attachment) -> vk::PipelineDepthStencilStateCre
         write_mask: 0,
         reference: 0,
     };
-    let depth = matches!(attachment, Attachment::DepthStencil);
+    let kept = matches!(attachment, Attachment::DepthStencil);
     vk::PipelineDepthStencilStateCreateInfo::default()
-        // Tested and written only where there is depth to keep. A flat view that enabled the test
-        // against a stencil-only attachment would be reading an attachment it does not have.
-        .depth_test_enable(depth)
-        .depth_write_enable(depth)
+        // Tested only where there is depth to keep. A flat view that enabled the test against a
+        // stencil-only attachment would be reading an attachment it does not have.
+        .depth_test_enable(kept)
+        // And written only in the pass that owns the ordering. The translucent pass tests without
+        // writing, so a translucent layer does not occlude the one painted in front of it.
+        .depth_write_enable(kept && matches!(depth, Depth::Write))
         .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
         .stencil_test_enable(true)
         .front(keep)
@@ -615,7 +673,7 @@ pub fn build<'d>(
     let raster = rasterization();
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-    let depth = depth_stencil(targets.attachment);
+    let depth = depth_stencil(targets.attachment, key.depth);
     let attachments = [key.blend.attachment()];
     let blending = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
 

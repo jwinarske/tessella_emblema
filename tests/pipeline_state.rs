@@ -22,20 +22,79 @@ use ash::vk;
 use tessella_emblema::device::Attachment;
 use tessella_emblema::pipelines;
 
-/// Depth is tested and written only where the view keeps depth.
+/// Depth is tested only where the view keeps depth, and written only by the opaque pass.
 ///
-/// A view of flat layers can take a stencil-only format, which on a tiler is less to write back. A
-/// pipeline that enabled the depth test against such an attachment would be reading one the frame
-/// does not have.
+/// A view of flat layers can take a stencil-only format. A pipeline that enabled the depth test
+/// against such an attachment would be reading one the frame does not have.
+///
+/// The write is the other half, and §11.7's: "opaque layers front-to-back with depth writes per
+/// `pass`". The translucent pass is painted back to front and must not occlude what follows it, so
+/// it tests without writing -- and the two are a `Key` apart, because a cache keyed without the
+/// pass would hand one the other's pipeline.
 #[test]
-fn depth_is_enabled_only_where_there_is_depth() {
-    let flat = pipelines::depth_stencil(Attachment::StencilOnly);
-    assert_eq!(flat.depth_test_enable, vk::FALSE);
-    assert_eq!(flat.depth_write_enable, vk::FALSE);
+fn depth_is_tested_where_it_is_kept_and_written_by_the_opaque_pass() {
+    for depth in [pipelines::Depth::Write, pipelines::Depth::TestOnly] {
+        let flat = pipelines::depth_stencil(Attachment::StencilOnly, depth);
+        assert_eq!(
+            flat.depth_test_enable,
+            vk::FALSE,
+            "{depth:?} has no depth to test against a stencil-only attachment"
+        );
+        assert_eq!(
+            flat.depth_write_enable,
+            vk::FALSE,
+            "{depth:?} has no depth to write there either"
+        );
+    }
 
-    let deep = pipelines::depth_stencil(Attachment::DepthStencil);
-    assert_eq!(deep.depth_test_enable, vk::TRUE);
-    assert_eq!(deep.depth_write_enable, vk::TRUE);
+    let opaque = pipelines::depth_stencil(Attachment::DepthStencil, pipelines::Depth::Write);
+    assert_eq!(opaque.depth_test_enable, vk::TRUE);
+    assert_eq!(
+        opaque.depth_write_enable,
+        vk::TRUE,
+        "the opaque pass writes, which is what rejects the layers behind it"
+    );
+
+    let translucent =
+        pipelines::depth_stencil(Attachment::DepthStencil, pipelines::Depth::TestOnly);
+    assert_eq!(
+        translucent.depth_test_enable,
+        vk::TRUE,
+        "the translucent pass still tests, so an opaque surface in front of it hides it"
+    );
+    assert_eq!(
+        translucent.depth_write_enable,
+        vk::FALSE,
+        "and does not write, so it does not occlude the layer painted in front of it"
+    );
+}
+
+/// The pass a bit names decides the depth write, and an unknown pass does not get one.
+///
+/// `RenderPass` is a bitflag and `DrawOrder::resolve` expands a drawable marked both into one entry
+/// per pass, so an entry carries one bit. Anything that is not the opaque bit is translucent: a
+/// pass this build does not know must not be handed depth writes for not being recognized.
+#[test]
+fn only_the_opaque_bit_writes_depth() {
+    use tessella_capture_abi::RenderPass;
+    assert_eq!(
+        pipelines::Depth::of(RenderPass::OPAQUE.bits()),
+        pipelines::Depth::Write
+    );
+    assert_eq!(
+        pipelines::Depth::of(RenderPass::TRANSLUCENT.bits()),
+        pipelines::Depth::TestOnly
+    );
+    assert_eq!(
+        pipelines::Depth::of(0),
+        pipelines::Depth::TestOnly,
+        "no bit set is not the opaque pass"
+    );
+    assert_eq!(
+        pipelines::Depth::of(0b1000_0000),
+        pipelines::Depth::TestOnly,
+        "nor is a bit this build does not know"
+    );
 }
 
 /// The stencil test is on for both, because the tile clip masks are what it is for.
@@ -46,7 +105,7 @@ fn depth_is_enabled_only_where_there_is_depth() {
 #[test]
 fn the_stencil_test_is_always_on() {
     for attachment in [Attachment::StencilOnly, Attachment::DepthStencil] {
-        let state = pipelines::depth_stencil(attachment);
+        let state = pipelines::depth_stencil(attachment, pipelines::Depth::Write);
         assert_eq!(
             state.stencil_test_enable,
             vk::TRUE,
@@ -63,7 +122,7 @@ fn the_stencil_test_is_always_on() {
 #[test]
 fn a_content_draw_does_not_write_the_stencil() {
     for attachment in [Attachment::StencilOnly, Attachment::DepthStencil] {
-        let state = pipelines::depth_stencil(attachment);
+        let state = pipelines::depth_stencil(attachment, pipelines::Depth::Write);
         for (side, face) in [("front", state.front), ("back", state.back)] {
             assert_eq!(face.write_mask, 0, "{side} writes the mask");
             // The compare mask is dynamic now, set per draw from the tile's `read_mask`. See
@@ -162,6 +221,7 @@ fn the_blend_mode_is_part_of_the_key() {
         permutation: 0,
         layout: Vec::new(),
         blend,
+        depth: pipelines::Depth::Write,
     };
     assert_ne!(
         of(pipelines::Blend::Alpha),

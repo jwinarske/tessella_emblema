@@ -238,6 +238,8 @@ fn draw(
             0,
             plans.get(&passes::DRAWN).ok_or("the child has no plan")?,
             Blend::Alpha,
+            // Both views draw in the translucent pass, so neither writes depth.
+            pipelines::Depth::TestOnly,
         );
         // Against the *child's* formats, which are its own: a pipeline names the formats it renders
         // into, and the child renders into its target rather than onto the screen. They happen to
@@ -271,6 +273,7 @@ fn draw(
             0,
             plans.get(&passes::SAMPLES).ok_or("no parent plan")?,
             Blend::Alpha,
+            pipelines::Depth::TestOnly,
         );
         let pipeline = cache
             .pipeline(gpu, &key, &raster_bindings, &words, screen.targets)
@@ -423,6 +426,8 @@ fn pass(
                 joiner: host.joiner(),
                 partition,
                 view,
+                depth: None,
+                size: (attach.width, attach.height),
             },
             &|_| Some(program),
         )

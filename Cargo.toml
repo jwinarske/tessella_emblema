@@ -92,3 +92,7 @@ harness = false
 [[bench]]
 name = "two_passes"
 harness = false
+
+[[bench]]
+name = "overdraw_cost"
+harness = false

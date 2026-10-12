@@ -25,7 +25,32 @@ use tessella_capture_abi::generated::mbgl_enums::{
 /// A view drawing fill-extrusions needs depth: the opaque pass resolves front-to-back and the
 /// extrusion's own prepass decides which surface is nearest. A view with none still needs stencil,
 /// for the per-tile clip masks, and can take a stencil-only format where the device has one —
-/// which is a smaller attachment and, on a tiler, less to write back.
+/// which is a smaller attachment.
+///
+/// # What the saving is, and is not, measured to be
+///
+/// This said "and, on a tiler, less to write back". That is still the reason the distinction
+/// exists, and it is unverified on any tiler this runs on — `examples/device-report.rs` asked four
+/// GPUs what the two attachments resolve to:
+///
+/// | device | `StencilOnly` | `DepthStencil` |
+/// |---|---|---|
+/// | RADV, Ryzen 9 iGPU | `S8_UINT` | `D32_SFLOAT_S8_UINT` |
+/// | llvmpipe | `S8_UINT` | `D24_UNORM_S8_UINT` |
+/// | Adreno 640, SA8155P | `S8_UINT` | `D24_UNORM_S8_UINT` |
+/// | **V3D 7.1.7.0, Pi 5** | `D24_UNORM_S8_UINT` | `D24_UNORM_S8_UINT` |
+///
+/// Three of the four give a smaller attachment, so the mechanism is real. **The one tiler does
+/// not** — V3D offers no `S8_UINT` at all, so a flat view there already carries depth and this
+/// saves nothing. The claim is about tilers and the only tiler here cannot exercise it.
+///
+/// Where the difference does exist and the pass can run, it measures the wrong way:
+/// `benches/overdraw_cost.rs`'s zero-layer rows put the stencil-only attachment about **12 µs a
+/// frame dearer** than the packed one on RADV, over 1024 by 1024 — 22.8 against 10.6. One device,
+/// one scene, and the opposite sign to the reason for the knob.
+///
+/// Kept rather than retired, because the caller chooses it and three devices do give a smaller
+/// attachment. What is removed is the claim that this is known to be cheaper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attachment {
     /// Depth and stencil, which is every view that draws an extrusion.
@@ -166,6 +191,10 @@ const DEPTH_STENCIL: [vk::Format; 2] = [
 /// `S8_UINT` is optional in Vulkan and plenty of devices lack it, so this falls back to the
 /// depth-stencil list rather than failing — an attachment with unused depth costs memory and
 /// bandwidth, not correctness.
+///
+/// "Plenty of devices lack it" is not hypothetical and the one that matters most is among them:
+/// V3D 7.1.7.0 has no `S8_UINT`, so every view on the gating target takes the fallback. See
+/// [`Attachment`] for the four devices asked and what each answered.
 const STENCIL_ONLY: [vk::Format; 1] = [vk::Format::S8_UINT];
 
 /// Picks the depth-stencil format for a view's pass.

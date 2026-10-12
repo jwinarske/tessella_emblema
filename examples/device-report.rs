@@ -15,6 +15,13 @@
 //! and whether dynamic rendering is there as Vulkan 1.3 core or through
 //! `VK_KHR_dynamic_rendering`. The pass requires it, which `device::check_dynamic_rendering` is
 //! the library's half of.
+//!
+//! Then what each [`Attachment`] resolves to, which is the question `Attachment::StencilOnly`
+//! turns on. Its own note says a stencil-only format is "a smaller attachment and, on a tiler,
+//! less to write back" -- so the two have to resolve to *different* formats for it to save
+//! anything, and on a device offering no `S8_UINT` it is inert. `benches/overdraw_cost.rs` prices
+//! the difference where there is one; this says whether there is one at all, on any device,
+//! without creating one.
 
 // A probe is a program, and it reports by printing.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -22,6 +29,7 @@
 use std::ffi::CStr;
 
 use ash::vk;
+use tessella_emblema::device::{self, Attachment};
 
 /// Reads a `VkPhysicalDeviceProperties`-style name array as a string.
 ///
@@ -87,6 +95,25 @@ fn main() {
                 (false, false) => "NO -- this crate's pass cannot run here",
             }
         );
+
+        // The library's own resolver, handed this device's `optimalTilingFeatures`. Asking it
+        // rather than reimplementing the preference order is the point: what is reported is what a
+        // view would actually be given.
+        let features = |format| {
+            // SAFETY: the handle came from this instance.
+            unsafe { instance.get_physical_device_format_properties(physical, format) }
+                .optimal_tiling_features
+        };
+        let flat = device::depth_stencil_format(Attachment::StencilOnly, features);
+        let deep = device::depth_stencil_format(Attachment::DepthStencil, features);
+        print!("    stencil-only -> {flat:?}, depth-stencil -> {deep:?}   ");
+        match (flat, deep) {
+            (Ok(a), Ok(b)) if a == b => {
+                println!("the same, so StencilOnly saves nothing here");
+            }
+            (Ok(_), Ok(_)) => println!("different, so StencilOnly has something to save"),
+            _ => println!("one of them has no format at all"),
+        }
     }
 
     // SAFETY: nothing was created from it.

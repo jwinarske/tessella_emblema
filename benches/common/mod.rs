@@ -139,10 +139,17 @@ impl Open {
             .queue_family_index(family)
             .queue_priorities(&priorities)];
         // Dynamic rendering, which the pass requires rather than prefers -- see
-        // `device::check_dynamic_rendering`. Core in Vulkan 1.3 and reported by every part this runs
-        // on, but a feature still has to be *enabled* at device creation to be used, and a pipeline
-        // chaining `VkPipelineRenderingCreateInfo` without it is invalid usage that a driver need
-        // not report.
+        // `device::check_dynamic_rendering`. Core in Vulkan 1.3, and a feature still has to be
+        // *enabled* at device creation to be used: a pipeline chaining
+        // `VkPipelineRenderingCreateInfo` without it is invalid usage that a driver need not
+        // report.
+        //
+        // Not reported by every part this runs on, which this comment claimed until it was asked.
+        // The Adreno 640 on the SA8155P reports api 1.1.128 and offers neither the 1.3 core
+        // feature nor `VK_KHR_dynamic_rendering`, so `create_device` fails there with "Requested
+        // feature is not available on this device" -- a message naming neither the feature nor the
+        // device. `examples/device-report.rs` is what answers that, and #85 records what it means
+        // for that board.
         let mut thirteen = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
         // SAFETY: the info is fully initialized and names a family this device reported.
         let device = unsafe {

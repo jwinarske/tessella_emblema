@@ -68,12 +68,12 @@ The shader half is done; the frame half is not started.
 What is here: eighteen shader families, transcribed from `include/mbgl/shaders/vulkan/*.hpp` —
 the Vulkan backend's text, which is what the ABI's tables are generated from and which differs
 from the GL shaders in places that matter. Each is assembled against one of four surfaces, giving
-57 modules that compile to SPIR-V. Plus the uniform-block declarations generated from the same
+61 modules that compile to SPIR-V. Plus the uniform-block declarations generated from the same
 tables, the permutation mechanism, and the device-side decisions that can be made without a GPU.
 
 How that is checked, in two ways, because reading a shader cannot catch what reading cannot see:
 
-- `tests/shaders.rs` assembles all 57 pairs, compiles each, and pins the decisions that are
+- `tests/shaders.rs` assembles all 61 pairs, compiles each, and pins the decisions that are
   silent when wrong — a wrong one of those still draws, which is why they are pinned.
 - `benches/first_pixel.rs` runs them. Twenty-one cases pick inputs that make one pixel
   predictable, derive it from mbgl's arithmetic by hand, draw, and read it back. A bench rather

@@ -728,6 +728,52 @@ fn the_fill_outline_keeps_its_feather() {
     );
 }
 
+/// The triangulated outline keeps the width mbgl gives it and the scale its vertices are packed at.
+///
+/// Both are constants in the shader rather than anything the producer sends, so both are silent
+/// when wrong: a ring still draws, at the wrong weight or the wrong distance from the polygon's
+/// edge. `u_width` is the literal `1.0` in mbgl -- an outline has no width property -- and the
+/// extrusion is a byte pair over sixty-three, which is the line layer's packing because these are
+/// the line layer's vertices.
+///
+/// The color is the layer's `outline_color`. Reading `color` instead compiles, validates, and
+/// draws the ring in the fill's own color, which on most styles is a plausible outline.
+#[test]
+fn the_triangulated_outline_keeps_its_width_and_its_scale() {
+    let outline = ALL
+        .iter()
+        .into_iter()
+        .find(|family| family.name == "fill_outline_triangulated")
+        .expect("the triangulated outline is in the matrix");
+    let source = module(
+        Surface::Plane,
+        outline.blocks,
+        outline.attributes,
+        outline.textures,
+        outline.body,
+    )
+    .expect("assembles");
+
+    assert!(
+        source.contains("let halfwidth = 0.5;")
+            && source.contains("let outset = halfwidth + antialiasing;"),
+        "the outline is not a pixel wide with the fade outside it:\n{source}"
+    );
+    assert!(
+        source.contains("let dist = outset * extrude / 63.0;")
+            && source.contains("displace(center, dist / ratio, drawable.matrix)"),
+        "the extrusion is not unpacked at the line layer's scale, or is not divided by the ratio"
+    );
+    assert!(
+        source.contains("normal.y = normal.y * 2.0 - 1.0;"),
+        "the normal's y is not remapped to the two directions"
+    );
+    assert!(
+        source.contains("props.outline_color * (alpha * props.opacity)"),
+        "the ring is not drawn in the layer's outline color"
+    );
+}
+
 /// The color relief pins a tile that covers a pole rather than sampling off the DEM.
 ///
 /// The sentinel is a `y` at the end of the signed short range, which is not a coordinate. Left
@@ -1148,7 +1194,7 @@ fn every_family_on_every_surface_compiles() {
         }
     }
     assert_eq!(
-        pairs, 57,
+        pairs, 61,
         "the matrix grew or shrank; look at the new pairs"
     );
 }
@@ -1310,6 +1356,10 @@ const UNREAD_COMPONENTS: &[(&str, &str, &str)] = &[
     // shader reads `.xy` and `.z` and stops; the GL one computes a `v_linesofar` its own fragment
     // stage then ignores.
     ("line", "line_data", "w"),
+    // The same two bytes, and this family reads neither: the distance along the line is the
+    // patterned variants' and `v_linesofar` is in the GL vertex stage with nothing in its fragment
+    // reading it. `.z` as well as `.w`, which `line` does read for the direction.
+    ("fill_outline_triangulated", "line_data", "zw"),
     // `tessella_skirt.y` is two bytes of padding the producer writes as zero. The flag is one
     // `i16` and the pair is declared `Short2` because Filament draws nothing at all from a single
     // short -- the same reason `encode_terrain` puts the ground's flag beside its position. See

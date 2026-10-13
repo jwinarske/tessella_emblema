@@ -2097,3 +2097,106 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
     return in.color * (alpha * in.opacity);
 }
 ";
+
+/// `FillOutlineTriangulatedShader`: a fill's outline as extruded quads rather than lines.
+///
+/// A fill's antialiasing *is* its outline -- `fill-antialias` turns it on -- and the triangles
+/// rasterize hard, so the only thing softening a polygon's boundary is the fade in this fragment.
+/// mbgl draws the outline one pixel wide with the fade outside it, which needs fragments further
+/// than half a pixel from the line's center; a line primitive generates none, so mbgl's
+/// `MLN_TRIANGULATE_FILL_OUTLINES` builds the ring out of the line layer's extruded quads instead
+/// and draws it through this shader. The producer picks that path, which is why this family exists
+/// here at all -- a capture of a real style names it twice a frame.
+///
+/// # Transcribed from the GL source, deliberately
+///
+/// `include/mbgl/shaders/gl/fill_outline_triangulated.hpp`, not the Vulkan one. mbgl's Vulkan
+/// version of this shader **cannot compile**: its `FillOutlineTriangulatedDrawableUBO` reads
+/// `float pad1,` with a comma, `float pad2` with no semicolon, and declares `pad1` twice, and it
+/// sizes the block at ninety-six bytes where `fill_layer_ubo.hpp` asserts eighty. It is dead code
+/// in that backend. The GL and Metal versions agree with the authoritative struct and with each
+/// other. See #111.
+///
+/// # No width property, and no data-driven paint
+///
+/// `u_width` is the literal `1.0` in mbgl -- an outline has no width of its own -- so the
+/// half-width is a half pixel and the quad is two across once the fade is added either side. The
+/// color is the layer's `outline_color` and the opacity its `opacity`, both read from the
+/// evaluated props rather than from an attribute: mbgl only takes this path when both are
+/// constant, and a per-feature color keeps the line-primitive path.
+///
+/// `v_linesofar` is in the GL vertex stage and read by nothing in its fragment, so it is not here.
+pub const FILL_OUTLINE_TRIANGULATED_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) normal: vec2<f32>,
+    @location(1) width: f32,
+    @location(2) gamma_scale: f32,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let drawable = fill_outline_triangulated_drawable_ubo[ubo_index];
+    let global = global_paint_params_ubo[0];
+    var out: Out;
+
+    // The distance the edge fades out over: half a device pixel each side. A denser display needs
+    // a narrower fade, which is why mbgl divides by the ratio rather than fixing one pixel.
+    let antialiasing = 1.0 / max(global.pixel_ratio, 1e-6) / 2.0;
+
+    // The normal is the low bit of each component; the center is what is left. Identical to the
+    // line family's unpacking, because this is the line family's vertex data.
+    let packed = vec2<f32>(in.line_pos_normal);
+    let center = floor(packed * 0.5);
+    var normal = packed - 2.0 * center;
+    normal.y = normal.y * 2.0 - 1.0;
+
+    // Four unnormalized bytes; the first two are the extrusion, biased by 128. The third and
+    // fourth carry the distance along the line, which this shader does not read -- taken as
+    // `.xy` rather than converting the whole vector and swizzling, so that
+    // `every_component_of_an_attribute_is_read` sees the two that are left and demands the
+    // sanction, instead of reading the bare use as all four.
+    let extrude = vec2<f32>(in.line_data.xy) - 128.0;
+
+    // mbgl's `u_width = 1.0`, so a half pixel each side plus the fade outside it.
+    let halfwidth = 0.5;
+    let outset = halfwidth + antialiasing;
+
+    // The extrusion down to a unit normal -- mbgl's `scale` is one over sixty-three -- and back up
+    // by this vertex's width.
+    let dist = outset * extrude / 63.0;
+    let ratio = max(drawable.ratio, 1e-6);
+
+    // Placed and extruded separately, because the projected extrusion's own length is what says
+    // how much perspective squashed this edge. `displace` is the surface's: the extrusion is
+    // linear on a plane and is not on a sphere, which is what lets this family draw on all four.
+    let projected_extrude = displace(center, dist / ratio, drawable.matrix);
+    let clip = place(vec3<f32>(center, 0.0), drawable.matrix) + projected_extrude;
+    out.clip = clip;
+
+    // How much the perspective view squashed or stretched the extrusion, which is what keeps the
+    // fade a constant width in pixels. Guarded where mbgl's is not: a zero-length extrusion is
+    // 0/0 there and NaNs a whole ring away, as `LINE_BODY` records for the same division.
+    let unprojected = length(dist);
+    let projected = length(projected_extrude.xy / clip.w * global.units_to_pixels);
+    out.gamma_scale = unprojected / max(projected, 1e-6);
+
+    out.normal = normal;
+    out.width = outset;
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    let props = fill_evaluated_props_ubo[0];
+
+    // How far this pixel is from the center of the ring, in pixels, and the fade across the outer
+    // edge. `dist + blur2` is the inner edge of a line with no gap, which never bites.
+    let distance = length(in.normal) * in.width;
+    let blur2 = (1.0 / max(global_paint_params_ubo[0].pixel_ratio, 1e-6)) * in.gamma_scale;
+    let alpha = clamp(min(distance + blur2, in.width - distance) / blur2, 0.0, 1.0);
+
+    return props.outline_color * (alpha * props.opacity);
+}
+";

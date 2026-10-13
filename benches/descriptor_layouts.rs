@@ -13,7 +13,7 @@
 //! floor for `maxPerStageDescriptorStorageBuffers` is four**. A conformant device may be under what
 //! the shaders need, so the number is worth knowing per part rather than assumed.
 //!
-//! So this creates all 57 and then reports the headroom, which is the measurement a later family
+//! So this creates all 61 and then reports the headroom, which is the measurement a later family
 //! would spend.
 //!
 //! Run with `cargo bench --bench descriptor_layouts`.
@@ -49,13 +49,13 @@ fn every_pair() -> Vec<(String, Vec<pipelines::Binding>)> {
 /// Every pair's layout is created, and none is refused.
 fn every_layout_is_accepted(device: &Open) -> Result<(), String> {
     let pairs = every_pair();
-    if pairs.len() != 57 {
+    if pairs.len() != 61 {
         return Err(format!(
-            "{} pairs, which is not the 57 modules the crate assembles",
+            "{} pairs, which is not the 61 modules the crate assembles",
             pairs.len()
         ));
     }
-    // Held to the end rather than dropped per iteration, so the device is carrying all 57 at once --
+    // Held to the end rather than dropped per iteration, so the device is carrying all 61 at once --
     // which is the state a frame drawing every family would be in.
     let mut held = Vec::with_capacity(pairs.len());
     for (who, bindings) in &pairs {
@@ -69,7 +69,10 @@ fn every_layout_is_accepted(device: &Open) -> Result<(), String> {
         }
         held.push(layout);
     }
-    println!("  every layout          ok   57 set and pipeline layouts, all resident at once");
+    println!(
+        "  every layout          ok   {} set and pipeline layouts, all resident at once",
+        held.len()
+    );
     Ok(())
 }
 
@@ -154,6 +157,7 @@ fn headroom(device: &Open) -> Result<(), String> {
 /// trivia: a family gaining two more blocks would be over V3D's eight, and nothing would say so.
 fn every_set_is_within_the_limits(device: &Open) -> Result<(), String> {
     let limits = &device.limits;
+    let mut checked = 0usize;
     for (who, bindings) in every_pair() {
         for (kind, allowed) in [
             (
@@ -180,6 +184,7 @@ fn every_set_is_within_the_limits(device: &Open) -> Result<(), String> {
                 limits.max_per_stage_resources
             ));
         }
+        checked += 1;
     }
 
     // And the evidence that the check is needed rather than redundant: one past the limit, which
@@ -209,7 +214,7 @@ fn every_set_is_within_the_limits(device: &Open) -> Result<(), String> {
             )
         }
     };
-    println!("  within the limits     ok   57 sets checked; {verdict}");
+    println!("  within the limits     ok   {checked} sets checked; {verdict}");
     Ok(())
 }
 

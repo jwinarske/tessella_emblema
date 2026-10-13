@@ -37,9 +37,9 @@
 //!
 //! What it still does *not* do is draw. That wants a pipeline per batch and the recording itself,
 //! which is its own piece of work; this stops where every resource a draw would bind is on the
-//! device and reachable, and where every input to the pipeline's key is in hand -- the last of
-//! them being the blend, which the frame's background takes two different values of because it is
-//! batched once in each pass.
+//! device and reachable, and where every input to the pipeline's key is in hand -- the surface
+//! each program is placed on, read off the camera and the batches' own flags, and the blend, which
+//! the frame's background takes two different values of because it is batched once in each pass.
 
 // A bench is a program, and it reports by printing.
 #![allow(
@@ -52,12 +52,12 @@
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tessella_capture_abi::EnvelopeKind;
 use tessella_capture_abi::RenderPass;
 use tessella_capture_abi::capture;
-use tessella_capture_abi::envelope::ViewId;
+use tessella_capture_abi::envelope::{DrawFlags, ViewId};
 use tessella_capture_abi::ring::Ring;
 use tessella_consume::host::Host;
 use tessella_consume::slab::{self, Slab};
@@ -67,7 +67,7 @@ use tessella_emblema::descriptors::Sets;
 use tessella_emblema::pipelines::Blend;
 use tessella_emblema::store::Store;
 use tessella_emblema::surface::Surface;
-use tessella_emblema::{blocks, buffers, families, pipelines, vertices};
+use tessella_emblema::{blocks, buffers, families, pipelines, slots, vertices};
 
 use common::Open;
 
@@ -184,6 +184,35 @@ fn run(path: &str) -> Result<(), String> {
     let mut layers: Vec<i32> = programs.iter().map(|(_, layer)| *layer).collect();
     layers.sort_unstable();
     layers.dedup();
+
+    // And what each pair is *placed* on, which is per drawable rather than per view: a camera
+    // names one projection for the whole frame, and `ON_TERRAIN` is set per binding wherever a
+    // ground covers the drawable's own tile. So the flags are collected per pair -- and a pair
+    // whose batches disagree about them is a layer drawn on two surfaces, which binds two
+    // different shapes of descriptor set under one `(view, layer, shader)` key. The loop below
+    // reports such a pair rather than picking one of the two.
+    let projection = frame.camera.projection().ok_or_else(|| {
+        format!(
+            "the camera's projection is {}, which this build does not know",
+            frame.camera.projection
+        )
+    })?;
+    let mut flags: BTreeMap<(i32, i32), BTreeSet<u8>> = BTreeMap::new();
+    for batch in frame.batches.iter() {
+        flags
+            .entry((
+                batch.key.builtin_shader,
+                i32::try_from(batch.key.layer_index).unwrap_or(i32::MAX),
+            ))
+            .or_default()
+            .insert(batch.key.draw_flags);
+    }
+    let raised = frame
+        .batches
+        .iter()
+        .filter(|batch| batch.key.draw_flags & DrawFlags::ON_TERRAIN.bits() != 0)
+        .count();
+    let batches = frame.batches.len();
 
     // And how each batch composites, which is the last thing a draw needs that nothing on the wire
     // carries: mbgl writes a `ColorMode` per render layer, and `families::Composite` is that table.
@@ -340,16 +369,16 @@ fn run(path: &str) -> Result<(), String> {
         held.buffers()
     );
 
-    // Then a descriptor set per (layer, family), which is what `record::content` looks one up by.
-    //
-    // `Surface::Plane` for every one of them, and the capture says so rather than this bench
-    // assuming it: a bent or raised frame carries the surface's own blocks, and this one's uploads
-    // name slots 0, 2, 3, 4 and 5 and neither the globe bend's eleven nor the terrain block's 128.
-    // Which surface a view is drawn on is the consumer's decision from the camera, and making it
-    // is not this bench's business yet.
-    let surface = Surface::Plane;
+    // Then a descriptor set per (layer, family), which is what `record::content` looks one up by --
+    // each on the surface its own drawables ask for, derived here rather than assumed. The three
+    // inputs are the camera's projection, the batch's flags, and whether the layer holds a bend
+    // block; the first two came off the capture above and the third is a question for the blocks
+    // just brought up, which is why it is asked here and not there.
+    let bend_slot = tessella_capture_abi::globe_ubo::ID_GLOBE_BEND_UBO;
     let mut layouts = Vec::with_capacity(programs.len());
     let mut refused = Vec::new();
+    let mut placements: BTreeSet<Surface> = BTreeSet::new();
+    let mut placed = 0;
     for (shader, layer) in &programs {
         let Some(family) = families::for_wire(*shader) else {
             refused.push(format!("shader {shader} has no family here"));
@@ -363,11 +392,46 @@ fn run(path: &str) -> Result<(), String> {
             ));
             continue;
         }
+        let which = blocks::Which {
+            view,
+            layer: *layer,
+        };
+        let bend = held
+            .buffer(slots::held_at(which, bend_slot), bend_slot)
+            .is_some();
+        let mut asked: Vec<Surface> = flags
+            .get(&(*shader, *layer))
+            .into_iter()
+            .flatten()
+            .map(|flags| family.surface(Surface::of(projection, *flags, bend)))
+            .collect();
+        asked.sort_unstable();
+        asked.dedup();
+        let [surface] = asked[..] else {
+            refused.push(format!(
+                "{} on layer {layer} asks for {asked:?}, and a set is keyed by (view, layer, \
+                 shader) alone",
+                family.name
+            ));
+            continue;
+        };
+        placements.insert(surface);
+        placed += 1;
         let bindings = pipelines::bindings(family, surface);
         let layout = pipelines::layout(gpu, &bindings)
             .map_err(|why| format!("{} on {surface:?}: {why}", family.name))?;
         layouts.push((*shader, *layer, family.name, bindings, layout));
     }
+    println!(
+        "  the surfaces          ok   a {projection:?} camera, {raised} of {batches} batches \
+         raised, {placed} of {} programs placed, on {}",
+        programs.len(),
+        placements
+            .iter()
+            .map(|surface| format!("{surface:?}"))
+            .collect::<Vec<_>>()
+            .join(" and ")
+    );
 
     let widest = layouts
         .iter()

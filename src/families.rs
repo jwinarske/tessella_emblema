@@ -200,6 +200,29 @@ impl Family {
             }
         }
     }
+
+    /// Which of [`Self::surfaces`] a drawable asking for `asked` is drawn on.
+    ///
+    /// [`Surface::of`] reads the camera and the drawable and names a surface; this is the half
+    /// that knows whether this family has a module for it. Not every pair exists -- an extrusion
+    /// has no direct bend, and the two offscreen families have only a plane -- while the producer
+    /// marks a drawable raised whatever family draws it, so what is asked for is sometimes not one
+    /// of the sixty-three. Where it is not, [`Surface::fallback`]'s chain is walked until it is,
+    /// which is the picture `DrawFlags::ON_TERRAIN`'s own note promises.
+    #[must_use]
+    pub fn surface(&self, asked: Surface) -> Surface {
+        let mut at = Some(asked);
+        while let Some(surface) = at {
+            if self.surfaces.contains(&surface) {
+                return surface;
+            }
+            at = surface.fallback();
+        }
+        // Unreachable while every family declares a plane, which `tests/placement.rs` pins. A
+        // return rather than a panic: the flat module is what the chain above exists to reach, and
+        // it is the right end of it too.
+        Surface::Plane
+    }
 }
 
 /// The constant arm of a symbol family's property, which is not a field.

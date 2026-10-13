@@ -4,7 +4,7 @@
 //! Two decisions, taken in two places because they rest on different things. [`Surface::of`] reads
 //! the wire -- the view's `ProjectionMode`, the drawable's `ON_TERRAIN` bit, and whether its layer
 //! was sent a bend block -- and names the surface the *producer* asked for. `Family::surface` then
-//! narrows that to one this crate has a module for, because only sixty-three of the eighty
+//! narrows that to one this crate has a module for, because only sixty-five of the eighty
 //! (family, surface) pairs exist.
 //!
 //! Neither decision is observable in a pixel on its own: a surface shows up as *where* geometry
@@ -122,7 +122,7 @@ fn only_the_terrain_bit_raises_a_drawable() {
 ///
 /// The producer marks a drawable raised wherever a ground covers its tile, whatever family draws
 /// it, and sends a bend block for every layer whose geometry is a tile's. So a family is asked for
-/// pairs that are not among the sixty-three, and what it must never do is be handed one: a module
+/// pairs that are not among the sixty-five, and what it must never do is be handed one: a module
 /// is assembled per pair, and a pair with no module is a pipeline built against bindings nothing
 /// wrote.
 #[test]
@@ -205,15 +205,17 @@ fn the_fallback_chain_ends_at_a_plane() {
 /// The three above say the narrowing is *consistent*; this says what it costs, because every one
 /// of these is a picture rather than an error:
 ///
-/// * An extrusion has no raised module here, so a terrain style draws its buildings standing on
-///   the Mercator plane while the ground under them is lifted -- they sink into a hill and float
-///   over a valley. This is the one fallback that is a gap rather than a decision: the terrain
-///   placement adds its height to `position.z`, which is where an extrusion's own height already
-///   is, so the pair is a module and an oracle case rather than a design.
 /// * `color_relief` has no anchored bend, so a globe draws it through the direct one. That is the
 ///   same sphere by the arithmetic every zoom below the crossover uses.
 /// * The two offscreen families and the one that composites their target are drawn on a plane
 ///   whatever the camera does, which is not a loss: a target of one's own has no camera.
+/// * A background is drawn on a plane where its drawable is raised, because it covers the viewport
+///   rather than a tile and is never raised in the first place.
+///
+/// The extrusions used to be the fourth and are not any more: they had no raised module, so a
+/// terrain style drew its buildings on the Mercator plane while the ground under them lifted. That
+/// was a gap rather than a decision, and the pair exists now -- so what this names is what is left,
+/// and every one of them is a decision.
 #[test]
 fn a_missing_module_falls_where_the_producer_says() {
     let raised = Surface::of(
@@ -221,11 +223,12 @@ fn a_missing_module_falls_where_the_producer_says() {
         DrawFlags::ON_TERRAIN.bits(),
         false,
     );
+    // And the extrusions, from the other side: a raised drawable of one is drawn raised.
     for extrusion in ["fill_extrusion", "fill_extrusion_instanced"] {
         assert_eq!(
             named(extrusion).surface(raised),
-            Surface::Plane,
-            "{extrusion} is raised by something"
+            Surface::Terrain,
+            "{extrusion} stands on the plane under raised ground"
         );
     }
 

@@ -111,9 +111,13 @@ const UNANCHORED: &[Surface] = &[Surface::Plane, Surface::Globe, Surface::Terrai
 /// A plane alone, for a family that draws into its own offscreen target.
 const FLAT: &[Surface] = &[Surface::Plane];
 
-/// A plane and the anchored bend. An extrusion leaves the surface, and the direct bend has no
-/// height term, so it cannot be drawn on that one.
-const PLANE_OR_ANCHORED: &[Surface] = &[Surface::Plane, Surface::GlobeAnchored];
+/// Every surface that can lift a height, which is all of them but the direct bend.
+///
+/// An extrusion leaves the surface: its vertices carry a height in meters, and a placement that
+/// reads no `z` draws every building flat on the ground. [`Surface::Globe`] is the one that reads
+/// none -- lifting along a sphere's normal needs the `d_h` coefficient, which belongs to the
+/// anchored bend -- and `tests/shaders.rs` holds that rule from both sides.
+const LIFTS_A_HEIGHT: &[Surface] = &[Surface::Plane, Surface::GlobeAnchored, Surface::Terrain];
 
 /// One family's module parts.
 #[derive(Debug, Clone, Copy)]
@@ -207,7 +211,7 @@ impl Family {
     /// that knows whether this family has a module for it. Not every pair exists -- an extrusion
     /// has no direct bend, and the two offscreen families have only a plane -- while the producer
     /// marks a drawable raised whatever family draws it, so what is asked for is sometimes not one
-    /// of the sixty-three. Where it is not, [`Surface::fallback`]'s chain is walked until it is,
+    /// of the sixty-five. Where it is not, [`Surface::fallback`]'s chain is walked until it is,
     /// which is the picture `DrawFlags::ON_TERRAIN`'s own note promises.
     #[must_use]
     pub fn surface(&self, asked: Surface) -> Surface {
@@ -702,7 +706,7 @@ pub static ALL: &[Family] = &[
         textures: &[],
         properties: FILL_EXTRUSION_PAINT,
         body: FILL_EXTRUSION_BODY,
-        surfaces: PLANE_OR_ANCHORED,
+        surfaces: LIFTS_A_HEIGHT,
         height: true,
         composite: Composite::Fixed(Blend::Alpha),
     },
@@ -715,7 +719,7 @@ pub static ALL: &[Family] = &[
         textures: &[],
         properties: FILL_EXTRUSION_INSTANCED_PAINT,
         body: FILL_EXTRUSION_INSTANCED_BODY,
-        surfaces: PLANE_OR_ANCHORED,
+        surfaces: LIFTS_A_HEIGHT,
         height: true,
         composite: Composite::Fixed(Blend::Alpha),
     },

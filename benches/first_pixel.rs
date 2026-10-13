@@ -1232,6 +1232,100 @@ fn cases() -> Vec<Case> {
             instanced: None,
             expect: [255, 115, 12, 255],
         },
+        // The same roof standing on a DEM, which is the pair this crate did not have.
+        //
+        // An extrusion's own height and the ground's are the same component: the body hands
+        // `place` a height in meters and the raise adds the elevation to it, so what reaches the
+        // matrix is the sum. That is the whole of what this reads -- the shading is the case
+        // above's, number for number, so a difference here is a position and nothing else.
+        //
+        // The DEM is `fill_raised`'s, which puts the three vertices on texel centers and is where
+        // its own arithmetic is checked:
+        //
+        //   meters   = dot((r, g, 0), (1, 0.5, 0)) - 10        =  -10,  70,  10
+        //   ground   = (meters - a skirt of 20) * 0.01         = -0.30, 0.50, -0.10
+        //   building = 0.2 at every vertex
+        //   clip     = (0.2x + 3z, -(0.2y + 3z)) with z = ground + building
+        //
+        // Pixel (18, 2) is one of twenty-one the sum covers and five wrong answers do not: the
+        // building height dropped, the ground dropped -- which is this family's old behavior, the
+        // flat module on raised ground -- neither added, the exaggeration ignored, and the skirt
+        // not subtracted.
+        //
+        // The first of those was unreachable before this case. Every other raised drawable hands
+        // `place` a height of nought, so a raise that ignored `position.z` entirely drew every one
+        // of them correctly; measured, `fill_raised` and `raster_raised_skirt` both still pass
+        // under it. It sits 1.2 pixels inside the right triangle and 1.7 from the nearest
+        // wrong one, which came out of the same search `fill_raised` describes: a building height
+        // of 0.4 or 0.5 has *no* qualifying pixel, because the sum then lands where the ground
+        // alone does.
+        Case {
+            name: "fill_extrusion_raised",
+            at: (18, 2),
+            family: BuiltIn::FillExtrusionShader,
+            wire: RAISED,
+            layout: Layout::PerAttribute,
+            streams: vec![
+                shorts(&COVERING),
+                ushorts(&[0, 0, 0, 0, 0, 0]),
+                per_vertex(&packed_color([255, 64, 0, 255]), 3),
+                per_vertex(&[0.0, 0.0], 3),
+                per_vertex(&[0.2, 0.2], 3),
+            ],
+            uniforms: vec![
+                block(
+                    &FILL_EXTRUSION_DRAWABLE_UBO,
+                    &[
+                        // The third column is what makes a height visible, as `fill_raised` says:
+                        // a raised vertex moves sideways, which is what a real projection does.
+                        (
+                            "matrix",
+                            At::F(&[
+                                0.2, 0.0, 0.0, 0.0, //
+                                0.0, 0.2, 0.0, 0.0, //
+                                3.0, 3.0, 0.0, 0.0, //
+                                0.0, 0.0, 0.0, 1.0,
+                            ]),
+                        ),
+                        ("base_t", At::F(&[0.0])),
+                        ("height_t", At::F(&[0.0])),
+                        ("color_t", At::F(&[0.0])),
+                    ],
+                ),
+                block(
+                    &FILL_EXTRUSION_PROPS_UBO,
+                    &[
+                        ("light_color", At::F(&[1.0, 1.0, 1.0])),
+                        ("light_position", At::F(&[0.0, 0.0, 2.0])),
+                        ("light_intensity", At::F(&[1.0])),
+                        ("vertical_gradient", At::F(&[0.0])),
+                        ("opacity", At::F(&[1.0])),
+                    ],
+                ),
+                block(
+                    &TERRAIN_DRAWABLE_UBO,
+                    &[
+                        ("unpack", At::F(&[1.0, 0.5, 0.0, 10.0])),
+                        ("params", At::F(&[0.1, 0.3, 0.3, 0.01])),
+                        ("skirt", At::F(&[0.0, 20.0, 0.0, 0.0])),
+                    ],
+                ),
+            ],
+            images: vec![Image::new(4, |x, y| {
+                [
+                    u8::try_from(x * 40).unwrap_or(255),
+                    u8::try_from(y * 20).unwrap_or(255),
+                    0,
+                    255,
+                ]
+            })],
+            vertices: 3,
+            ubo_index: 0,
+            pass: None,
+            absent: &[],
+            instanced: None,
+            expect: [255, 115, 12, 255],
+        },
         // The same roof under a dim light at an angle, which is where the other half of the
         // shading shows. Above, the light is overhead and at full intensity, so the mix lands on
         // its upper end and the `max` that guards it never binds.
@@ -3676,7 +3770,7 @@ fn draw_case<'d>(
 
     // Where the vertices land, from the case's three wire inputs rather than named. `Surface::of`
     // is the producer's half -- the camera's projection, the drawable's flags, and whether its
-    // layer holds a bend block -- and `Family::surface` is this crate's, because only sixty-three
+    // layer holds a bend block -- and `Family::surface` is this crate's, because only sixty-five
     // of the pairs have a module. A frame loop makes those two calls and nothing else, so a rule
     // that answers wrongly shows up here as a pixel in the wrong place.
     let surface = found.surface(Surface::of(

@@ -54,7 +54,7 @@
 //!
 //! Two ways, because reading a shader cannot catch what reading cannot see.
 //!
-//! `tests/shaders.rs` assembles every (family, surface) pair — 63 of them — compiles each to
+//! `tests/shaders.rs` assembles every (family, surface) pair — 65 of them — compiles each to
 //! SPIR-V, and pins the decisions that are silent when wrong. A wrong one of those still draws,
 //! which is why they are pinned at all. It also assembles each pair with each paint property
 //! constant and with all of them constant, because every fixture here sends every attribute and

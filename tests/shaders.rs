@@ -956,8 +956,8 @@ fn the_instanced_family_takes_its_slot_from_a_push_constant() {
         }
     }
     assert_eq!(
-        seen, 2,
-        "the instanced extrusion on a plane and on the bend"
+        seen, 3,
+        "the instanced extrusion on a plane, on the bend and on a raised ground"
     );
 }
 
@@ -1133,7 +1133,7 @@ fn every_family_on_every_surface_compiles() {
         }
     }
     assert_eq!(
-        pairs, 63,
+        pairs, 65,
         "the matrix grew or shrank; look at the new pairs"
     );
 }
@@ -1197,7 +1197,7 @@ fn every_permutation_of_every_family_compiles() {
     // Not a round number and not worth deriving: it is the shape of the table, and a change to it
     // is a change worth looking at.
     assert_eq!(
-        modules, 191,
+        modules, 199,
         "the permutations grew or shrank; look at the new ones"
     );
 }

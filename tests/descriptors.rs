@@ -121,8 +121,8 @@ fn every_module_declares_what_the_layout_describes() {
         }
     }
     assert_eq!(
-        checked, 63,
-        "the crate assembles 63 modules; a different number here means the sweep drifted from \
+        checked, 65,
+        "the crate assembles 65 modules; a different number here means the sweep drifted from \
          what tests/shaders.rs compiles"
     );
 }
@@ -160,6 +160,11 @@ fn the_bindings_are_consecutive_from_zero() {
 ///
 /// The shape `shaders::module` writes. A sampler before its image, or an image with no sampler,
 /// would be a set the module cannot be built against.
+///
+/// Within group zero, which is the group that has both. Group one is a family's instance buffer
+/// and is one storage binding of its own -- so the rule read over the whole list said
+/// `fill_extrusion_instanced on Terrain has a block after a texture` as soon as an instanced family
+/// had a surface with a texture, which is a true statement about the list and not about any set.
 #[test]
 fn textures_follow_the_blocks_as_pairs() {
     for family in families::ALL {
@@ -167,7 +172,10 @@ fn textures_follow_the_blocks_as_pairs() {
             if !family.surfaces.contains(&surface) {
                 continue;
             }
-            let derived = pipelines::bindings(family, surface);
+            let derived: Vec<_> = pipelines::bindings(family, surface)
+                .into_iter()
+                .filter(|binding| binding.group == 0)
+                .collect();
             let blocks = derived
                 .iter()
                 .take_while(|b| b.kind == Kind::StorageBuffer)

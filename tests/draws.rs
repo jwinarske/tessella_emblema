@@ -66,13 +66,60 @@ fn no_instances_is_no_draws() {
     assert_eq!(got, [] as [Draw; 0]);
 }
 
+/// An instanced draw repeats every segment, and its slot has to be nought.
+///
+/// Both halves of one rule. `firstInstance` addresses the instance-rate attribute fetch as well as
+/// the builtin a body reads as `ubo_index`, so a slot there and more than one instance cannot both
+/// be meant -- `benches/instance_fetch.rs` measures it on a device. This asked for `slot` one with
+/// sixty-four instances and got draws, which is the shape the instanced wall family would have
+/// recorded: the instance stream read from element one, and sixty-three of the sixty-four bodies
+/// reading another drawable's uniforms.
 #[test]
 fn an_instanced_family_repeats_every_segment() {
-    let got = indexed(&[segment(0, 0, 4, 6), segment(4, 6, 4, 6)], 1, 64).expect("draws");
+    let run = [segment(0, 0, 4, 6), segment(4, 6, 4, 6)];
+    let got = indexed(&run, 0, 64).expect("draws");
     assert_eq!(got.len(), 2);
     for draw in &got {
         assert_eq!(draw.instance_count, 64);
+        assert_eq!(draw.first_instance, 0, "the slot cannot ride firstInstance");
     }
+
+    assert_eq!(
+        indexed(&run, 1, 64),
+        Err(Unusable::SlotWithInstances {
+            slot: 1,
+            instances: 64
+        }),
+        "a slot and more than one instance cannot share firstInstance"
+    );
+}
+
+/// One instance keeps the slot, which is every family drawn today.
+///
+/// The boundary, stated on its own: the refusal is about more than one instance and not about
+/// instancing as an idea, so the eighteen families that draw once go on carrying their slot.
+#[test]
+fn one_instance_still_carries_the_slot() {
+    let got = indexed(&[segment(0, 0, 4, 6)], 7, 1).expect("draws");
+    assert_eq!(got[0].first_instance, 7);
+
+    // Two is already too many, which is where the boundary is rather than at some larger count.
+    assert_eq!(
+        indexed(&[segment(0, 0, 4, 6)], 7, 2),
+        Err(Unusable::SlotWithInstances {
+            slot: 7,
+            instances: 2
+        })
+    );
+}
+
+/// A draw of no instances is not a disagreement, whatever the slot says.
+///
+/// Nothing is drawn, so the two numbers have nothing to be inconsistent about -- and refusing it
+/// would make a drawable whose geometry was clipped away an error rather than an empty draw.
+#[test]
+fn no_instances_with_a_slot_is_still_no_draws() {
+    assert_eq!(indexed(&[segment(0, 0, 4, 6)], 7, 0), Ok(Vec::new()));
 }
 
 /// The signed field is what the call takes, so an offset past its range is refused rather than

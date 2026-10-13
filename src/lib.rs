@@ -75,11 +75,14 @@
 //! attribute descriptors come to once they are checked against the family's own table. [`draws`]
 //! is the other end of the same drawable: its segments as the indexed draw parameters they
 //! become, including the slot that travels as `firstInstance` because the bodies read it as
-//! `ubo_index`. [`buffers`] is what those two come to on the device -- the distinct slab
-//! references behind a plan's bindings, which is fewer than the bindings whenever the producer
-//! interleaved a vertex. [`pipelines`] is what a cache of them is keyed by, which includes the
-//! vertex input state because a `VkPipeline` bakes that in -- two drawables of one family and
-//! permutation whose strides differ are two pipelines.
+//! `ubo_index` -- which it can do only while a draw is one instance. `firstInstance` also
+//! addresses an instance-rate attribute fetch, measured in `benches/instance_fetch.rs` with a
+//! per-vertex binding as the control, so a slot and more than one instance cannot share it and
+//! [`draws`] refuses the pair. [`buffers`] is what those two come to on the device -- the
+//! distinct slab references behind a plan's bindings, which is fewer than the bindings whenever
+//! the producer interleaved a vertex. [`pipelines`] is what a cache of them is keyed by, which
+//! includes the vertex input state because a `VkPipeline` bakes that in -- two drawables of one
+//! family and permutation whose strides differ are two pipelines.
 //!
 //! [`store`] is the first module that puts anything on a device -- and this crate still has no
 //! `unsafe` in it.

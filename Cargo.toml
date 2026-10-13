@@ -100,3 +100,7 @@ harness = false
 [[bench]]
 name = "capture_frame"
 harness = false
+
+[[bench]]
+name = "instance_fetch"
+harness = false

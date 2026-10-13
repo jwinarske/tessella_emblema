@@ -55,6 +55,10 @@ pub struct Program {
     ///
     /// One for everything but the instanced families, which bind a wall outline per instance. The
     /// caller knows which family a batch is; this does not need to.
+    ///
+    /// More than one and the batch's `ubo_indexes` must all be nought: `firstInstance` carries the
+    /// slot today and it also addresses the instance-rate attribute fetch, so the two cannot share
+    /// it. [`crate::draws::indexed`] refuses the pair rather than recording it.
     pub instances: u32,
 }
 

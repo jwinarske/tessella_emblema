@@ -117,7 +117,6 @@ use tessella_emblema::device::{self, Attachment, check_vertex_formats, vertex_fo
 use tessella_emblema::families::family;
 use tessella_emblema::images::Images;
 use tessella_emblema::pipelines::{Blend, Cache, Targets};
-use tessella_emblema::shaders::module;
 use tessella_emblema::store::Store;
 use tessella_emblema::surface::{GLOBE_BEND_UBO, GLOBE_CAMERA_UBO, Surface, TERRAIN_DRAWABLE_UBO};
 use tessella_emblema::target::{self, Depth, Host};
@@ -193,6 +192,16 @@ struct Case {
     /// attribute run at the instance rate, a group-one descriptor set over the buffer that run is
     /// read ahead in, and `ubo_index` in a push constant rather than in `firstInstance`.
     instanced: Option<Instanced>,
+    /// Locations the case deliberately sends no descriptor for, as `@location`s.
+    ///
+    /// Empty for all but the two constant cases. A data-driven paint property whose style value
+    /// does not vary arrives as *no attribute at all*, and the module then reads the layer's
+    /// evaluated value instead -- so a case that omits one is the only way to draw the arm the
+    /// real Berlin frame's circle layer takes for every property it has.
+    ///
+    /// The stream at such a location must be empty, which `descriptors_for` asks: `streams` stays
+    /// indexed by the table's order, so an omitted attribute still needs its place in the list.
+    absent: &'static [u32],
     /// Which entry of the blocks the draw reads, which the body receives as `ubo_index`.
     ///
     /// Zero for every case but one. `drawable_at_one` is the exception and the reason this is a
@@ -687,8 +696,60 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [0, 0, 255, 255],
+        },
+        // The same fill with both of its paint properties *constant*, which is a different module.
+        //
+        // A style whose `fill-color` is a plain color rather than an expression over a feature's
+        // fields sends no color attribute at all -- mbgl compiles the program with
+        // `HAS_UNIFORM_u_color` and reads the layer's evaluated value instead. So this case sends
+        // two empty streams, the plan reports two absent locations, and the module it selects
+        // declares neither in its input and reads both out of `FillEvaluatedPropsUBO`.
+        //
+        // Every fixture in this repository sent every attribute before this case, so the constant
+        // arm of every property in every family was unrun. The captured Berlin frame is almost all
+        // constant arms: its circle layer sends one attribute of eight.
+        //
+        // The props block's other fields are set, and set differently, because they are what this
+        // case's mutations reach for. Reading `outline_color` instead of `color` draws
+        // `[15, 31, 138, 153]`, `fade` instead of `opacity` draws `[57, 45, 19, 64]`, and
+        // `from_scale` instead of `opacity` draws `[92, 71, 31, 102]` -- all of them plausible
+        // pixels, none of them this one.
+        //
+        // `color_t` and `opacity_t` are deliberately left at zero. They are the factors the
+        // varying arm mixes by, and nothing here reads them: a module that mixed anyway would not
+        // compile, because the attributes it would mix are not in `In`.
+        Case {
+            name: "fill_constant",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillShader,
+            surface: Surface::Plane,
+            layout: Layout::PerAttribute,
+            // The two empty streams keep their place in the table's order, which is what
+            // `descriptors_for` indexes by.
+            streams: vec![shorts(&COVERING), Vec::new(), Vec::new()],
+            uniforms: vec![
+                block(&FILL_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
+                block(
+                    &FILL_EVALUATED_PROPS_UBO,
+                    &[
+                        ("color", At::F(&[0.9, 0.7, 0.3, 1.0])),
+                        ("outline_color", At::F(&[0.1, 0.2, 0.9, 1.0])),
+                        ("opacity", At::F(&[0.6])),
+                        ("fade", At::F(&[0.25])),
+                        ("from_scale", At::F(&[0.4])),
+                        ("to_scale", At::F(&[0.8])),
+                    ],
+                ),
+            ],
+            images: Vec::new(),
+            vertices: 3,
+            ubo_index: 0,
+            absent: &[1, 2],
+            instanced: None,
+            expect: [138, 107, 46, 153],
         },
         // The second entry of a drawable buffer, which is where the entry *stride* becomes visible.
         //
@@ -747,6 +808,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 1,
+            absent: &[],
             instanced: None,
             expect: [0, 0, 255, 255],
         },
@@ -773,6 +835,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [0, 0, 255, 255],
         },
@@ -821,6 +884,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [255, 255, 255, 255],
         },
@@ -881,6 +945,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [255, 115, 12, 255],
         },
@@ -933,6 +998,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [125, 125, 125, 255],
         },
@@ -1008,6 +1074,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 6,
+            absent: &[],
             instanced: Some(Instanced {
                 // Two points, and the second is flagged: it is the ring's closing point, which is
                 // what keeps the lookahead inside the buffer on a real frame. One instance is
@@ -1122,6 +1189,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 6,
+            absent: &[],
             instanced: Some(Instanced {
                 streams: vec![
                     outline(&[([2, 0], 0), ([-2, 0], 1)]),
@@ -1245,6 +1313,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [64, 32, 64, 64],
         },
@@ -1327,6 +1396,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [64, 32, 64, 64],
         },
@@ -1388,6 +1458,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [54, 37, 87, 255],
         },
@@ -1451,6 +1522,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [128, 64, 0, 128],
         },
@@ -1534,6 +1606,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [10, 90, 55, 128],
         },
@@ -1569,6 +1642,7 @@ fn cases() -> Vec<Case> {
             images: vec![glyph_atlas()],
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [200, 100, 50, 255],
         },
@@ -1605,6 +1679,7 @@ fn cases() -> Vec<Case> {
             images: vec![glyph_atlas()],
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [0, 0, 0, 0],
         },
@@ -1653,6 +1728,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [194, 144, 255, 255],
         },
@@ -1724,6 +1800,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [95, 47, 24, 118],
         },
@@ -1796,6 +1873,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 6,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [80, 255, 255, 255],
         },
@@ -1885,6 +1963,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [48, 24, 64, 64],
         },
@@ -1959,6 +2038,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [48, 24, 64, 64],
         },
@@ -2072,6 +2152,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 6,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [32, 16, 64, 64],
         },
@@ -2107,6 +2188,7 @@ fn cases() -> Vec<Case> {
             images: vec![sprite_sheet(16)],
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [40, 20, 64, 64],
         },
@@ -2137,6 +2219,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [40, 20, 64, 64],
         },
@@ -2166,6 +2249,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [100, 50, 25, 64],
         },
@@ -2258,6 +2342,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [0, 255, 255, 255],
         },
@@ -2319,6 +2404,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [255, 255, 0, 255],
         },
@@ -2402,6 +2488,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [255, 0, 255, 255],
         },
@@ -2494,6 +2581,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [32, 16, 64, 64],
         },
@@ -2545,8 +2633,83 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 6,
             ubo_index: 0,
+            absent: &[],
             instanced: None,
             expect: [0, 255, 0, 255],
+        },
+        // The widest permutation any family has: a circle with all seven of its paint properties
+        // constant, so its input is a position and nothing else.
+        //
+        // This is the permutation the captured Berlin frame's circle layer actually sends -- one
+        // attribute of eight -- and it is the case where a constant arm decides *geometry* rather
+        // than color. The radius is what the quad is extruded by, so a radius read from the wrong
+        // field shrinks the quad instead of recoloring it.
+        //
+        // The seven values are deliberately all different, because this case has seven mutations
+        // and they are each other's. Measured, each with the rest left alone:
+        //
+        // * `stroke_color` for `color` draws `[153, 0, 153, 153]`;
+        // * `stroke_opacity` for `opacity` draws `[13, 51, 29, 64]`;
+        // * `blur` for `radius` leaves a quad a thirtieth of the reach and the center fades to
+        //   `[1, 2, 1, 3]`;
+        // * `stroke_width` for `radius` leaves no quad at all and the pixel is the clear,
+        //   `[51, 102, 153, 255]`.
+        //
+        // `blur` is 0.3 rather than zero for that reason alone: it is the one of the three small
+        // values that has to differ from the others, and it does not reach the center, where the
+        // fade is one whatever it is.
+        Case {
+            name: "circle_constant",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::CircleShader,
+            surface: Surface::Plane,
+            layout: Layout::PerAttribute,
+            streams: vec![
+                shorts(&CORNERED_QUAD),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ],
+            uniforms: vec![
+                block(
+                    &CIRCLE_DRAWABLE_UBO,
+                    &[
+                        ("matrix", At::F(&CLIP)),
+                        ("extrude_scale", At::F(&[0.2, 0.2])),
+                    ],
+                ),
+                block(
+                    &CIRCLE_EVALUATED_PROPS_UBO,
+                    &[
+                        ("color", At::F(&[0.2, 0.8, 0.45, 1.0])),
+                        ("stroke_color", At::F(&[1.0, 0.0, 1.0, 1.0])),
+                        ("radius", At::F(&[10.0])),
+                        ("blur", At::F(&[0.3])),
+                        ("opacity", At::F(&[0.6])),
+                        ("stroke_width", At::F(&[0.0])),
+                        ("stroke_opacity", At::F(&[0.25])),
+                        ("scale_with_map", At::I(&[0])),
+                        ("pitch_with_map", At::I(&[0])),
+                    ],
+                ),
+                block(
+                    &GLOBAL_PAINT_PARAMS_UBO,
+                    &[
+                        ("pixel_ratio", At::F(&[1.0])),
+                        ("camera_to_center_distance", At::F(&[1.0])),
+                    ],
+                ),
+            ],
+            images: Vec::new(),
+            vertices: 6,
+            ubo_index: 0,
+            absent: &[1, 2, 3, 4, 5, 6, 7],
+            instanced: None,
+            expect: [31, 122, 69, 153],
         },
     ]
 }
@@ -2762,6 +2925,24 @@ fn descriptors_for(case: &Case, table: &[ShaderAttribute]) -> Result<Vec<Attribu
     let mut out = Vec::with_capacity(table.len());
     let mut at = 0u32;
     for (index, attribute) in table.iter().enumerate() {
+        if u32::try_from(attribute.binding).is_ok_and(|at| case.absent.contains(&at)) {
+            // Its place in `streams` stays, so the offsets of the attributes after it do not
+            // move, and it has to be empty: bytes at a location the case says it is not sending
+            // would be a stream nothing reads and an offset that no longer means what it says.
+            if case
+                .streams
+                .get(index)
+                .is_some_and(|stream| !stream.is_empty())
+            {
+                return Err(format!(
+                    "{}: location {} is absent and carries {} bytes",
+                    case.name,
+                    attribute.binding,
+                    case.streams[index].len()
+                ));
+            }
+            continue;
+        }
         let format = vertex_format(attribute.declared)
             .ok_or_else(|| format!("{} has no vertex format", attribute.name))?;
         let (source, offset, stride) = match case.layout {
@@ -2831,6 +3012,12 @@ fn resolve(case: &Case, reference: SlabRef) -> Option<&[u8]> {
             let mut found = None;
             for stream in &case.streams {
                 let length = u32::try_from(stream.len()).ok()?;
+                // An empty stream is an absent attribute keeping its place in the list. Skipped
+                // rather than matched: it sits at the same offset as whatever follows it, and
+                // matching first would hand that attribute no bytes.
+                if length == 0 {
+                    continue;
+                }
                 if at == reference.offset {
                     found = Some(stream.as_slice());
                     break;
@@ -2911,6 +3098,9 @@ fn instance_descriptors(
 
     let mut out = Vec::with_capacity(table.len());
     for (attribute, packed) in table.iter().zip(&instanced.packing) {
+        if u32::try_from(attribute.binding).is_ok_and(|at| case.absent.contains(&at)) {
+            continue;
+        }
         let source = *starts
             .get(packed.stream)
             .ok_or_else(|| format!("{}: no instance stream {}", case.name, packed.stream))?;
@@ -3121,18 +3311,10 @@ fn draw_case<'d>(
     let gpu = open.gpu();
     let found = family(case.family)
         .ok_or_else(|| format!("{}: {:?} is not a drawn family", case.name, case.family))?;
-    let source = module(
-        case.surface,
-        found.blocks,
-        found.attributes,
-        found.instance_attributes,
-        found.textures,
-        found.body,
-    )
-    .map_err(|why| format!("{} does not assemble: {why:?}", case.name))?;
-    let words = compile(&source).map_err(|why| format!("{}: {why}", case.name))?;
-
-    // The producer's records, then the plan a consumer makes of them, then the key that plan is.
+    // The producer's records first, then the plan a consumer makes of them -- because the plan is
+    // what says which module to assemble. A location no descriptor arrived for is left out of the
+    // vertex input and its property read from the layer's block instead, which is a different
+    // text; assembling before planning would build the whole family's module for every case.
     let descs = descriptors_for(case, found.attributes)?;
     let instance_descs = instance_descriptors(case, found.instance_attributes)?;
     let plan = vertices::plan_instanced(
@@ -3142,7 +3324,13 @@ fn draw_case<'d>(
         &instance_descs,
     )
     .map_err(|why| format!("{}: {why:?}", case.name))?;
-    let declares = found.attributes.len() + found.instance_attributes.len();
+    if plan.absent != case.absent {
+        return Err(format!(
+            "{}: the case omits {:?} and the plan finds {:?} absent",
+            case.name, case.absent, plan.absent
+        ));
+    }
+    let declares = found.attributes.len() + found.instance_attributes.len() - case.absent.len();
     if plan.bound.len() != declares {
         return Err(format!(
             "{}: {} of {declares} attributes planned",
@@ -3150,6 +3338,11 @@ fn draw_case<'d>(
             plan.bound.len(),
         ));
     }
+
+    let source = found
+        .module(case.surface, &plan.absent)
+        .map_err(|why| format!("{} does not assemble: {why:?}", case.name))?;
+    let words = compile(&source).map_err(|why| format!("{}: {why}", case.name))?;
     // A device that will not take one of these in a vertex buffer binds the attribute anyway and
     // the shader reads zero, so ask before building the pipeline rather than reading the silence as
     // a pixel. Per case, not once per device: a board missing one format can still run every family
@@ -3165,7 +3358,6 @@ fn draw_case<'d>(
     let key = pipelines::key(
         case.family,
         case.surface,
-        0,
         &plan,
         Blend::Unblended,
         pipelines::Depth::Write,

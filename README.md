@@ -57,9 +57,31 @@ naga 23 and pins the answer so it cannot go stale:
 That second point is the one that matters, and it is the opposite of what the plan feared. There
 is a constant to patch and a branch for it to steer, so the fallback works as written: substitute,
 then rewrite that `OpConstantFalse` into `OpSpecConstantFalse` with a `SpecId` decoration, and let
-the driver fold the branch and the dead arm at pipeline creation. One module per (family, surface),
-permutations as pipeline-creation arguments, nothing translated at run time, and no module-count
-explosion.
+the driver fold the branch and the dead arm at pipeline creation. `spec` does that.
+
+**And it is not what the permutation turned out to need.** A data-driven paint property that is
+constant for a layer does not arrive as a different *value*: it arrives as no vertex attribute at
+all, and the module reads the layer's evaluated block instead. That is three changes at once --
+which `@location`s the input declares, where the value comes from, and for the symbol families
+which of two block fields it is -- and a specialization constant can only fold the branch. It
+cannot remove an input declaration. `tests/naga_overrides.rs`'s own miniature shader shows it:
+`@location(0) attribute_color` is declared whichever way its switch folds.
+
+Vulkan asks that every input a vertex stage declares have a `VkVertexInputAttributeDescription`
+behind it, and no driver has to enforce that -- `benches/pipelines_build.rs` measures both
+directions of the disagreement, and on RADV a module input with no description **builds**, so the
+fetch is from nowhere. Which is the argument rather than against it: the failure mode of leaving
+the declaration in is a pipeline that compiles and reads whatever the fetch returns.
+
+So the folding happens before the module exists, which is what mbgl's Vulkan backend does -- it
+compiles a program per `propertiesAsUniforms` set. `shaders::module` takes the absent locations,
+leaves them out of the input, and emits each property as a one-line function reading whichever arm
+that leaves; `pipelines::Key::permutation` is a bitmask over those locations and the module cache
+keys on it.
+
+The module-count explosion the plan feared does not happen, because a permutation is a property of
+a *style's layer* rather than of a drawable. Measured on the captured Berlin frame: 19 geometries
+in 28 drawables across 7 families need **7 modules**, one per family.
 
 ## Status
 
@@ -75,7 +97,7 @@ How that is checked, in two ways, because reading a shader cannot catch what rea
 
 - `tests/shaders.rs` assembles all 63 pairs, compiles each, and pins the decisions that are
   silent when wrong — a wrong one of those still draws, which is why they are pinned.
-- `benches/first_pixel.rs` runs them. Twenty-nine cases pick inputs that make one pixel
+- `benches/first_pixel.rs` runs them. Thirty-one cases pick inputs that make one pixel
   predictable, derive it from mbgl's arithmetic by hand, draw, and read it back. A bench rather
   than a test because it needs a GPU and CI has none. It picks a device external first, then
   internal, then software.

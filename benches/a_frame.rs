@@ -54,7 +54,7 @@ use tessella_emblema::store::Store;
 use tessella_emblema::surface::Surface;
 use tessella_emblema::target::{self, Depth, Host as Host_};
 use tessella_emblema::{
-    blocks, buffers, descriptors, families, masks, pipelines, record, shaders, vertices,
+    blocks, buffers, descriptors, families, masks, pipelines, record, vertices,
 };
 use tessella_vk::{Buffer, Image, ImageView, Memory, Recorder};
 
@@ -453,20 +453,13 @@ fn draw(
 
     let program = {
         let words = compile(
-            &shaders::module(
-                Surface::Plane,
-                fill.blocks,
-                fill.attributes,
-                fill.instance_attributes,
-                fill.textures,
-                fill.body,
-            )
-            .map_err(|why| format!("the fill does not assemble: {why:?}"))?,
+            &fill
+                .module(Surface::Plane, &[])
+                .map_err(|why| format!("the fill does not assemble: {why:?}"))?,
         )?;
         let key = pipelines::key(
             BuiltIn::FillShader,
             Surface::Plane,
-            0,
             plans
                 .get(&frame::GEOMETRIES[0])
                 .ok_or("the first geometry has no plan")?,
@@ -511,20 +504,13 @@ fn draw(
     // to a raster's vertex layout, which `vkCreateGraphicsPipelines` would not have built at all.
     let raster_program = {
         let words = compile(
-            &shaders::module(
-                Surface::Plane,
-                raster.blocks,
-                raster.attributes,
-                raster.instance_attributes,
-                raster.textures,
-                raster.body,
-            )
-            .map_err(|why| format!("the raster does not assemble: {why:?}"))?,
+            &raster
+                .module(Surface::Plane, &[])
+                .map_err(|why| format!("the raster does not assemble: {why:?}"))?,
         )?;
         let key = pipelines::key(
             BuiltIn::RasterShader,
             Surface::Plane,
-            0,
             plans
                 .get(&frame::SAMPLER)
                 .ok_or("the sampling geometry has no plan")?,

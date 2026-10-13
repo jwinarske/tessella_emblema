@@ -50,9 +50,7 @@ use tessella_emblema::record::Program;
 use tessella_emblema::store::Store;
 use tessella_emblema::surface::Surface;
 use tessella_emblema::target::{self, Depth, Host as Attach};
-use tessella_emblema::{
-    blocks, buffers, descriptors, families, pipelines, record, shaders, vertices,
-};
+use tessella_emblema::{blocks, buffers, descriptors, families, pipelines, record, vertices};
 use tessella_vk::{Buffer, Image, ImageView, Memory, Recorder};
 
 use common::Open;
@@ -235,7 +233,6 @@ fn draw(
         let key = pipelines::key(
             BuiltIn::FillShader,
             Surface::Plane,
-            0,
             plans.get(&passes::DRAWN).ok_or("the child has no plan")?,
             Blend::Alpha,
             // Both views draw in the translucent pass, so neither writes depth.
@@ -271,7 +268,6 @@ fn draw(
         let key = pipelines::key(
             BuiltIn::RasterShader,
             Surface::Plane,
-            0,
             plans.get(&passes::SAMPLES).ok_or("no parent plan")?,
             Blend::Alpha,
             pipelines::Depth::TestOnly,
@@ -619,15 +615,9 @@ fn stage<'d>(
 
 /// One family's module, compiled.
 fn compile_family(family: &families::Family) -> Result<Vec<u32>, String> {
-    let source = shaders::module(
-        Surface::Plane,
-        family.blocks,
-        family.attributes,
-        family.instance_attributes,
-        family.textures,
-        family.body,
-    )
-    .map_err(|why| format!("{} does not assemble: {why:?}", family.name))?;
+    let source = family
+        .module(Surface::Plane, &[])
+        .map_err(|why| format!("{} does not assemble: {why:?}", family.name))?;
     let parsed = naga::front::wgsl::parse_str(&source)
         .map_err(|why| format!("wgsl: {}", why.emit_to_string(&source)))?;
     let info = naga::valid::Validator::new(

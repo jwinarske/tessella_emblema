@@ -38,9 +38,17 @@
 //! become the few contiguous ranges §11.7 asks for rather than a whole-buffer rewrite.
 //!
 //! And [`spec`], which turns a shader's permutation switches back into specialization constants
-//! after naga has resolved them away. That is the whole of what stands between one module per
-//! (family, surface) and one module per permutation — see `tests/naga_overrides.rs` for why it is
-//! needed and `spec` for what it does.
+//! after naga has resolved them away — see `tests/naga_overrides.rs` for the two facts it exists
+//! between. It is not what the paint permutation needed, and [`spec`]'s own doc says why: a
+//! constant paint property is an *interface* change rather than a branch, so the folding happens
+//! before the module exists.
+//!
+//! The permutation itself is [`shaders::Property`] and [`shaders::Paint`]. A data-driven property
+//! arrives as an attribute where the style's value varies and as no attribute at all where it does
+//! not, so a family has one module per set of its properties that arrived --
+//! [`pipelines::Key::permutation`] is the bitmask of the ones that did not, and the module cache
+//! keys on it. One per family per style in practice: the captured Berlin frame's 28 drawables need
+//! seven modules.
 //!
 //! # How the shaders are checked
 //!
@@ -48,9 +56,15 @@
 //!
 //! `tests/shaders.rs` assembles every (family, surface) pair — 63 of them — compiles each to
 //! SPIR-V, and pins the decisions that are silent when wrong. A wrong one of those still draws,
-//! which is why they are pinned at all.
+//! which is why they are pinned at all. It also assembles each pair with each paint property
+//! constant and with all of them constant, because every fixture here sends every attribute and
+//! a real style sends almost none.
 //!
-//! `benches/first_pixel.rs` *runs* them. Twenty-nine cases pick inputs that make one pixel
+//! `tests/properties.rs` is the other half of that: the paint table against the generated tables,
+//! which is where a data-driven attribute with no entry and a body reading one directly are
+//! caught. Neither fails on its own until a drawable arrives without that attribute.
+//!
+//! `benches/first_pixel.rs` *runs* them. Thirty-one cases pick inputs that make one pixel
 //! predictable, derive that pixel from mbgl's own arithmetic by hand, draw, and read it back. It
 //! is a bench rather than a test because it needs a GPU and CI has none; it has caught defects
 //! the pins could not, including a feather mirrored by a coordinate flip naga applies after a

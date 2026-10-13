@@ -47,11 +47,11 @@ use tessella_capture_abi::generated::ubo_layouts::{
 };
 
 use crate::shaders::{
-    BACKGROUND_BODY, BACKGROUND_PATTERN_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY,
+    self, BACKGROUND_BODY, BACKGROUND_PATTERN_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY,
     FILL_EXTRUSION_BODY, FILL_EXTRUSION_INSTANCED_BODY, FILL_OUTLINE_BODY,
     FILL_OUTLINE_TRIANGULATED_BODY, FILL_PATTERN_BODY, HEATMAP_BODY, HEATMAP_TEXTURE_BODY,
-    HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_BODY, LINE_PATTERN_BODY, RASTER_BODY,
-    SYMBOL_ICON_BODY, SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY,
+    HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_BODY, LINE_PATTERN_BODY, Paint, Property,
+    RASTER_BODY, SYMBOL_ICON_BODY, SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY,
 };
 use crate::surface::Surface;
 
@@ -100,6 +100,12 @@ pub struct Family {
     pub instance_attributes: &'static [ShaderAttribute],
     /// The texture table, which names the module's samplers.
     pub textures: &'static [ShaderTexture],
+    /// The data-driven paint properties, each of which the module declares as a `paint_<name>`
+    /// function reading whichever of its two arms the drawable's descriptors leave.
+    ///
+    /// Empty for a family whose every attribute is geometry, which is nine of the twenty. See
+    /// [`Property`] for why both arms are written out rather than derived from the names.
+    pub properties: &'static [Property],
     /// The hand-written body.
     pub body: &'static str,
     /// Which surfaces a module exists for.
@@ -107,6 +113,402 @@ pub struct Family {
     /// Whether the body hands `place` a height above the surface rather than zero.
     pub height: bool,
 }
+
+impl Family {
+    /// This family's WGSL module for a surface, with the attributes at `absent` left out.
+    ///
+    /// `absent` is [`crate::vertices::Plan::absent`] -- the locations no descriptor supplied -- and
+    /// an empty slice is the whole family. Which it is decides the module's text, so two
+    /// permutations of one family are two modules and [`crate::pipelines::Cache`] keys them apart.
+    ///
+    /// A shorthand rather than a layer: every field it passes is public, and the hand-assembled
+    /// cases in `tests/` call [`crate::shaders::module`] directly with parts no family has.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::shaders::Error`], as [`crate::shaders::module`].
+    pub fn module(&self, surface: Surface, absent: &[u32]) -> Result<String, shaders::Error> {
+        shaders::module(
+            surface,
+            self.blocks,
+            self.attributes,
+            self.instance_attributes,
+            self.textures,
+            &Paint {
+                properties: self.properties,
+                absent,
+            },
+            self.body,
+        )
+    }
+}
+
+/// The constant arm of a symbol family's property, which is not a field.
+///
+/// mbgl's three symbol shaders each read `tileProps.is_text ? props.text_opacity :
+/// props.icon_opacity`, because a symbol layer's evaluated properties carry both sets and which
+/// one applies is a property of the *tile* -- one layer draws text and icons from the same
+/// evaluated properties, and the tile props say which this drawable is.
+///
+/// These are the entries no derivation from a name could have produced, and the reason
+/// [`Property`] writes both arms out instead of deriving one.
+macro_rules! symbol_constant {
+    ($property:literal) => {
+        concat!(
+            "select(symbol_evaluated_props_ubo[0].icon_",
+            $property,
+            ", symbol_evaluated_props_ubo[0].text_",
+            $property,
+            ", symbol_tile_props_ubo[ubo_index].is_text != 0)"
+        )
+    };
+}
+
+/// `fill`'s two: a color and an opacity, which is mbgl's whole set for a plain fill.
+const FILL_PAINT: &[Property] = &[
+    Property {
+        location: 1,
+        name: "color",
+        returns: "vec4<f32>",
+        varies: "mix_color(in.fill_color, fill_drawable_ubo[ubo_index].color_t)",
+        constant: "fill_evaluated_props_ubo[0].color",
+    },
+    Property {
+        location: 2,
+        name: "opacity",
+        returns: "f32",
+        varies: "mix_value(in.fill_opacity, fill_drawable_ubo[ubo_index].opacity_t)",
+        constant: "fill_evaluated_props_ubo[0].opacity",
+    },
+];
+
+/// `fill_outline`'s two. The color is `outline_color` in both blocks and `fill_outline_color` as
+/// an attribute, so the name is written here rather than taken from either.
+const FILL_OUTLINE_PAINT: &[Property] = &[
+    Property {
+        location: 1,
+        name: "outline_color",
+        returns: "vec4<f32>",
+        varies: "mix_color(in.fill_outline_color, fill_outline_drawable_ubo[ubo_index].outline_color_t)",
+        constant: "fill_evaluated_props_ubo[0].outline_color",
+    },
+    Property {
+        location: 2,
+        name: "opacity",
+        returns: "f32",
+        varies: "mix_value(in.fill_opacity, fill_outline_drawable_ubo[ubo_index].opacity_t)",
+        constant: "fill_evaluated_props_ubo[0].opacity",
+    },
+];
+
+/// `fill_pattern`'s one. The pattern corners are attributes mbgl never makes uniform -- a
+/// sprite's place on the sheet is per tile, not per layer -- so the opacity is the whole set.
+const FILL_PATTERN_PAINT: &[Property] = &[Property {
+    location: 3,
+    name: "opacity",
+    returns: "f32",
+    varies: "mix_value(in.fill_opacity, fill_pattern_drawable_ubo[ubo_index].opacity_t)",
+    constant: "fill_evaluated_props_ubo[0].opacity",
+}];
+
+/// `fill_extrusion`'s three: the color, and the two heights a wall is extruded between.
+const FILL_EXTRUSION_PAINT: &[Property] = &[
+    Property {
+        location: 2,
+        name: "color",
+        returns: "vec4<f32>",
+        varies: "mix_color(in.fill_extrusion_color, fill_extrusion_drawable_ubo[ubo_index].color_t)",
+        constant: "fill_extrusion_props_ubo[0].color",
+    },
+    Property {
+        location: 3,
+        name: "base",
+        returns: "f32",
+        varies: "mix_value(in.fill_extrusion_base, fill_extrusion_drawable_ubo[ubo_index].base_t)",
+        constant: "fill_extrusion_props_ubo[0].base",
+    },
+    Property {
+        location: 4,
+        name: "height",
+        returns: "f32",
+        varies: "mix_value(in.fill_extrusion_height, fill_extrusion_drawable_ubo[ubo_index].height_t)",
+        constant: "fill_extrusion_props_ubo[0].height",
+    },
+];
+
+/// `fill_extrusion_instanced`'s three: the same properties as the plain walls, two locations
+/// higher, because the outline position and the packed decimals come before them in the
+/// instance table.
+const FILL_EXTRUSION_INSTANCED_PAINT: &[Property] = &[
+    Property {
+        location: 3,
+        name: "color",
+        returns: "vec4<f32>",
+        varies: "mix_color(in.fill_extrusion_color, fill_extrusion_drawable_ubo[ubo_index].color_t)",
+        constant: "fill_extrusion_props_ubo[0].color",
+    },
+    Property {
+        location: 4,
+        name: "base",
+        returns: "f32",
+        varies: "mix_value(in.fill_extrusion_base, fill_extrusion_drawable_ubo[ubo_index].base_t)",
+        constant: "fill_extrusion_props_ubo[0].base",
+    },
+    Property {
+        location: 5,
+        name: "height",
+        returns: "f32",
+        varies: "mix_value(in.fill_extrusion_height, fill_extrusion_drawable_ubo[ubo_index].height_t)",
+        constant: "fill_extrusion_props_ubo[0].height",
+    },
+];
+
+/// `line`'s six. `gapwidth` is one word in both blocks and two in the attribute, which is mbgl's
+/// spelling in each place and not a typo to tidy.
+const LINE_PAINT: &[Property] = &[
+    Property {
+        location: 2,
+        name: "color",
+        returns: "vec4<f32>",
+        varies: "mix_color(in.line_color, line_drawable_ubo[ubo_index].color_t)",
+        constant: "line_evaluated_props_ubo[0].color",
+    },
+    Property {
+        location: 3,
+        name: "blur",
+        returns: "f32",
+        varies: "mix_value(in.line_blur, line_drawable_ubo[ubo_index].blur_t)",
+        constant: "line_evaluated_props_ubo[0].blur",
+    },
+    Property {
+        location: 4,
+        name: "opacity",
+        returns: "f32",
+        varies: "mix_value(in.line_opacity, line_drawable_ubo[ubo_index].opacity_t)",
+        constant: "line_evaluated_props_ubo[0].opacity",
+    },
+    Property {
+        location: 5,
+        name: "gapwidth",
+        returns: "f32",
+        varies: "mix_value(in.line_gap_width, line_drawable_ubo[ubo_index].gapwidth_t)",
+        constant: "line_evaluated_props_ubo[0].gapwidth",
+    },
+    Property {
+        location: 6,
+        name: "offset",
+        returns: "f32",
+        varies: "mix_value(in.line_offset, line_drawable_ubo[ubo_index].offset_t)",
+        constant: "line_evaluated_props_ubo[0].offset",
+    },
+    Property {
+        location: 7,
+        name: "width",
+        returns: "f32",
+        varies: "mix_value(in.line_width, line_drawable_ubo[ubo_index].width_t)",
+        constant: "line_evaluated_props_ubo[0].width",
+    },
+];
+
+/// `line_pattern`'s five: [`LINE_PAINT`] without the color, which a patterned line has no block
+/// field for -- the sprite is the color.
+const LINE_PATTERN_PAINT: &[Property] = &[
+    Property {
+        location: 2,
+        name: "blur",
+        returns: "f32",
+        varies: "mix_value(in.line_blur, line_pattern_drawable_ubo[ubo_index].blur_t)",
+        constant: "line_evaluated_props_ubo[0].blur",
+    },
+    Property {
+        location: 3,
+        name: "opacity",
+        returns: "f32",
+        varies: "mix_value(in.line_opacity, line_pattern_drawable_ubo[ubo_index].opacity_t)",
+        constant: "line_evaluated_props_ubo[0].opacity",
+    },
+    Property {
+        location: 4,
+        name: "gapwidth",
+        returns: "f32",
+        varies: "mix_value(in.line_gap_width, line_pattern_drawable_ubo[ubo_index].gapwidth_t)",
+        constant: "line_evaluated_props_ubo[0].gapwidth",
+    },
+    Property {
+        location: 5,
+        name: "offset",
+        returns: "f32",
+        varies: "mix_value(in.line_offset, line_pattern_drawable_ubo[ubo_index].offset_t)",
+        constant: "line_evaluated_props_ubo[0].offset",
+    },
+    Property {
+        location: 6,
+        name: "width",
+        returns: "f32",
+        varies: "mix_value(in.line_width, line_pattern_drawable_ubo[ubo_index].width_t)",
+        constant: "line_evaluated_props_ubo[0].width",
+    },
+];
+
+/// `circle`'s seven, which is every attribute it declares but the position.
+const CIRCLE_PAINT: &[Property] = &[
+    Property {
+        location: 1,
+        name: "color",
+        returns: "vec4<f32>",
+        varies: "mix_color(in.circle_color, circle_drawable_ubo[ubo_index].color_t)",
+        constant: "circle_evaluated_props_ubo[0].color",
+    },
+    Property {
+        location: 2,
+        name: "radius",
+        returns: "f32",
+        varies: "mix_value(in.circle_radius, circle_drawable_ubo[ubo_index].radius_t)",
+        constant: "circle_evaluated_props_ubo[0].radius",
+    },
+    Property {
+        location: 3,
+        name: "blur",
+        returns: "f32",
+        varies: "mix_value(in.circle_blur, circle_drawable_ubo[ubo_index].blur_t)",
+        constant: "circle_evaluated_props_ubo[0].blur",
+    },
+    Property {
+        location: 4,
+        name: "opacity",
+        returns: "f32",
+        varies: "mix_value(in.circle_opacity, circle_drawable_ubo[ubo_index].opacity_t)",
+        constant: "circle_evaluated_props_ubo[0].opacity",
+    },
+    Property {
+        location: 5,
+        name: "stroke_color",
+        returns: "vec4<f32>",
+        varies: "mix_color(in.circle_stroke_color, circle_drawable_ubo[ubo_index].stroke_color_t)",
+        constant: "circle_evaluated_props_ubo[0].stroke_color",
+    },
+    Property {
+        location: 6,
+        name: "stroke_width",
+        returns: "f32",
+        varies: "mix_value(in.circle_stroke_width, circle_drawable_ubo[ubo_index].stroke_width_t)",
+        constant: "circle_evaluated_props_ubo[0].stroke_width",
+    },
+    Property {
+        location: 7,
+        name: "stroke_opacity",
+        returns: "f32",
+        varies: "mix_value(in.circle_stroke_opacity, circle_drawable_ubo[ubo_index].stroke_opacity_t)",
+        constant: "circle_evaluated_props_ubo[0].stroke_opacity",
+    },
+];
+
+/// `heatmap`'s two: a point's weight and its radius.
+const HEATMAP_PAINT: &[Property] = &[
+    Property {
+        location: 1,
+        name: "weight",
+        returns: "f32",
+        varies: "mix_value(in.heatmap_weight, heatmap_drawable_ubo[ubo_index].weight_t)",
+        constant: "heatmap_evaluated_props_ubo[0].weight",
+    },
+    Property {
+        location: 2,
+        name: "radius",
+        returns: "f32",
+        varies: "mix_value(in.heatmap_radius, heatmap_drawable_ubo[ubo_index].radius_t)",
+        constant: "heatmap_evaluated_props_ubo[0].radius",
+    },
+];
+
+/// `symbol_icon`'s one, through [`symbol_constant`].
+const SYMBOL_ICON_PAINT: &[Property] = &[Property {
+    location: 5,
+    name: "opacity",
+    returns: "f32",
+    varies: "mix_value(in.symbol_opacity, symbol_drawable_ubo[ubo_index].opacity_t)",
+    constant: symbol_constant!("opacity"),
+}];
+
+/// `symbol_sdf`'s five: the glyph's fill and halo colors, and the three scalars that shape the
+/// halo.
+const SYMBOL_SDF_PAINT: &[Property] = &[
+    Property {
+        location: 5,
+        name: "fill_color",
+        returns: "vec4<f32>",
+        varies: "mix_color(in.symbol_color, symbol_drawable_ubo[ubo_index].fill_color_t)",
+        constant: symbol_constant!("fill_color"),
+    },
+    Property {
+        location: 6,
+        name: "halo_color",
+        returns: "vec4<f32>",
+        varies: "mix_color(in.symbol_halo_color, symbol_drawable_ubo[ubo_index].halo_color_t)",
+        constant: symbol_constant!("halo_color"),
+    },
+    Property {
+        location: 7,
+        name: "opacity",
+        returns: "f32",
+        varies: "mix_value(in.symbol_opacity, symbol_drawable_ubo[ubo_index].opacity_t)",
+        constant: symbol_constant!("opacity"),
+    },
+    Property {
+        location: 8,
+        name: "halo_width",
+        returns: "f32",
+        varies: "mix_value(in.symbol_halo_width, symbol_drawable_ubo[ubo_index].halo_width_t)",
+        constant: symbol_constant!("halo_width"),
+    },
+    Property {
+        location: 9,
+        name: "halo_blur",
+        returns: "f32",
+        varies: "mix_value(in.symbol_halo_blur, symbol_drawable_ubo[ubo_index].halo_blur_t)",
+        constant: symbol_constant!("halo_blur"),
+    },
+];
+
+/// `symbol_text_and_icon`'s five: [`SYMBOL_SDF_PAINT`]'s properties, each one location lower.
+/// This family declares no pixel offset, so everything after it shifts down.
+const SYMBOL_TEXT_AND_ICON_PAINT: &[Property] = &[
+    Property {
+        location: 4,
+        name: "fill_color",
+        returns: "vec4<f32>",
+        varies: "mix_color(in.symbol_color, symbol_drawable_ubo[ubo_index].fill_color_t)",
+        constant: symbol_constant!("fill_color"),
+    },
+    Property {
+        location: 5,
+        name: "halo_color",
+        returns: "vec4<f32>",
+        varies: "mix_color(in.symbol_halo_color, symbol_drawable_ubo[ubo_index].halo_color_t)",
+        constant: symbol_constant!("halo_color"),
+    },
+    Property {
+        location: 6,
+        name: "opacity",
+        returns: "f32",
+        varies: "mix_value(in.symbol_opacity, symbol_drawable_ubo[ubo_index].opacity_t)",
+        constant: symbol_constant!("opacity"),
+    },
+    Property {
+        location: 7,
+        name: "halo_width",
+        returns: "f32",
+        varies: "mix_value(in.symbol_halo_width, symbol_drawable_ubo[ubo_index].halo_width_t)",
+        constant: symbol_constant!("halo_width"),
+    },
+    Property {
+        location: 8,
+        name: "halo_blur",
+        returns: "f32",
+        varies: "mix_value(in.symbol_halo_blur, symbol_drawable_ubo[ubo_index].halo_blur_t)",
+        constant: symbol_constant!("halo_blur"),
+    },
+];
 
 /// Every family this crate draws, in no particular order.
 pub static ALL: &[Family] = &[
@@ -117,6 +519,7 @@ pub static ALL: &[Family] = &[
         attributes: &BACKGROUND_SHADER,
         instance_attributes: &[],
         textures: &[],
+        properties: &[],
         body: BACKGROUND_BODY,
         surfaces: FLAT_OR_BENT,
         height: false,
@@ -132,6 +535,7 @@ pub static ALL: &[Family] = &[
         attributes: &BACKGROUND_PATTERN_SHADER,
         instance_attributes: &[],
         textures: &BACKGROUND_PATTERN_SHADER_TEXTURES,
+        properties: &[],
         body: BACKGROUND_PATTERN_BODY,
         surfaces: FLAT_OR_BENT,
         height: false,
@@ -143,6 +547,7 @@ pub static ALL: &[Family] = &[
         attributes: &FILL_SHADER,
         instance_attributes: &[],
         textures: &[],
+        properties: FILL_PAINT,
         body: FILL_BODY,
         surfaces: EVERY,
         height: false,
@@ -158,6 +563,7 @@ pub static ALL: &[Family] = &[
         attributes: &FILL_OUTLINE_SHADER,
         instance_attributes: &[],
         textures: &[],
+        properties: FILL_OUTLINE_PAINT,
         body: FILL_OUTLINE_BODY,
         surfaces: EVERY,
         height: false,
@@ -177,6 +583,7 @@ pub static ALL: &[Family] = &[
         attributes: &FILL_OUTLINE_TRIANGULATED_SHADER,
         instance_attributes: &[],
         textures: &[],
+        properties: &[],
         body: FILL_OUTLINE_TRIANGULATED_BODY,
         surfaces: EVERY,
         height: false,
@@ -193,6 +600,7 @@ pub static ALL: &[Family] = &[
         attributes: &FILL_PATTERN_SHADER,
         instance_attributes: &[],
         textures: &FILL_PATTERN_SHADER_TEXTURES,
+        properties: FILL_PATTERN_PAINT,
         body: FILL_PATTERN_BODY,
         surfaces: EVERY,
         height: false,
@@ -204,6 +612,7 @@ pub static ALL: &[Family] = &[
         attributes: &FILL_EXTRUSION_SHADER,
         instance_attributes: &[],
         textures: &[],
+        properties: FILL_EXTRUSION_PAINT,
         body: FILL_EXTRUSION_BODY,
         surfaces: PLANE_OR_ANCHORED,
         height: true,
@@ -215,6 +624,7 @@ pub static ALL: &[Family] = &[
         attributes: &FILL_EXTRUSION_INSTANCED_SHADER,
         instance_attributes: &FILL_EXTRUSION_INSTANCED_SHADER_INSTANCE,
         textures: &[],
+        properties: FILL_EXTRUSION_INSTANCED_PAINT,
         body: FILL_EXTRUSION_INSTANCED_BODY,
         surfaces: PLANE_OR_ANCHORED,
         height: true,
@@ -230,6 +640,7 @@ pub static ALL: &[Family] = &[
         attributes: &LINE_SHADER,
         instance_attributes: &[],
         textures: &[],
+        properties: LINE_PAINT,
         body: LINE_BODY,
         surfaces: EVERY,
         height: false,
@@ -246,6 +657,7 @@ pub static ALL: &[Family] = &[
         attributes: &LINE_PATTERN_SHADER,
         instance_attributes: &[],
         textures: &LINE_PATTERN_SHADER_TEXTURES,
+        properties: LINE_PATTERN_PAINT,
         body: LINE_PATTERN_BODY,
         surfaces: EVERY,
         height: false,
@@ -261,6 +673,7 @@ pub static ALL: &[Family] = &[
         attributes: &CIRCLE_SHADER,
         instance_attributes: &[],
         textures: &[],
+        properties: CIRCLE_PAINT,
         body: CIRCLE_BODY,
         surfaces: EVERY,
         height: false,
@@ -272,6 +685,7 @@ pub static ALL: &[Family] = &[
         attributes: &RASTER_SHADER,
         instance_attributes: &[],
         textures: &RASTER_SHADER_TEXTURES,
+        properties: &[],
         body: RASTER_BODY,
         surfaces: EVERY,
         height: false,
@@ -286,6 +700,7 @@ pub static ALL: &[Family] = &[
         attributes: &HILLSHADE_PREPARE_SHADER,
         instance_attributes: &[],
         textures: &HILLSHADE_PREPARE_SHADER_TEXTURES,
+        properties: &[],
         body: HILLSHADE_PREPARE_BODY,
         surfaces: FLAT,
         height: false,
@@ -301,6 +716,7 @@ pub static ALL: &[Family] = &[
         attributes: &HILLSHADE_SHADER,
         instance_attributes: &[],
         textures: &HILLSHADE_SHADER_TEXTURES,
+        properties: &[],
         body: HILLSHADE_BODY,
         surfaces: EVERY,
         height: false,
@@ -316,6 +732,7 @@ pub static ALL: &[Family] = &[
         attributes: &COLOR_RELIEF_SHADER,
         instance_attributes: &[],
         textures: &COLOR_RELIEF_SHADER_TEXTURES,
+        properties: &[],
         body: COLOR_RELIEF_BODY,
         surfaces: UNANCHORED,
         height: false,
@@ -327,6 +744,7 @@ pub static ALL: &[Family] = &[
         attributes: &HEATMAP_SHADER,
         instance_attributes: &[],
         textures: &[],
+        properties: HEATMAP_PAINT,
         body: HEATMAP_BODY,
         surfaces: FLAT,
         height: false,
@@ -338,6 +756,7 @@ pub static ALL: &[Family] = &[
         attributes: &HEATMAP_TEXTURE_SHADER,
         instance_attributes: &[],
         textures: &HEATMAP_TEXTURE_SHADER_TEXTURES,
+        properties: &[],
         body: HEATMAP_TEXTURE_BODY,
         surfaces: FLAT_OR_BENT,
         height: false,
@@ -349,6 +768,7 @@ pub static ALL: &[Family] = &[
         attributes: &SYMBOL_ICON_SHADER,
         instance_attributes: &[],
         textures: &SYMBOL_ICON_SHADER_TEXTURES,
+        properties: SYMBOL_ICON_PAINT,
         body: SYMBOL_ICON_BODY,
         surfaces: EVERY,
         height: false,
@@ -360,6 +780,7 @@ pub static ALL: &[Family] = &[
         attributes: &SYMBOL_SDFSHADER,
         instance_attributes: &[],
         textures: &SYMBOL_SDFSHADER_TEXTURES,
+        properties: SYMBOL_SDF_PAINT,
         body: SYMBOL_SDF_BODY,
         surfaces: EVERY,
         height: false,
@@ -371,6 +792,7 @@ pub static ALL: &[Family] = &[
         attributes: &SYMBOL_TEXT_AND_ICON_SHADER,
         instance_attributes: &[],
         textures: &SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES,
+        properties: SYMBOL_TEXT_AND_ICON_PAINT,
         body: SYMBOL_TEXT_AND_ICON_BODY,
         surfaces: EVERY,
         height: false,

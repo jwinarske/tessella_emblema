@@ -23,9 +23,9 @@ mod common;
 use ash::vk;
 use tessella_capture_abi::generated::mbgl_enums::AttributeDataType;
 use tessella_emblema::device::{self, Attachment};
+use tessella_emblema::families;
 use tessella_emblema::pipelines::{self, Key, Slot, Targets};
 use tessella_emblema::surface::Surface;
-use tessella_emblema::{families, shaders};
 
 use common::Open;
 
@@ -127,15 +127,9 @@ fn every_pipeline_builds(device: &Open) -> Result<(), String> {
                 continue;
             }
             let who = format!("{} on {surface:?}", family.name);
-            let text = shaders::module(
-                surface,
-                family.blocks,
-                family.attributes,
-                family.instance_attributes,
-                family.textures,
-                family.body,
-            )
-            .map_err(|why| format!("{who} does not assemble: {why:?}"))?;
+            let text = family
+                .module(surface, &[])
+                .map_err(|why| format!("{who} does not assemble: {why:?}"))?;
             let words = compile(&text).map_err(|why| format!("{who}: {why}"))?;
 
             let module = device
@@ -175,13 +169,20 @@ fn every_pipeline_builds(device: &Open) -> Result<(), String> {
     Ok(())
 }
 
-/// A key whose vertex input the module has no input for is refused.
+/// What a driver does when the module and the vertex input disagree, in both directions.
 ///
 /// The disagreement `vkCreateGraphicsPipelines` exists to catch, and the reason the key carries the
-/// layout at all: an attribute at a location the module does not declare is invalid usage that the
-/// validation layers report as `VUID-VkGraphicsPipelineCreateInfo-Input-07904`. Whether a driver
-/// refuses it is not promised, so this reports what happened rather than asserting a refusal -- the
-/// same lesson as the descriptor limits.
+/// layout at all. Both are invalid usage the validation layers report as
+/// `VUID-VkGraphicsPipelineCreateInfo-Input-07904`, and whether a driver refuses either is not
+/// promised -- so this reports what happened rather than asserting a refusal, the same lesson as
+/// the descriptor limits.
+///
+/// The second direction is the one the paint permutation rests on. A property that is constant for
+/// a layer arrives as no attribute, and a module that went on declaring it would be exactly this
+/// case: an input with no bytes behind it. If a driver accepts that, the attribute is fetched from
+/// nowhere and the shader reads whatever the fetch returns -- which is why the module leaves the
+/// location out instead, and why a specialization constant folding a branch would not have been
+/// enough. See `crate::spec`'s own note.
 fn a_bogus_location_is_reported(device: &Open) -> Result<(), String> {
     let family = families::ALL
         .iter()
@@ -193,15 +194,9 @@ fn a_bogus_location_is_reported(device: &Open) -> Result<(), String> {
     })
     .map_err(|why| format!("no depth-stencil format: {why:?}"))?;
 
-    let text = shaders::module(
-        surface,
-        family.blocks,
-        family.attributes,
-        family.instance_attributes,
-        family.textures,
-        family.body,
-    )
-    .map_err(|why| format!("assemble: {why:?}"))?;
+    let text = family
+        .module(surface, &[])
+        .map_err(|why| format!("assemble: {why:?}"))?;
     let words = compile(&text)?;
     let module = device.gpu().shader(&words).map_err(|why| why.to_string())?;
     let layout = pipelines::layout(device.gpu(), &pipelines::bindings(family, surface))
@@ -226,6 +221,15 @@ fn a_bogus_location_is_reported(device: &Open) -> Result<(), String> {
         Err(_) => "refused",
     };
     println!("  a bogus location      ok   an input the module lacks was {verdict}");
+
+    // And the other way: the module declares `@location(0)` and the key binds nothing at all.
+    let mut bare = key_for(family, surface)?;
+    bare.layout.clear();
+    let verdict = match pipelines::build(device.gpu(), &bare, &layout, &module, targets) {
+        Ok(_) => "accepted, so the fetch is from nowhere",
+        Err(_) => "refused",
+    };
+    println!("  an unbound input      ok   a module input with no description was {verdict}");
     Ok(())
 }
 
@@ -260,18 +264,12 @@ fn the_cache_reuses(device: &Open) -> Result<(), String> {
 
                 // The words are needed only when the *module* is missing, which is the question
                 // `has_module` answers and `holds` does not.
-                let words = if cache.has_module(family.shader, surface) {
+                let words = if cache.has_module(family.shader, surface, key.permutation) {
                     Vec::new()
                 } else {
-                    let text = shaders::module(
-                        surface,
-                        family.blocks,
-                        family.attributes,
-                        family.instance_attributes,
-                        family.textures,
-                        family.body,
-                    )
-                    .map_err(|why| format!("{who}: {why:?}"))?;
+                    let text = family
+                        .module(surface, &[])
+                        .map_err(|why| format!("{who}: {why:?}"))?;
                     compile(&text).map_err(|why| format!("{who}: {why}"))?
                 };
                 if round > 0 && !words.is_empty() {
@@ -332,15 +330,9 @@ fn a_stride_is_a_different_pipeline(device: &Open) -> Result<(), String> {
         .find(|f| f.name == "background")
         .ok_or("a background family")?;
     let bindings = pipelines::bindings(family, Surface::Plane);
-    let text = shaders::module(
-        Surface::Plane,
-        family.blocks,
-        family.attributes,
-        family.instance_attributes,
-        family.textures,
-        family.body,
-    )
-    .map_err(|why| format!("{why:?}"))?;
+    let text = family
+        .module(Surface::Plane, &[])
+        .map_err(|why| format!("{why:?}"))?;
     let words = compile(&text)?;
 
     let mut cache = pipelines::Cache::new();
@@ -356,7 +348,7 @@ fn a_stride_is_a_different_pipeline(device: &Open) -> Result<(), String> {
     // Empty words deliberately: the module is already compiled, and a cache that reached for them
     // anyway would be recompiling the same text per stride. `vkCreateShaderModule` of nothing
     // fails, so this is the assertion rather than a count.
-    if !cache.has_module(family.shader, Surface::Plane) {
+    if !cache.has_module(family.shader, Surface::Plane, key.permutation) {
         return Err("the first pipeline did not cache its module".into());
     }
     let second = cache

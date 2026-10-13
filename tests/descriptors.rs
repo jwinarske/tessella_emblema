@@ -26,7 +26,6 @@
 
 use tessella_emblema::families;
 use tessella_emblema::pipelines::{self, Binding, Kind};
-use tessella_emblema::shaders;
 use tessella_emblema::surface::Surface;
 
 /// Every `@group(g) @binding(n)` the assembled text declares, in group and binding order, with its
@@ -85,15 +84,9 @@ fn assembled(family: &families::Family, surface: Surface) -> Option<String> {
         return None;
     }
     Some(
-        shaders::module(
-            surface,
-            family.blocks,
-            family.attributes,
-            family.instance_attributes,
-            family.textures,
-            family.body,
-        )
-        .unwrap_or_else(|why| panic!("{} on {surface:?} does not assemble: {why:?}", family.name)),
+        family.module(surface, &[]).unwrap_or_else(|why| {
+            panic!("{} on {surface:?} does not assemble: {why:?}", family.name)
+        }),
     )
 }
 

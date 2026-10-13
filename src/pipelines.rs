@@ -58,7 +58,16 @@ pub struct Key {
     pub shader: BuiltIn,
     /// Which surface its module was assembled against.
     pub surface: Surface,
-    /// The data-driven variant, which decides the module's specialization constants.
+    /// Which of the family's attributes the drawable did not send, as a bitmask over locations.
+    ///
+    /// mbgl's `propertiesAsUniforms`, by another route. A data-driven paint property that is
+    /// constant for a layer arrives as no descriptor at all, and the module then reads the layer's
+    /// evaluated value instead of an attribute -- a different program, with a different vertex
+    /// input. So this names the *module*, not only the pipeline, and [`Cache`] keys both on it.
+    ///
+    /// Derived from the plan by [`key`] rather than passed in, because the plan is the only thing
+    /// that knows: `batch::Key::permutation_key` is mbgl's own hash over its property names and
+    /// says nothing about this crate's locations. See [`crate::shaders::permutation`].
     pub permutation: u64,
     /// The vertex input state, in slot order.
     pub layout: Vec<Slot>,
@@ -121,20 +130,13 @@ impl Depth {
 /// Built from the plan rather than from the family's table, because the table says what a module
 /// *declares* and the plan says what this drawable *binds*. They differ whenever a data-driven
 /// attribute is constant for this permutation and no descriptor arrived for it, and that difference
-/// is a different pipeline.
+/// is a different pipeline -- and, through [`Key::permutation`], a different module.
 #[must_use]
-pub fn key(
-    shader: BuiltIn,
-    surface: Surface,
-    permutation: u64,
-    plan: &Plan,
-    blend: Blend,
-    depth: Depth,
-) -> Key {
+pub fn key(shader: BuiltIn, surface: Surface, plan: &Plan, blend: Blend, depth: Depth) -> Key {
     Key {
         shader,
         surface,
-        permutation,
+        permutation: crate::shaders::permutation(&plan.absent),
         blend,
         depth,
         layout: plan
@@ -987,7 +989,7 @@ pub fn build_mask<'d>(
 /// the style's own size and stops, and [`Cache::len`] is what a caller watches to find out it was
 /// wrong about that.
 pub struct Cache<'d> {
-    modules: HashMap<(BuiltIn, Surface), tessella_vk::ShaderModule<'d>>,
+    modules: HashMap<(BuiltIn, Surface, u64), tessella_vk::ShaderModule<'d>>,
     layouts: HashMap<(BuiltIn, Surface), Layout<'d>>,
     pipelines: HashMap<Key, tessella_vk::Pipeline<'d>>,
     built: usize,
@@ -1036,7 +1038,7 @@ impl<'d> Cache<'d> {
         self.pipelines.is_empty()
     }
 
-    /// How many modules are held, which is at most one per family and surface.
+    /// How many modules are held, which is at most one per family, surface and permutation.
     #[must_use]
     pub fn modules(&self) -> usize {
         self.modules.len()
@@ -1103,14 +1105,20 @@ impl<'d> Cache<'d> {
             return Ok(had.raw());
         }
 
+        // The module is keyed on the permutation as well, because it is the text that changed:
+        // an absent attribute is left out of `In` and its property read from the layer's block
+        // instead. The layout is not -- a permutation moves vertex input and nothing in the
+        // descriptor set, so one family and surface have one set layout however their attributes
+        // arrived.
+        let text = (key.shader, key.surface, key.permutation);
         let at = (key.shader, key.surface);
-        if let std::collections::hash_map::Entry::Vacant(slot) = self.modules.entry(at) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.modules.entry(text) {
             slot.insert(gpu.shader(words)?);
         }
         if let std::collections::hash_map::Entry::Vacant(slot) = self.layouts.entry(at) {
             slot.insert(layout(gpu, bindings)?);
         }
-        let pipeline = build(gpu, key, &self.layouts[&at], &self.modules[&at], targets)?;
+        let pipeline = build(gpu, key, &self.layouts[&at], &self.modules[&text], targets)?;
         let raw = pipeline.raw();
         self.pipelines.insert(key.clone(), pipeline);
         self.built += 1;
@@ -1133,8 +1141,12 @@ impl<'d> Cache<'d> {
     ///
     /// [`Self::pipeline`] ignores `words` when the module is present, so a caller seeing `true`
     /// here can pass an empty slice.
+    ///
+    /// The permutation is part of the question for the reason [`Key::permutation`] gives: a
+    /// drawable that sent fewer attributes needs its own text, so a cache asked without it would
+    /// report a hit and then be handed the wrong module's words to ignore.
     #[must_use]
-    pub fn has_module(&self, shader: BuiltIn, surface: Surface) -> bool {
-        self.modules.contains_key(&(shader, surface))
+    pub fn has_module(&self, shader: BuiltIn, surface: Surface, permutation: u64) -> bool {
+        self.modules.contains_key(&(shader, surface, permutation))
     }
 }

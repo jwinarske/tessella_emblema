@@ -10,7 +10,7 @@ use tessella_capture_abi::generated::mbgl_enums::AttributeDataType;
 use tessella_capture_abi::generated::shader_attributes::BACKGROUND_SHADER;
 use tessella_capture_abi::generated::ubo_layouts::{BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO};
 use tessella_emblema::families::ALL;
-use tessella_emblema::shaders::{BACKGROUND_BODY, attribute_name, module};
+use tessella_emblema::shaders::{BACKGROUND_BODY, Paint, attribute_name, module};
 use tessella_emblema::surface::Surface;
 
 /// Compiles a module to SPIR-V, or says why not.
@@ -41,6 +41,7 @@ fn background() -> String {
         &BACKGROUND_SHADER,
         &[],
         &[],
+        &Paint::NONE,
         BACKGROUND_BODY,
     )
     .expect("background declares")
@@ -100,15 +101,7 @@ fn the_roof_sits_at_the_top_and_keeps_its_fraction() {
         .into_iter()
         .find(|family| family.name == "fill_extrusion")
         .expect("fill extrusion is in the matrix");
-    let source = module(
-        Surface::Plane,
-        extrusion.blocks,
-        extrusion.attributes,
-        extrusion.instance_attributes,
-        extrusion.textures,
-        extrusion.body,
-    )
-    .expect("assembles");
+    let source = extrusion.module(Surface::Plane, &[]).expect("assembles");
 
     assert!(
         source.contains("let z = select(base, height, on_roof > 0.0);"),
@@ -140,15 +133,7 @@ fn the_symbol_icon_keeps_its_placement_decisions() {
         .into_iter()
         .find(|family| family.name == "symbol_icon")
         .expect("symbol icon is in the matrix");
-    let source = module(
-        Surface::Plane,
-        icon.blocks,
-        icon.attributes,
-        icon.instance_attributes,
-        icon.textures,
-        icon.body,
-    )
-    .expect("assembles");
+    let source = icon.module(Surface::Plane, &[]).expect("assembles");
 
     assert!(
         source.contains("let in_plane = transform(drawable.label_plane_matrix,")
@@ -200,15 +185,7 @@ fn the_text_and_icon_keeps_its_sheet_decisions() {
         .into_iter()
         .find(|family| family.name == "symbol_text_and_icon")
         .expect("text and icon is in the matrix");
-    let source = module(
-        Surface::Plane,
-        both.blocks,
-        both.attributes,
-        both.instance_attributes,
-        both.textures,
-        both.body,
-    )
-    .expect("assembles");
+    let source = both.module(Surface::Plane, &[]).expect("assembles");
 
     assert!(
         source.contains("let is_sdf = sized.x - 2.0 * smallest;")
@@ -265,15 +242,7 @@ fn the_hillshade_keeps_its_slope_decisions() {
             .into_iter()
             .find(|family| family.name == name)
             .unwrap_or_else(|| panic!("{name} is in the matrix"));
-        module(
-            Surface::Plane,
-            found.blocks,
-            found.attributes,
-            found.instance_attributes,
-            found.textures,
-            found.body,
-        )
-        .expect("assembles")
+        found.module(Surface::Plane, &[]).expect("assembles")
     };
     let prepare = family("hillshade_prepare");
     let shade = family("hillshade");
@@ -335,15 +304,7 @@ fn the_patterns_keep_their_tiling_decisions() {
             .into_iter()
             .find(|family| family.name == name)
             .unwrap_or_else(|| panic!("{name} is in the matrix"));
-        module(
-            Surface::Plane,
-            found.blocks,
-            found.attributes,
-            found.instance_attributes,
-            found.textures,
-            found.body,
-        )
-        .expect("assembles")
+        found.module(Surface::Plane, &[]).expect("assembles")
     };
     let background = assembled("background_pattern");
     let fill = assembled("fill_pattern");
@@ -409,15 +370,7 @@ fn the_line_pattern_keeps_its_sprite_decisions() {
         .into_iter()
         .find(|family| family.name == "line_pattern")
         .expect("line pattern is in the matrix");
-    let source = module(
-        Surface::Plane,
-        pattern.blocks,
-        pattern.attributes,
-        pattern.instance_attributes,
-        pattern.textures,
-        pattern.body,
-    )
-    .expect("assembles");
+    let source = pattern.module(Surface::Plane, &[]).expect("assembles");
 
     assert!(
         source.contains("out.along = (floor(data.z / 4.0) + data.w * 64.0) * 2.0;"),
@@ -469,15 +422,7 @@ fn the_heatmap_keeps_its_kernel_decisions() {
             .into_iter()
             .find(|family| family.name == name)
             .unwrap_or_else(|| panic!("{name} is in the matrix"));
-        module(
-            Surface::Plane,
-            found.blocks,
-            found.attributes,
-            found.instance_attributes,
-            found.textures,
-            found.body,
-        )
-        .expect("assembles")
+        found.module(Surface::Plane, &[]).expect("assembles")
     };
     let density = assembled("heatmap");
     let colored = assembled("heatmap_texture");
@@ -542,15 +487,7 @@ fn the_line_keeps_its_extrusion_decisions() {
         .into_iter()
         .find(|family| family.name == "line")
         .expect("line is in the matrix");
-    let source = module(
-        Surface::Plane,
-        line.blocks,
-        line.attributes,
-        line.instance_attributes,
-        line.textures,
-        line.body,
-    )
-    .expect("assembles");
+    let source = line.module(Surface::Plane, &[]).expect("assembles");
 
     assert!(
         source.contains("let extrude_scale = 63.0;")
@@ -563,8 +500,11 @@ fn the_line_keeps_its_extrusion_decisions() {
         "the extrusion does not divide by the width ratio"
     );
     assert!(
-        source.contains("let line_offset = -1.0 * mix_value(in.line_offset, drawable.offset_t);"),
-        "the side offset is not negated"
+        source.contains("let line_offset = -1.0 * paint_offset(in);")
+            && source.contains(
+                "return mix_value(in.line_offset, line_drawable_ubo[ubo_index].offset_t);"
+            ),
+        "the side offset is not negated, or is not mixed from this family's own offset"
     );
     assert!(
         source.contains("let inset = gapwidth + select(0.0, antialiasing, gapwidth > 0.0);")
@@ -601,15 +541,7 @@ fn the_symbol_sdf_keeps_its_edge_decisions() {
         .into_iter()
         .find(|family| family.name == "symbol_sdf")
         .expect("symbol sdf is in the matrix");
-    let source = module(
-        Surface::Plane,
-        sdf.blocks,
-        sdf.attributes,
-        sdf.instance_attributes,
-        sdf.textures,
-        sdf.body,
-    )
-    .expect("assembles");
+    let source = sdf.module(Surface::Plane, &[]).expect("assembles");
 
     assert!(
         source.contains("textureSample(symbol_image, symbol_image_sampler, in.tex).r;"),
@@ -656,15 +588,7 @@ fn the_circle_keeps_its_extrusion_decisions() {
         .into_iter()
         .find(|family| family.name == "circle")
         .expect("circle is in the matrix");
-    let source = module(
-        Surface::Plane,
-        circle.blocks,
-        circle.attributes,
-        circle.instance_attributes,
-        circle.textures,
-        circle.body,
-    )
-    .expect("assembles");
+    let source = circle.module(Surface::Plane, &[]).expect("assembles");
 
     assert!(
         source.contains("let center = floor(position * 0.5);")
@@ -713,15 +637,7 @@ fn the_fill_outline_keeps_its_feather() {
         .into_iter()
         .find(|family| family.name == "fill_outline")
         .expect("fill outline is in the matrix");
-    let source = module(
-        Surface::Plane,
-        outline.blocks,
-        outline.attributes,
-        outline.instance_attributes,
-        outline.textures,
-        outline.body,
-    )
-    .expect("assembles");
+    let source = outline.module(Surface::Plane, &[]).expect("assembles");
 
     assert!(
         source.contains(
@@ -735,8 +651,11 @@ fn the_fill_outline_keeps_its_feather() {
         "the outline has no feather"
     );
     assert!(
-        source.contains("drawable.outline_color_t"),
-        "the outline mixes with the fill's interpolation factor, not its own"
+        source.contains(
+            "return mix_color(in.fill_outline_color, \
+             fill_outline_drawable_ubo[ubo_index].outline_color_t);"
+        ),
+        "the outline mixes the wrong attribute, or with the fill's interpolation factor"
     );
 }
 
@@ -757,15 +676,7 @@ fn the_triangulated_outline_keeps_its_width_and_its_scale() {
         .into_iter()
         .find(|family| family.name == "fill_outline_triangulated")
         .expect("the triangulated outline is in the matrix");
-    let source = module(
-        Surface::Plane,
-        outline.blocks,
-        outline.attributes,
-        outline.instance_attributes,
-        outline.textures,
-        outline.body,
-    )
-    .expect("assembles");
+    let source = outline.module(Surface::Plane, &[]).expect("assembles");
 
     assert!(
         source.contains("let halfwidth = 0.5;")
@@ -799,15 +710,7 @@ fn the_color_relief_pins_the_poles() {
         .into_iter()
         .find(|family| family.name == "color_relief")
         .expect("color relief is in the matrix");
-    let source = module(
-        Surface::Plane,
-        relief.blocks,
-        relief.attributes,
-        relief.instance_attributes,
-        relief.textures,
-        relief.body,
-    )
-    .expect("assembles");
+    let source = relief.module(Surface::Plane, &[]).expect("assembles");
 
     assert!(
         source.contains("if f32(in.color_relief_pos.y) < -32767.5 {")
@@ -882,15 +785,7 @@ fn the_color_relief_keeps_its_unpack_and_its_texel_centers() {
         .into_iter()
         .find(|family| family.name == "color_relief")
         .expect("color relief is in the matrix");
-    let source = module(
-        Surface::Plane,
-        relief.blocks,
-        relief.attributes,
-        relief.instance_attributes,
-        relief.textures,
-        relief.body,
-    )
-    .expect("assembles");
+    let source = relief.module(Surface::Plane, &[]).expect("assembles");
 
     assert!(
         source.contains("dot(vec4<f32>(texel.rgb, -1.0), tile.unpack)"),
@@ -925,15 +820,7 @@ fn a_familys_images_bind_before_the_surfaces() {
     assert_eq!(raster.textures.len(), 2, "a raster samples two pictures");
 
     // Flat: two blocks, then the family's two images and their samplers, and nothing after.
-    let flat = module(
-        Surface::Plane,
-        raster.blocks,
-        raster.attributes,
-        raster.instance_attributes,
-        raster.textures,
-        raster.body,
-    )
-    .expect("assembles");
+    let flat = raster.module(Surface::Plane, &[]).expect("assembles");
     for (at, texture) in raster.textures.iter().enumerate() {
         let name = texture_name(texture.name);
         let binding = 2 + at * 2;
@@ -961,15 +848,7 @@ fn a_familys_images_bind_before_the_surfaces() {
 
     // Raised: the surface's block pushes the images on by one binding, and the elevation lands
     // after them rather than among them.
-    let raised = module(
-        Surface::Terrain,
-        raster.blocks,
-        raster.attributes,
-        raster.instance_attributes,
-        raster.textures,
-        raster.body,
-    )
-    .expect("assembles");
+    let raised = raster.module(Surface::Terrain, &[]).expect("assembles");
     assert!(raised.contains("@binding(2) var<storage, read> terrain_drawable_ubo"));
     assert!(raised.contains("@binding(3) var raster_image0: texture_2d<f32>;"));
     assert!(raised.contains("@binding(5) var raster_image1: texture_2d<f32>;"));
@@ -1000,15 +879,7 @@ fn the_slot_arrives_as_the_instance_index() {
             continue;
         }
         for surface in family.surfaces {
-            let source = module(
-                *surface,
-                family.blocks,
-                family.attributes,
-                family.instance_attributes,
-                family.textures,
-                family.body,
-            )
-            .expect("assembles");
+            let source = family.module(*surface, &[]).expect("assembles");
             let what = format!("{}{}", family.name, surface.suffix());
             assert!(
                 !source.contains("push_constant"),
@@ -1058,15 +929,7 @@ fn the_instanced_family_takes_its_slot_from_a_push_constant() {
             continue;
         }
         for surface in family.surfaces {
-            let source = module(
-                *surface,
-                family.blocks,
-                family.attributes,
-                family.instance_attributes,
-                family.textures,
-                family.body,
-            )
-            .expect("assembles");
+            let source = family.module(*surface, &[]).expect("assembles");
             let what = format!("{}{}", family.name, surface.suffix());
             assert!(
                 source.contains("var<push_constant> pushed: Pushed;"),
@@ -1164,15 +1027,7 @@ fn a_matrix_is_declared_as_four_columns() {
 fn no_module_names_a_matrix_type() {
     for family in ALL {
         for surface in family.surfaces {
-            let source = module(
-                *surface,
-                family.blocks,
-                family.attributes,
-                family.instance_attributes,
-                family.textures,
-                family.body,
-            )
-            .expect("assembles");
+            let source = family.module(*surface, &[]).expect("assembles");
             assert!(
                 !source.contains("mat4x4"),
                 "{}{} names a matrix type",
@@ -1211,6 +1066,7 @@ fn a_body_naming_an_undeclared_field_fails() {
         &BACKGROUND_SHADER,
         &[],
         &[],
+        &Paint::NONE,
         r"
 @fragment
 fn fragment_main() -> @location(0) vec4<f32> {
@@ -1267,15 +1123,9 @@ fn every_family_on_every_surface_compiles() {
     for family in ALL {
         for surface in family.surfaces {
             let what = format!("{}{}", family.name, surface.suffix());
-            let source = module(
-                *surface,
-                family.blocks,
-                family.attributes,
-                family.instance_attributes,
-                family.textures,
-                family.body,
-            )
-            .unwrap_or_else(|why| panic!("{what} does not assemble: {why:?}"));
+            let source = family
+                .module(*surface, &[])
+                .unwrap_or_else(|why| panic!("{what} does not assemble: {why:?}"));
             let words = compile(&source);
             assert!(words.len() > 64, "{what} emitted {} words", words.len());
             assert_eq!(words[0], 0x0723_0203, "{what} is not SPIR-V");
@@ -1288,6 +1138,70 @@ fn every_family_on_every_surface_compiles() {
     );
 }
 
+/// Every family compiles with its paint properties constant, one at a time and all at once.
+///
+/// The permutation's own test, and the reason it is here rather than in `tests/properties.rs`:
+/// what can be wrong with a constant arm is not the table but the *text*, and only naga can say.
+/// An arm naming a field of the wrong type, or a block the module does not declare on this
+/// surface, is a module that fails to assemble -- and it would fail for the first time on a real
+/// frame, because every fixture in this repository sends every attribute.
+///
+/// One at a time and all at once rather than every subset. The arms are independent text, so a
+/// pair that each compile alone compile together; what the all-at-once case adds is the family
+/// with nothing left in `In` but its geometry, which is the permutation a style of constant paint
+/// actually sends -- the captured Berlin frame's circle layer sends exactly that.
+#[test]
+fn every_permutation_of_every_family_compiles() {
+    let mut modules = 0;
+    for family in ALL {
+        if family.properties.is_empty() {
+            continue;
+        }
+        let every: Vec<u32> = family
+            .properties
+            .iter()
+            .map(|property| property.location)
+            .collect();
+        // Each alone, then all of them. `every` last so a failure names the smallest case first.
+        let mut cases: Vec<Vec<u32>> = every.iter().map(|at| vec![*at]).collect();
+        cases.push(every.clone());
+
+        for surface in family.surfaces {
+            for absent in &cases {
+                let what = format!("{}{} without {:?}", family.name, surface.suffix(), absent);
+                let source = family
+                    .module(*surface, absent)
+                    .unwrap_or_else(|why| panic!("{what} does not assemble: {why:?}"));
+                // The attribute is gone from the input, which is the half Vulkan requires: a
+                // declared input with no binding is a pipeline the driver may refuse.
+                //
+                // Read off the `In` struct rather than the whole module, because a body's `Out`
+                // numbers its own locations from zero and would match any of these.
+                let (fields, _) = source
+                    .split_once("struct In {")
+                    .and_then(|(_, tail)| tail.split_once('}'))
+                    .unwrap_or_else(|| panic!("{what} declares no input"));
+                for at in absent {
+                    let location = format!("@location({at}) ");
+                    assert!(
+                        !fields.contains(&location),
+                        "{what} still declares {location}in its input"
+                    );
+                }
+                let words = compile(&source);
+                assert!(words.len() > 64, "{what} emitted {} words", words.len());
+                modules += 1;
+            }
+        }
+    }
+    // Not a round number and not worth deriving: it is the shape of the table, and a change to it
+    // is a change worth looking at.
+    assert_eq!(
+        modules, 191,
+        "the permutations grew or shrank; look at the new ones"
+    );
+}
+
 /// Every attribute the producer sends is read by the body that receives it.
 ///
 /// An attribute declared and never read is a paint property the style asked for and the picture
@@ -1297,15 +1211,7 @@ fn every_family_on_every_surface_compiles() {
 fn every_attribute_is_read() {
     for family in ALL {
         for surface in family.surfaces {
-            let source = module(
-                *surface,
-                family.blocks,
-                family.attributes,
-                family.instance_attributes,
-                family.textures,
-                family.body,
-            )
-            .expect("assembles");
+            let source = family.module(*surface, &[]).expect("assembles");
             // Both tables: a family's per-instance attributes are declared in `In` beside its
             // per-vertex ones and a body that never read one would be the same defect.
             for attribute in family.attributes.iter().chain(family.instance_attributes) {
@@ -1486,15 +1392,7 @@ const UNREAD_COMPONENTS: &[(&str, &str, &str)] = &[
 fn every_component_of_an_attribute_is_read() {
     let mut short = Vec::new();
     for family in ALL {
-        let source = module(
-            Surface::Plane,
-            family.blocks,
-            family.attributes,
-            family.instance_attributes,
-            family.textures,
-            family.body,
-        )
-        .expect("assembles");
+        let source = family.module(Surface::Plane, &[]).expect("assembles");
         // Both tables, for the reason [`every_attribute_is_read`] walks both: an instance
         // attribute's spare components are as easy to leave unread as a vertex attribute's, and
         // this family's `decimals_ed.y` is exactly that case.
@@ -1567,6 +1465,13 @@ fn swizzles_of(source: &str, name: &str, depth: u32) -> BTreeSet<char> {
             continue;
         }
         let line_start = source[..at].rfind('\n').map_or(0, |nl| nl + 1);
+        // A comment is prose, not a read. Worth skipping rather than relying on the prose staying
+        // clear of these names: the generated header above the `paint_*` functions said
+        // "data-driven", and that counted as a bare use of a line's `data` and so excused every
+        // component of `in.line_data`.
+        if source[line_start..at].contains("//") {
+            continue;
+        }
         // The left side of the binding that introduced this name is not a use of it.
         if source[line_start..at].trim_end().ends_with("let") {
             continue;
@@ -1651,15 +1556,7 @@ fn every_zoom_factor_is_used() {
     let mut paired = 0;
     for family in ALL {
         for surface in family.surfaces {
-            let source = module(
-                *surface,
-                family.blocks,
-                family.attributes,
-                family.instance_attributes,
-                family.textures,
-                family.body,
-            )
-            .expect("assembles");
+            let source = family.module(*surface, &[]).expect("assembles");
             for attribute in family.attributes {
                 let field = attribute_name(attribute.name);
                 let flat = field.replace('_', "");

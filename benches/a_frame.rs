@@ -48,7 +48,7 @@ use tessella_emblema::blocks::Blocks;
 use tessella_emblema::descriptors::Sets;
 use tessella_emblema::device::{self, Attachment};
 use tessella_emblema::images::Images;
-use tessella_emblema::pipelines::{Blend, Cache, Targets};
+use tessella_emblema::pipelines::{Cache, Targets};
 use tessella_emblema::record::Program;
 use tessella_emblema::store::Store;
 use tessella_emblema::surface::Surface;
@@ -467,7 +467,7 @@ fn draw(
             plans
                 .get(&frame::GEOMETRIES[0])
                 .ok_or("the first geometry has no plan")?,
-            Blend::Alpha,
+            fill.blend(pass.bits()),
             pipelines::Depth::of(pass.bits()),
         );
         let pipeline = cache
@@ -525,7 +525,7 @@ fn draw(
             plans
                 .get(&frame::SAMPLER)
                 .ok_or("the sampling geometry has no plan")?,
-            Blend::Alpha,
+            raster.blend(pass.bits()),
             pipelines::Depth::of(pass.bits()),
         );
         let pipeline = cache

@@ -112,7 +112,7 @@ use tessella_capture_abi::generated::ubo_layouts::{
     RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO, SYMBOL_EVALUATED_PROPS_UBO,
     SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
-use tessella_capture_abi::{TextureChannelDataType, TexturePixelType};
+use tessella_capture_abi::{RenderPass, TextureChannelDataType, TexturePixelType};
 use tessella_emblema::device::{self, Attachment, check_vertex_formats, vertex_format};
 use tessella_emblema::families::family;
 use tessella_emblema::images::Images;
@@ -122,7 +122,7 @@ use tessella_emblema::surface::{GLOBE_BEND_UBO, GLOBE_CAMERA_UBO, Surface, TERRA
 use tessella_emblema::target::{self, Depth, Host};
 use tessella_emblema::{blocks, buffers, descriptors, pipelines, slots, vertices};
 // The probe's own `Image` is a case's input; the wrapper's is a device object. Aliased rather
-// than renamed, because the twenty-six cases name theirs.
+// than renamed, because the cases name theirs.
 use tessella_vk::{Buffer, Image as Device2d, ImageView, Memory, Recorder};
 
 mod common;
@@ -202,6 +202,18 @@ struct Case {
     /// The stream at such a location must be empty, which `descriptors_for` asks: `streams` stays
     /// indexed by the table's order, so an omitted attribute still needs its place in the list.
     absent: &'static [u32],
+    /// Which pass the drawable is in, for a case that is about how it composites.
+    ///
+    /// `None` for all but the four background cases below, and the pipeline is then built
+    /// `Blend::Unblended` -- the mode a readback oracle wants, because the pixel is then what the
+    /// fragment stage returned rather than what it returned over the clear. That is what makes the
+    /// four cases whose alpha is below 255 readable at all.
+    ///
+    /// `Some(pass)` takes the blend from `Family::blend`, this crate's transcription of mbgl's
+    /// `setColorMode`, which is what makes those four the only cases here whose blend state is
+    /// under test. The background is the family worth testing it on: it is `Composite::ByPass`, so
+    /// its two pass bits give two different pipelines out of one family.
+    pass: Option<u8>,
     /// Which entry of the blocks the draw reads, which the body receives as `ubo_index`.
     ///
     /// Zero for every case but one. `drawable_at_one` is the exception and the reason this is a
@@ -696,6 +708,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [0, 0, 255, 255],
@@ -747,6 +760,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[1, 2],
             instanced: None,
             expect: [138, 107, 46, 153],
@@ -808,6 +822,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 1,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [0, 0, 255, 255],
@@ -815,6 +830,10 @@ fn cases() -> Vec<Case> {
         // A background: the only family whose color is a uniform rather than an attribute, and
         // the only one declaring a `Color` field -- so this is where that kind's four floats are
         // checked to arrive unpacked.
+        //
+        // It is also the family that composites by pass, and this case with the three after it
+        // are the only ones here that take their blend from `Family::blend`. This one is the
+        // opaque arm, which is `Blend::Unblended` and so the mode every other case is built with.
         Case {
             name: "background",
             at: (SIDE / 2, SIDE / 2),
@@ -835,9 +854,111 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            pass: Some(RenderPass::OPAQUE.bits()),
             absent: &[],
             instanced: None,
             expect: [0, 0, 255, 255],
+        },
+        // The same background in the translucent pass, which `Composite::ByPass` gives
+        // `Blend::Alpha`. The same four bytes, and that is the point.
+        //
+        // mbgl's background takes the *unblended* arm in both passes, because it compares its
+        // whole pass set for equality with `Translucent` and an opaque background declares
+        // `Opaque | Translucent`. This crate sees one bit per order entry and gives the
+        // translucent copy `Blend::Alpha` instead -- and the two write the same pixel, which is
+        // what this case and the one above measure rather than assert. `alphaBlended` is
+        // `Add{One, OneMinusSrcAlpha}` over a premultiplied source, so at an alpha of one it is
+        // `src + dst * 0`.
+        //
+        // Which also means this pair agrees under any blend state whatsoever, so on its own it
+        // says nothing about whether a mode reached the pipeline at all. The faded pair below is
+        // what shows that one does, and so what makes this one a result.
+        Case {
+            name: "background_blended",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::BackgroundShader,
+            surface: Surface::Plane,
+            layout: Layout::PerAttribute,
+            streams: vec![shorts(&COVERING)],
+            uniforms: vec![
+                block(&BACKGROUND_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
+                block(
+                    &BACKGROUND_PROPS_UBO,
+                    &[
+                        ("color", At::F(&[0.0, 0.0, 1.0, 1.0])),
+                        ("opacity", At::F(&[1.0])),
+                    ],
+                ),
+            ],
+            images: Vec::new(),
+            vertices: 3,
+            ubo_index: 0,
+            pass: Some(RenderPass::TRANSLUCENT.bits()),
+            absent: &[],
+            instanced: None,
+            expect: [0, 0, 255, 255],
+        },
+        // The same background faded, in the opaque pass: `Blend::Unblended`, so the premultiplied
+        // color reaches the target as it left the fragment stage and the clear is gone.
+        //
+        // `FADED` is sixteen seventeenths for the reason its own comment gives: every byte of
+        // both outcomes is exact, so neither case can be decided by how a device rounds.
+        Case {
+            name: "background_faded",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::BackgroundShader,
+            surface: Surface::Plane,
+            layout: Layout::PerAttribute,
+            streams: vec![shorts(&COVERING)],
+            uniforms: vec![
+                block(&BACKGROUND_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
+                block(
+                    &BACKGROUND_PROPS_UBO,
+                    &[
+                        ("color", At::F(&[0.0, 0.0, 1.0, 1.0])),
+                        ("opacity", At::F(&[FADED])),
+                    ],
+                ),
+            ],
+            images: Vec::new(),
+            vertices: 3,
+            ubo_index: 0,
+            pass: Some(RenderPass::OPAQUE.bits()),
+            absent: &[],
+            instanced: None,
+            // `color * opacity` is `(0, 0, 16/17, 16/17)`, and sixteen seventeenths of 255 is 240.
+            expect: [0, 0, 240, 240],
+        },
+        // And faded in the translucent pass, which blends it over the clear.
+        //
+        // `src + dst * (1 - srcAlpha)` is `(0, 0, 240, 240) + (51, 102, 153, 255) / 17`, and a
+        // seventeenth of each of those is an integer: 3, 6, 9 and 15. So this is the case that
+        // says the blend state is engaged at all, and the pair above says that where the alpha is
+        // one it makes no difference.
+        Case {
+            name: "background_faded_over",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::BackgroundShader,
+            surface: Surface::Plane,
+            layout: Layout::PerAttribute,
+            streams: vec![shorts(&COVERING)],
+            uniforms: vec![
+                block(&BACKGROUND_DRAWABLE_UBO, &[("matrix", At::F(&CLIP))]),
+                block(
+                    &BACKGROUND_PROPS_UBO,
+                    &[
+                        ("color", At::F(&[0.0, 0.0, 1.0, 1.0])),
+                        ("opacity", At::F(&[FADED])),
+                    ],
+                ),
+            ],
+            images: Vec::new(),
+            vertices: 3,
+            ubo_index: 0,
+            pass: Some(RenderPass::TRANSLUCENT.bits()),
+            absent: &[],
+            instanced: None,
+            expect: [3, 6, 249, 255],
         },
         // An outline, which is the one family whose fragment stage reads its own screen position
         // back and so the one that can tell which way `y` runs.
@@ -884,6 +1005,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [255, 255, 255, 255],
@@ -945,6 +1067,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [255, 115, 12, 255],
@@ -998,6 +1121,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [125, 125, 125, 255],
@@ -1074,6 +1198,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 6,
+            pass: None,
             absent: &[],
             instanced: Some(Instanced {
                 // Two points, and the second is flagged: it is the ring's closing point, which is
@@ -1189,6 +1314,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 6,
+            pass: None,
             absent: &[],
             instanced: Some(Instanced {
                 streams: vec![
@@ -1313,6 +1439,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [64, 32, 64, 64],
@@ -1396,6 +1523,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [64, 32, 64, 64],
@@ -1458,6 +1586,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [54, 37, 87, 255],
@@ -1522,6 +1651,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [128, 64, 0, 128],
@@ -1606,6 +1736,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [10, 90, 55, 128],
@@ -1642,6 +1773,7 @@ fn cases() -> Vec<Case> {
             images: vec![glyph_atlas()],
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [200, 100, 50, 255],
@@ -1679,6 +1811,7 @@ fn cases() -> Vec<Case> {
             images: vec![glyph_atlas()],
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [0, 0, 0, 0],
@@ -1728,6 +1861,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [194, 144, 255, 255],
@@ -1800,6 +1934,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [95, 47, 24, 118],
@@ -1873,6 +2008,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 6,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [80, 255, 255, 255],
@@ -1963,6 +2099,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [48, 24, 64, 64],
@@ -2038,6 +2175,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [48, 24, 64, 64],
@@ -2152,6 +2290,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 6,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [32, 16, 64, 64],
@@ -2188,6 +2327,7 @@ fn cases() -> Vec<Case> {
             images: vec![sprite_sheet(16)],
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [40, 20, 64, 64],
@@ -2219,6 +2359,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [40, 20, 64, 64],
@@ -2249,6 +2390,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [100, 50, 25, 64],
@@ -2342,6 +2484,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [0, 255, 255, 255],
@@ -2404,6 +2547,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [255, 255, 0, 255],
@@ -2488,6 +2632,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [255, 0, 255, 255],
@@ -2581,6 +2726,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [32, 16, 64, 64],
@@ -2633,6 +2779,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 6,
             ubo_index: 0,
+            pass: None,
             absent: &[],
             instanced: None,
             expect: [0, 255, 0, 255],
@@ -2707,6 +2854,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 6,
             ubo_index: 0,
+            pass: None,
             absent: &[1, 2, 3, 4, 5, 6, 7],
             instanced: None,
             expect: [31, 122, 69, 153],
@@ -2923,6 +3071,20 @@ const CLEAR: [f32; 4] = [0.2, 0.4, 0.6, 1.0];
 
 /// The same color as the target's bytes, which is what a case reading the clear expects.
 const CLEARED: [u8; 4] = [51, 102, 153, 255];
+
+/// The opacity the two faded background cases draw at, chosen so neither outcome rounds.
+///
+/// Sixteen seventeenths. 255 is fifteen seventeenths, so a seventeenth of each of [`CLEAR`]'s
+/// bytes is an integer -- 3, 6, 9 and 15 -- and sixteen seventeenths of 255 is 240. Both the
+/// premultiplied color the fragment stage returns and the blend of it over the clear land on exact
+/// bytes, so the pair is decided by the blend state and not by a device's precision. Which the
+/// spec leaves open: blending "may be performed at the precision of the framebuffer format", and
+/// quantizing the source alpha to eight bits first gives the same four bytes here.
+///
+/// A rounder opacity does not have that property. A half leaves 25.5 and 76.5, and a fifth leaves
+/// 40.8 and 173.4 -- the first pair sitting exactly on the boundary two rounding rules disagree
+/// about, and the second close enough to it to depend on where the multiply happened.
+const FADED: f32 = 16.0 / 17.0;
 
 /// What the producer would have sent for this case's streams.
 ///
@@ -3372,7 +3534,7 @@ fn draw_case<'d>(
         case.family,
         case.surface,
         &plan,
-        Blend::Unblended,
+        case.pass.map_or(Blend::Unblended, |pass| found.blend(pass)),
         pipelines::Depth::Write,
     );
     let bindings = pipelines::bindings(found, case.surface);
@@ -3430,7 +3592,7 @@ fn draw_case<'d>(
         //
         // Decided here from the slot rather than asked of `slots::held_at`, which is the thing
         // under test. The first version of this did ask, and the mutation that made every block
-        // the layer's passed all thirty-one cases: the decoy below was placed by the same
+        // the layer's passed all thirty-one cases it then had: the decoy below was placed by the same
         // function, so a wrong answer moved the real bytes and the decoy together and nothing was
         // ever read from the wrong place.
         let at = if slot == FRAME_WIDE_SLOT {

@@ -73,10 +73,13 @@ pub struct Key {
     pub layout: Vec<Slot>,
     /// How the draw composites.
     ///
-    /// In the key because it is pipeline state, for the same reason the vertex layout is: two
-    /// layers of one family and permutation can pick different `ColorMode`s -- a heatmap
-    /// accumulates where a fill composites -- and a cache keyed without this would hand the second
-    /// one the first's pipeline and blend it wrongly. Which draws.
+    /// In the key because it is pipeline state, for the same reason the vertex layout is: one
+    /// family, permutation and layout can want two of these, and a cache keyed without it would
+    /// hand the second draw the first's pipeline and composite it wrongly. Which draws.
+    ///
+    /// Not hypothetical. Seven of the twenty families are [`crate::families::Composite::ByPass`],
+    /// and the captured Berlin frame batches its background twice -- once in each pass -- which is
+    /// the same family, permutation and layout under two blends.
     pub blend: Blend,
     /// Whether the draw writes depth.
     ///
@@ -639,8 +642,14 @@ const CONTENT_COMPARE_MASK: u32 = 0;
 ///
 /// mbgl's four named `ColorMode`s, which is where these come from rather than from first
 /// principles: `include/mbgl/gfx/color_mode.hpp` has `unblended`, `alphaBlended`, `additive` and
-/// `disabled`, and a layer picks one. Per layer rather than per family, which is why this is a
-/// parameter of [`build`] and not a constant.
+/// `disabled`, and a render layer picks one.
+///
+/// Three of the four are here. The fourth, `disabled`, is a mask of all-false rather than a blend
+/// function -- it writes no color at all -- and this crate spells it [`no_color`], which is what a
+/// clipping mask's pipeline is built with.
+///
+/// Which of the three a draw takes is [`crate::families::Composite`] and the batch's pass, so it
+/// is a parameter of [`build`] rather than a constant: a family can have two of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Blend {
     /// The source replaces the target. mbgl's `unblended`.

@@ -37,7 +37,9 @@
 //!
 //! What it still does *not* do is draw. That wants a pipeline per batch and the recording itself,
 //! which is its own piece of work; this stops where every resource a draw would bind is on the
-//! device and reachable.
+//! device and reachable, and where every input to the pipeline's key is in hand -- the last of
+//! them being the blend, which the frame's background takes two different values of because it is
+//! batched once in each pass.
 
 // A bench is a program, and it reports by printing.
 #![allow(
@@ -53,6 +55,7 @@ mod common;
 use std::collections::BTreeSet;
 
 use tessella_capture_abi::EnvelopeKind;
+use tessella_capture_abi::RenderPass;
 use tessella_capture_abi::capture;
 use tessella_capture_abi::envelope::ViewId;
 use tessella_capture_abi::ring::Ring;
@@ -61,11 +64,24 @@ use tessella_consume::slab::{self, Slab};
 use tessella_consume::upload::Upload;
 use tessella_emblema::blocks::Blocks;
 use tessella_emblema::descriptors::Sets;
+use tessella_emblema::pipelines::Blend;
 use tessella_emblema::store::Store;
 use tessella_emblema::surface::Surface;
 use tessella_emblema::{blocks, buffers, families, pipelines, vertices};
 
 use common::Open;
+
+/// A pass, as a name. An order entry carries one bit of what is a mask on the wire.
+fn named(pass: u8) -> String {
+    let one = RenderPass::from_bits(pass);
+    if one == Some(RenderPass::OPAQUE) {
+        "the opaque pass".to_owned()
+    } else if one == Some(RenderPass::TRANSLUCENT) {
+        "the translucent pass".to_owned()
+    } else {
+        format!("pass {pass:#04b}")
+    }
+}
 
 fn main() {
     let Ok(path) = std::env::var("TSE_CAPTURE") else {
@@ -168,6 +184,24 @@ fn run(path: &str) -> Result<(), String> {
     let mut layers: Vec<i32> = programs.iter().map(|(_, layer)| *layer).collect();
     layers.sort_unstable();
     layers.dedup();
+
+    // And how each batch composites, which is the last thing a draw needs that nothing on the wire
+    // carries: mbgl writes a `ColorMode` per render layer, and `families::Composite` is that table.
+    // Read here rather than below because `frame` borrows the host, which the uploads take back.
+    //
+    // By (family, pass) and not by batch, because that is what the answer depends on -- and in
+    // this frame the two differ: its background is batched twice, once in each pass, and those are
+    // the two arms of the one family that has two.
+    let mut composites: Vec<(&'static str, u8, Blend)> = frame
+        .batches
+        .iter()
+        .filter_map(|batch| {
+            let family = families::for_wire(batch.key.builtin_shader)?;
+            Some((family.name, batch.key.pass, family.blend(batch.key.pass)))
+        })
+        .collect();
+    composites.sort_unstable_by_key(|(name, pass, _)| (*name, *pass));
+    composites.dedup_by_key(|(name, pass, _)| (*name, *pass));
 
     let joiner = frame.joiner;
     let plans: Vec<(
@@ -381,6 +415,25 @@ fn run(path: &str) -> Result<(), String> {
     for why in refused.iter().take(4) {
         println!("                             {why}");
     }
+
+    // The blend each of them would be built with. Not a draw, and not a pipeline: it is the one
+    // input to `pipelines::Key` that the capture cannot supply, so this is where the table meets a
+    // real frame's batches rather than a fixture's chosen pair.
+    let replaced: Vec<String> = composites
+        .iter()
+        .filter(|(_, _, blend)| *blend == Blend::Unblended)
+        .map(|(name, pass, _)| format!("{name} in {}", named(*pass)))
+        .collect();
+    println!(
+        "  the blends            ok   {} (family, pass) pairs, {} by replacement{}",
+        composites.len(),
+        replaced.len(),
+        if replaced.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", replaced.join(", "))
+        }
+    );
 
     Ok(())
 }

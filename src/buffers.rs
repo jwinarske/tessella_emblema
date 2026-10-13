@@ -48,6 +48,16 @@ pub struct Needs {
     /// `vkCmdBindIndexBuffer` rather than as a vertex binding, and a store that merged them would
     /// have to un-merge them to bind.
     pub indexes: Option<SlabRef>,
+    /// Which of [`Self::vertices`] are also bound as a storage buffer, as indices into it.
+    ///
+    /// A set rather than a flag beside each buffer, because a buffer can be named by several
+    /// bindings and only some of them shared: the instanced extrusion's outline position and its
+    /// packed decimals both name the shared buffer, and the data-driven paint beside them in the
+    /// same geometry does not. So the answer is per *buffer* and is the union over the bindings
+    /// that read it, which is what `needs` computes.
+    ///
+    /// Sorted and without repeats. Empty for every family but the instanced extrusions.
+    pub storage: Vec<usize>,
 }
 
 /// What a planned drawable needs on the device.
@@ -61,6 +71,7 @@ pub fn needs(plan: &Plan, indexes: SlabRef) -> Needs {
         vertices: Vec::new(),
         reads: Vec::with_capacity(plan.bound.len()),
         indexes: (indexes.length > 0).then_some(indexes),
+        storage: Vec::new(),
     };
     for bound in &plan.bound {
         let at = out
@@ -75,7 +86,14 @@ pub fn needs(plan: &Plan, indexes: SlabRef) -> Needs {
             slot: bound.slot,
             buffer: at,
         });
+        // The union over the bindings that read this buffer, not the last one's answer: the
+        // instanced extrusion's outline is read by two shared bindings and its paint by three that
+        // are not, and whether the *buffer* needs the usage is whether any of them said so.
+        if bound.shared && !out.storage.contains(&at) {
+            out.storage.push(at);
+        }
     }
+    out.storage.sort_unstable();
     out
 }
 

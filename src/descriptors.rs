@@ -37,7 +37,7 @@
 use std::collections::BTreeMap;
 
 use ash::vk;
-use tessella_capture_abi::envelope::{TextureFilter, TextureRef};
+use tessella_capture_abi::envelope::{GeometryId, TextureFilter, TextureRef};
 use tessella_vk::{DescriptorPool, Gpu, Sampler};
 
 use crate::blocks::{Blocks, Which};
@@ -119,6 +119,16 @@ pub enum Error {
         /// How many arrived.
         got: usize,
     },
+    /// A group-one set was asked for on a family whose layout has none.
+    ///
+    /// Every family but the instanced extrusions is drawn entirely out of its layer's set, so
+    /// [`crate::pipelines::layout`] builds them one set layout and nothing else. Allocating from
+    /// group zero's layout instead would give a set the module does not declare, which binds
+    /// nothing where the body reads the instance buffer.
+    NoInstanceLayout {
+        /// The geometry the caller asked for.
+        geometry: GeometryId,
+    },
     /// The device refused.
     Device(tessella_vk::Error),
 }
@@ -160,6 +170,9 @@ impl core::fmt::Display for Error {
             Self::WrongTextureCount { wanted, got } => {
                 write!(f, "the set has {wanted} texture bindings and {got} arrived")
             }
+            Self::NoInstanceLayout { geometry } => {
+                write!(f, "geometry {} has no group-one layout", geometry.0)
+            }
             Self::Device(why) => write!(f, "{why}"),
         }
     }
@@ -184,6 +197,7 @@ pub struct Sets<'d> {
     linear: Sampler<'d>,
     nearest: Sampler<'d>,
     held: BTreeMap<Which, vk::DescriptorSet>,
+    per_drawable: BTreeMap<GeometryId, vk::DescriptorSet>,
 }
 
 impl core::fmt::Debug for Sets<'_> {
@@ -217,6 +231,7 @@ impl<'d> Sets<'d> {
             linear: gpu.sampler(vk::Filter::LINEAR)?,
             nearest: gpu.sampler(vk::Filter::NEAREST)?,
             held: BTreeMap::new(),
+            per_drawable: BTreeMap::new(),
         })
     }
 
@@ -230,6 +245,16 @@ impl<'d> Sets<'d> {
     #[must_use]
     pub fn get(&self, which: Which) -> Option<vk::DescriptorSet> {
         self.held.get(&which).copied()
+    }
+
+    /// The group-one set for a drawable, once it has one.
+    ///
+    /// Keyed by the geometry rather than by the layer, which is the whole reason it is a second
+    /// set: the buffer it names belongs to one geometry. A geometry drawn twice in a frame shares
+    /// the set, because the buffer is the same both times.
+    #[must_use]
+    pub fn instances(&self, geometry: GeometryId) -> Option<vk::DescriptorSet> {
+        self.per_drawable.get(&geometry).copied()
     }
 
     /// The sampler for a filter.
@@ -268,7 +293,7 @@ impl<'d> Sets<'d> {
     ) -> Result<vk::DescriptorSet, Error> {
         let images = bindings
             .iter()
-            .filter(|b| b.kind == Kind::SampledImage)
+            .filter(|b| b.group == 0 && b.kind == Kind::SampledImage)
             .count();
         if images != textures.len() {
             return Err(Error::WrongTextureCount {
@@ -289,7 +314,10 @@ impl<'d> Sets<'d> {
         // `minStorageBufferOffsetAlignment` appears here or in `blocks`: one buffer per slot means
         // there is no offset to align.
         let mut buffers: Vec<vk::DescriptorBufferInfo> = Vec::with_capacity(bindings.len());
-        for binding in bindings.iter().filter(|b| b.kind == Kind::StorageBuffer) {
+        for binding in bindings
+            .iter()
+            .filter(|b| b.group == 0 && b.kind == Kind::StorageBuffer)
+        {
             let slot = binding.slot.ok_or(Error::UnknownSlot {
                 binding: binding.binding,
             })?;
@@ -329,7 +357,9 @@ impl<'d> Sets<'d> {
         let mut block = 0usize;
         let mut image = 0usize;
         let mut sampler = 0usize;
-        for binding in bindings {
+        // Group zero alone: group one is one buffer a drawable and goes through
+        // [`Self::write_instances`], which is called per geometry rather than per layer.
+        for binding in bindings.iter().filter(|b| b.group == 0) {
             let write = vk::WriteDescriptorSet::default()
                 .dst_set(set)
                 .dst_binding(binding.binding)
@@ -363,6 +393,47 @@ impl<'d> Sets<'d> {
         Ok(set)
     }
 
+    /// Allocates and writes the group-one set for one drawable's instance buffer.
+    ///
+    /// One binding, the whole buffer at offset zero. The buffer is a geometry's own, created by
+    /// [`crate::store`] over exactly the slab reference the producer sent, so there is no offset
+    /// and therefore no `minStorageBufferOffsetAlignment` -- the same property every group-zero
+    /// binding has for the same reason.
+    ///
+    /// Idempotent per geometry within a frame: the second call returns the first set rather than
+    /// allocating another, because the buffer cannot have changed under it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoInstanceLayout`] for a family whose layout has no group one -- which is every
+    /// family but the instanced extrusions, and asking for one is a caller that has mistaken which
+    /// family it is holding. [`Error::Device`] when the pool refuses.
+    pub fn write_instances(
+        &mut self,
+        layout: &Layout<'_>,
+        geometry: GeometryId,
+        buffer: vk::Buffer,
+    ) -> Result<vk::DescriptorSet, Error> {
+        if let Some(had) = self.per_drawable.get(&geometry) {
+            return Ok(*had);
+        }
+        let described = layout
+            .instances()
+            .ok_or(Error::NoInstanceLayout { geometry })?;
+        let set = self.pool.allocate(described)?;
+        let info = [vk::DescriptorBufferInfo::default()
+            .buffer(buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        self.pool.write(&[vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&info)]);
+        self.per_drawable.insert(geometry, set);
+        Ok(set)
+    }
+
     /// Frees every set at once.
     ///
     /// # Correctness, which this cannot check
@@ -376,6 +447,7 @@ impl<'d> Sets<'d> {
     pub fn reset(&mut self) -> Result<(), Error> {
         self.pool.reset()?;
         self.held.clear();
+        self.per_drawable.clear();
         Ok(())
     }
 }

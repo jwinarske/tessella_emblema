@@ -11,7 +11,7 @@
 //!
 //! # What is not here
 //!
-//! Fifteen of mbgl's thirty-three shaders. [`UNDRAWN`] lists them with the reason, and
+//! Sixteen of mbgl's thirty-six shader entries. [`UNDRAWN`] lists them with the reason, and
 //! [`for_wire`] returns `None` for each, so a producer naming one is a drawable this crate skips
 //! rather than a panic. The list is pinned by a test: adding a family here without removing it
 //! there fails, and so does the reverse.
@@ -19,6 +19,7 @@
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_capture_abi::generated::shader_attributes::{
     BACKGROUND_PATTERN_SHADER, BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER,
+    FILL_EXTRUSION_INSTANCED_SHADER, FILL_EXTRUSION_INSTANCED_SHADER_INSTANCE,
     FILL_EXTRUSION_SHADER, FILL_OUTLINE_SHADER, FILL_OUTLINE_TRIANGULATED_SHADER,
     FILL_PATTERN_SHADER, FILL_SHADER, HEATMAP_SHADER, HEATMAP_TEXTURE_SHADER,
     HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, LINE_PATTERN_SHADER, LINE_SHADER, RASTER_SHADER,
@@ -47,9 +48,10 @@ use tessella_capture_abi::generated::ubo_layouts::{
 
 use crate::shaders::{
     BACKGROUND_BODY, BACKGROUND_PATTERN_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY,
-    FILL_EXTRUSION_BODY, FILL_OUTLINE_BODY, FILL_OUTLINE_TRIANGULATED_BODY, FILL_PATTERN_BODY,
-    HEATMAP_BODY, HEATMAP_TEXTURE_BODY, HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_BODY,
-    LINE_PATTERN_BODY, RASTER_BODY, SYMBOL_ICON_BODY, SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY,
+    FILL_EXTRUSION_BODY, FILL_EXTRUSION_INSTANCED_BODY, FILL_OUTLINE_BODY,
+    FILL_OUTLINE_TRIANGULATED_BODY, FILL_PATTERN_BODY, HEATMAP_BODY, HEATMAP_TEXTURE_BODY,
+    HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_BODY, LINE_PATTERN_BODY, RASTER_BODY,
+    SYMBOL_ICON_BODY, SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY,
 };
 use crate::surface::Surface;
 
@@ -85,8 +87,17 @@ pub struct Family {
     pub name: &'static str,
     /// The uniform blocks the body reads, in binding order.
     pub blocks: &'static [&'static UboLayout],
-    /// The attribute table the vertex input is planned against.
+    /// The attribute table the vertex input is planned against, per vertex.
     pub attributes: &'static [ShaderAttribute],
+    /// The same per instance, which is empty for every family but the instanced extrusions.
+    ///
+    /// mbgl declares these in a second array -- `instanceAttributes` beside `attributes` -- and
+    /// the generated tables carry both. A family with any of these is drawn with more than one
+    /// instance, which has two consequences nothing else here has: `firstInstance` cannot carry
+    /// `ubo_index` (see [`crate::draws`]), and the entries that name a `shared_buffer` are the
+    /// fields of an element the body also reads through a storage buffer, because it has to look
+    /// at the *next* instance and an attribute fetch cannot look ahead.
+    pub instance_attributes: &'static [ShaderAttribute],
     /// The texture table, which names the module's samplers.
     pub textures: &'static [ShaderTexture],
     /// The hand-written body.
@@ -104,6 +115,7 @@ pub static ALL: &[Family] = &[
         name: "background",
         blocks: &[&BACKGROUND_DRAWABLE_UBO, &BACKGROUND_PROPS_UBO],
         attributes: &BACKGROUND_SHADER,
+        instance_attributes: &[],
         textures: &[],
         body: BACKGROUND_BODY,
         surfaces: FLAT_OR_BENT,
@@ -118,6 +130,7 @@ pub static ALL: &[Family] = &[
             &GLOBAL_PAINT_PARAMS_UBO,
         ],
         attributes: &BACKGROUND_PATTERN_SHADER,
+        instance_attributes: &[],
         textures: &BACKGROUND_PATTERN_SHADER_TEXTURES,
         body: BACKGROUND_PATTERN_BODY,
         surfaces: FLAT_OR_BENT,
@@ -128,6 +141,7 @@ pub static ALL: &[Family] = &[
         name: "fill",
         blocks: &[&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
         attributes: &FILL_SHADER,
+        instance_attributes: &[],
         textures: &[],
         body: FILL_BODY,
         surfaces: EVERY,
@@ -142,6 +156,7 @@ pub static ALL: &[Family] = &[
             &GLOBAL_PAINT_PARAMS_UBO,
         ],
         attributes: &FILL_OUTLINE_SHADER,
+        instance_attributes: &[],
         textures: &[],
         body: FILL_OUTLINE_BODY,
         surfaces: EVERY,
@@ -160,6 +175,7 @@ pub static ALL: &[Family] = &[
             &GLOBAL_PAINT_PARAMS_UBO,
         ],
         attributes: &FILL_OUTLINE_TRIANGULATED_SHADER,
+        instance_attributes: &[],
         textures: &[],
         body: FILL_OUTLINE_TRIANGULATED_BODY,
         surfaces: EVERY,
@@ -175,6 +191,7 @@ pub static ALL: &[Family] = &[
             &GLOBAL_PAINT_PARAMS_UBO,
         ],
         attributes: &FILL_PATTERN_SHADER,
+        instance_attributes: &[],
         textures: &FILL_PATTERN_SHADER_TEXTURES,
         body: FILL_PATTERN_BODY,
         surfaces: EVERY,
@@ -185,8 +202,20 @@ pub static ALL: &[Family] = &[
         name: "fill_extrusion",
         blocks: &[&FILL_EXTRUSION_DRAWABLE_UBO, &FILL_EXTRUSION_PROPS_UBO],
         attributes: &FILL_EXTRUSION_SHADER,
+        instance_attributes: &[],
         textures: &[],
         body: FILL_EXTRUSION_BODY,
+        surfaces: PLANE_OR_ANCHORED,
+        height: true,
+    },
+    Family {
+        shader: BuiltIn::FillExtrusionInstancedShader,
+        name: "fill_extrusion_instanced",
+        blocks: &[&FILL_EXTRUSION_DRAWABLE_UBO, &FILL_EXTRUSION_PROPS_UBO],
+        attributes: &FILL_EXTRUSION_INSTANCED_SHADER,
+        instance_attributes: &FILL_EXTRUSION_INSTANCED_SHADER_INSTANCE,
+        textures: &[],
+        body: FILL_EXTRUSION_INSTANCED_BODY,
         surfaces: PLANE_OR_ANCHORED,
         height: true,
     },
@@ -199,6 +228,7 @@ pub static ALL: &[Family] = &[
             &GLOBAL_PAINT_PARAMS_UBO,
         ],
         attributes: &LINE_SHADER,
+        instance_attributes: &[],
         textures: &[],
         body: LINE_BODY,
         surfaces: EVERY,
@@ -214,6 +244,7 @@ pub static ALL: &[Family] = &[
             &GLOBAL_PAINT_PARAMS_UBO,
         ],
         attributes: &LINE_PATTERN_SHADER,
+        instance_attributes: &[],
         textures: &LINE_PATTERN_SHADER_TEXTURES,
         body: LINE_PATTERN_BODY,
         surfaces: EVERY,
@@ -228,6 +259,7 @@ pub static ALL: &[Family] = &[
             &GLOBAL_PAINT_PARAMS_UBO,
         ],
         attributes: &CIRCLE_SHADER,
+        instance_attributes: &[],
         textures: &[],
         body: CIRCLE_BODY,
         surfaces: EVERY,
@@ -238,6 +270,7 @@ pub static ALL: &[Family] = &[
         name: "raster",
         blocks: &[&RASTER_DRAWABLE_UBO, &RASTER_EVALUATED_PROPS_UBO],
         attributes: &RASTER_SHADER,
+        instance_attributes: &[],
         textures: &RASTER_SHADER_TEXTURES,
         body: RASTER_BODY,
         surfaces: EVERY,
@@ -251,6 +284,7 @@ pub static ALL: &[Family] = &[
             &HILLSHADE_PREPARE_TILE_PROPS_UBO,
         ],
         attributes: &HILLSHADE_PREPARE_SHADER,
+        instance_attributes: &[],
         textures: &HILLSHADE_PREPARE_SHADER_TEXTURES,
         body: HILLSHADE_PREPARE_BODY,
         surfaces: FLAT,
@@ -265,6 +299,7 @@ pub static ALL: &[Family] = &[
             &HILLSHADE_EVALUATED_PROPS_UBO,
         ],
         attributes: &HILLSHADE_SHADER,
+        instance_attributes: &[],
         textures: &HILLSHADE_SHADER_TEXTURES,
         body: HILLSHADE_BODY,
         surfaces: EVERY,
@@ -279,6 +314,7 @@ pub static ALL: &[Family] = &[
             &COLOR_RELIEF_EVALUATED_PROPS_UBO,
         ],
         attributes: &COLOR_RELIEF_SHADER,
+        instance_attributes: &[],
         textures: &COLOR_RELIEF_SHADER_TEXTURES,
         body: COLOR_RELIEF_BODY,
         surfaces: UNANCHORED,
@@ -289,6 +325,7 @@ pub static ALL: &[Family] = &[
         name: "heatmap",
         blocks: &[&HEATMAP_DRAWABLE_UBO, &HEATMAP_EVALUATED_PROPS_UBO],
         attributes: &HEATMAP_SHADER,
+        instance_attributes: &[],
         textures: &[],
         body: HEATMAP_BODY,
         surfaces: FLAT,
@@ -299,6 +336,7 @@ pub static ALL: &[Family] = &[
         name: "heatmap_texture",
         blocks: &[&HEATMAP_TEXTURE_PROPS_UBO, &GLOBAL_PAINT_PARAMS_UBO],
         attributes: &HEATMAP_TEXTURE_SHADER,
+        instance_attributes: &[],
         textures: &HEATMAP_TEXTURE_SHADER_TEXTURES,
         body: HEATMAP_TEXTURE_BODY,
         surfaces: FLAT_OR_BENT,
@@ -309,6 +347,7 @@ pub static ALL: &[Family] = &[
         name: "symbol_icon",
         blocks: SYMBOL_BLOCKS,
         attributes: &SYMBOL_ICON_SHADER,
+        instance_attributes: &[],
         textures: &SYMBOL_ICON_SHADER_TEXTURES,
         body: SYMBOL_ICON_BODY,
         surfaces: EVERY,
@@ -319,6 +358,7 @@ pub static ALL: &[Family] = &[
         name: "symbol_sdf",
         blocks: SYMBOL_BLOCKS,
         attributes: &SYMBOL_SDFSHADER,
+        instance_attributes: &[],
         textures: &SYMBOL_SDFSHADER_TEXTURES,
         body: SYMBOL_SDF_BODY,
         surfaces: EVERY,
@@ -329,6 +369,7 @@ pub static ALL: &[Family] = &[
         name: "symbol_text_and_icon",
         blocks: SYMBOL_BLOCKS,
         attributes: &SYMBOL_TEXT_AND_ICON_SHADER,
+        instance_attributes: &[],
         textures: &SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES,
         body: SYMBOL_TEXT_AND_ICON_BODY,
         surfaces: EVERY,
@@ -353,11 +394,11 @@ const SYMBOL_BLOCKS: &[&UboLayout] = &[
 /// Until a real frame could be replayed here, that reason was unfalsifiable: every fixture writes
 /// the records its author chose, so a family nothing sent looked the same as a family nothing
 /// *will* send. `benches/capture_frame.rs` replays a capture of a real style and reports the
-/// shaders it names that have no family -- and a Berlin z14 frame through `families_p` names
+/// shaders it names that have no family -- and a Berlin z14 frame through `families_p` named
 /// `FillOutlineTriangulatedShader` twice and `FillExtrusionInstancedShader` twice.
 ///
-/// So one reason here is now measured rather than assumed, and the rest stay claims. A capture of
-/// a style that uses them is what would settle the others.
+/// Both are drawn now, and that frame plans and uploads all nineteen of its geometries. What is
+/// left here is claims again: a capture of a style that uses one of these is what would settle it.
 pub static UNDRAWN: &[(BuiltIn, &str)] = &[
     (
         BuiltIn::None,
@@ -391,10 +432,6 @@ pub static UNDRAWN: &[(BuiltIn, &str)] = &[
     (
         BuiltIn::FillOutlinePatternShader,
         "the producer emits no drawable for it yet",
-    ),
-    (
-        BuiltIn::FillExtrusionInstancedShader,
-        "the wall form, whose instance attributes the tables carry and whose body is unported",
     ),
     (
         BuiltIn::FillExtrusionPatternShader,

@@ -457,6 +457,7 @@ fn draw(
                 Surface::Plane,
                 fill.blocks,
                 fill.attributes,
+                fill.instance_attributes,
                 fill.textures,
                 fill.body,
             )
@@ -500,6 +501,7 @@ fn draw(
             pipeline,
             layout: layout.pipeline(),
             instances: 1,
+            per_drawable: false,
         }
     };
 
@@ -513,6 +515,7 @@ fn draw(
                 Surface::Plane,
                 raster.blocks,
                 raster.attributes,
+                raster.instance_attributes,
                 raster.textures,
                 raster.body,
             )
@@ -557,11 +560,13 @@ fn draw(
             pipeline,
             layout: layout.pipeline(),
             instances: 1,
+            per_drawable: false,
         }
     };
 
     // The mask pipeline and its own set, over the one storage binding its body declares.
     let mask_bindings = [pipelines::Binding {
+        group: 0,
         binding: 0,
         kind: pipelines::Kind::StorageBuffer,
         slot: Some(MASK_SLOT),

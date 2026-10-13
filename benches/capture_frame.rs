@@ -150,7 +150,15 @@ fn run(path: &str) -> Result<(), String> {
                 continue;
             };
             families_seen.insert(family.name);
-            let plan = match vertices::plan(family.attributes, &drawable.geometry.attrs) {
+            // Both runs, because a family with instance attributes has them on the wire too: the
+            // ABI splits a geometry's `attrs` from its `instance_attrs`, and which run a
+            // descriptor arrived in is the only thing that says a binding advances per instance.
+            let plan = match vertices::plan_instanced(
+                family.attributes,
+                &drawable.geometry.attrs,
+                family.instance_attributes,
+                &drawable.geometry.instance_attrs,
+            ) {
                 Ok(plan) => plan,
                 Err(why) => {
                     refused.push(format!(

@@ -55,9 +55,11 @@ fn blocks_for<'d>(
     bindings: &[pipelines::Binding],
 ) -> Result<Blocks<'d>, String> {
     let mut blocks = Blocks::new();
+    // Group zero only: `Sets::write` fills a layer's set from the blocks, and group one is a
+    // geometry's instance buffer, which `write_instances` binds and no `Blocks` holds.
     for binding in bindings
         .iter()
-        .filter(|b| b.kind == pipelines::Kind::StorageBuffer)
+        .filter(|b| b.group == 0 && b.kind == pipelines::Kind::StorageBuffer)
     {
         let slot = binding
             .slot
@@ -74,7 +76,7 @@ fn blocks_for<'d>(
 fn texture_slots(bindings: &[pipelines::Binding]) -> Vec<u32> {
     bindings
         .iter()
-        .filter(|b| b.kind == pipelines::Kind::SampledImage)
+        .filter(|b| b.group == 0 && b.kind == pipelines::Kind::SampledImage)
         .filter_map(|b| b.slot)
         .collect()
 }
@@ -219,7 +221,7 @@ fn each_binding_resolves_its_own_slot(device: &Open) -> Result<(), String> {
     let bindings = pipelines::bindings(family, Surface::Plane);
     let slots: Vec<u32> = bindings
         .iter()
-        .filter(|b| b.kind == pipelines::Kind::StorageBuffer)
+        .filter(|b| b.group == 0 && b.kind == pipelines::Kind::StorageBuffer)
         .filter_map(|b| b.slot)
         .collect();
     if slots.len() < 2 {

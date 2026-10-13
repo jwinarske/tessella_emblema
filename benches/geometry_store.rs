@@ -53,6 +53,7 @@ fn two_and_indexes() -> (Needs, Vec<u8>, Vec<u8>, Vec<u8>) {
         vertices: vec![first, second],
         reads: vec![Reads { slot: 0, buffer: 0 }, Reads { slot: 1, buffer: 1 }],
         indexes: Some(indexes),
+        storage: Vec::new(),
     };
     // Distinct per buffer and varying within each, so a swap or a shared offset cannot pass.
     let a: Vec<u8> = (0..64u8).collect();
@@ -138,6 +139,7 @@ fn dedup(device: &Open) -> Result<(), String> {
         vertex_offset: 0,
         source: interleaved,
         rate: vk::VertexInputRate::VERTEX,
+        shared: false,
     };
     let plan = Plan {
         bound: vec![bound(0, 0), bound(1, 4), bound(2, 8)],
@@ -189,6 +191,7 @@ fn the_bind_list_follows_the_reads(device: &Open) -> Result<(), String> {
         vertex_offset: 0,
         source: interleaved,
         rate: vk::VertexInputRate::VERTEX,
+        shared: false,
     };
     let plan = Plan {
         bound: vec![bound(0, 0), bound(1, 4), bound(2, 8)],
@@ -242,6 +245,7 @@ fn refusals(device: &Open) -> Result<(), String> {
         vertices: vec![at(9, 0, 32)],
         reads: vec![Reads { slot: 0, buffer: 0 }],
         indexes: None,
+        storage: Vec::new(),
     };
     let mut store = Store::new();
 

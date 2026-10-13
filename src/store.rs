@@ -100,6 +100,27 @@ pub struct Layout {
     pub total: u64,
 }
 
+/// What usage one of a geometry's vertex buffers is created with.
+///
+/// `VERTEX_BUFFER` always, and `STORAGE_BUFFER` as well for a buffer the ABI says is bound twice.
+/// mbgl's `AttributeInfo` carries a UBO binding beside the location for exactly those, which makes
+/// `VertexAttribute::getBufferUsage` return both bits and `Drawable::setSharedBuffers` register the
+/// same buffer at that binding -- and the instanced extrusion's body needs both, because it reads
+/// its own instance as an attribute and the *next* one out of the array.
+///
+/// A usage the module reads and the buffer was not created with is invalid usage that no driver has
+/// to report. Split out and `pub` so it can be read against [`crate::buffers::Needs::storage`]
+/// without a device: there is no `vkGetBufferUsage`, so this decision cannot be checked after the
+/// fact on the device it was made for.
+#[must_use]
+pub fn vertex_usage(needs: &Needs, at: usize) -> vk::BufferUsageFlags {
+    if needs.storage.contains(&at) {
+        vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::STORAGE_BUFFER
+    } else {
+        vk::BufferUsageFlags::VERTEX_BUFFER
+    }
+}
+
 /// Lays a geometry's buffers out end to end, each aligned up to `alignment`.
 ///
 /// `alignment` is the largest `VkMemoryRequirements::alignment` of the buffers being placed. Taking
@@ -324,12 +345,8 @@ impl<'d> Store<'d> {
         let vertices: Vec<Buffer<'d>> = needs
             .vertices
             .iter()
-            .map(|reference| {
-                gpu.buffer(
-                    u64::from(reference.length),
-                    vk::BufferUsageFlags::VERTEX_BUFFER,
-                )
-            })
+            .enumerate()
+            .map(|(at, reference)| gpu.buffer(u64::from(reference.length), vertex_usage(needs, at)))
             .collect::<Result<_, _>>()?;
         let indexes = needs
             .indexes

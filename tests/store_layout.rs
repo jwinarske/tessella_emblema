@@ -46,6 +46,7 @@ fn vertices_of(lengths: &[u32]) -> Needs {
             })
             .collect(),
         indexes: None,
+        storage: Vec::new(),
     }
 }
 
@@ -94,6 +95,7 @@ fn no_two_buffers_overlap() {
             })
             .collect(),
         indexes: Some(at(4, 0, 33)),
+        storage: Vec::new(),
     };
 
     for alignment in [1, 4, 16, 64, 256, 1024] {
@@ -141,6 +143,7 @@ fn every_offset_is_aligned() {
             })
             .collect(),
         indexes: Some(at(3, 0, 7)),
+        storage: Vec::new(),
     };
     for alignment in [1, 2, 16, 64, 256] {
         let placed = store::layout(&needs, alignment);
@@ -218,6 +221,7 @@ fn the_index_buffer_is_placed_separately() {
         reads: vec![Reads { slot: 0, buffer: 0 }],
         // The *same* reference as the vertex buffer, which is a thing the producer sends.
         indexes: Some(shared),
+        storage: Vec::new(),
     };
     let placed = store::layout(&needs, 16);
 
@@ -249,6 +253,7 @@ fn a_deduplicated_plan_lays_out_one_buffer() {
         vertex_offset: 0,
         source: interleaved,
         rate: ash::vk::VertexInputRate::VERTEX,
+        shared: false,
     };
     let plan = Plan {
         bound: vec![bound(0, 0), bound(1, 4), bound(2, 8)],

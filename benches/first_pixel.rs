@@ -186,6 +186,13 @@ struct Case {
     /// One image per entry in `textures`, in the same order.
     images: Vec<Image>,
     vertices: u32,
+    /// The per-instance half, for the one family drawn with more than one instance.
+    ///
+    /// `None` for every other case, which is a draw of one instance whose attributes all advance
+    /// per vertex. The walls are the exception and need three things no other case does: a second
+    /// attribute run at the instance rate, a group-one descriptor set over the buffer that run is
+    /// read ahead in, and `ubo_index` in a push constant rather than in `firstInstance`.
+    instanced: Option<Instanced>,
     /// Which entry of the blocks the draw reads, which the body receives as `ubo_index`.
     ///
     /// Zero for every case but one. `drawable_at_one` is the exception and the reason this is a
@@ -193,6 +200,34 @@ struct Case {
     /// stride the entries are packed at -- see #81.
     ubo_index: u32,
     expect: [u8; 4],
+}
+
+/// Where one instance attribute's bytes sit, which an instanced case has to say explicitly.
+///
+/// [`Layout`] is per case and all-or-nothing, and the instance run is neither: the two attributes
+/// that name a shared buffer have to be *interleaved in one buffer at stride eight*, because the
+/// storage element the body reads ahead in is those same eight bytes, while the data-driven paint
+/// beside them is in buffers of its own. That is what the producer sends:
+/// `encode_extrusion_walls` puts the outline position and the packed decimals at offsets nought
+/// and four of the roof's own buffer, and the paint in the binder's interleaved one.
+#[derive(Debug, Clone, Copy)]
+struct Packed {
+    /// Which of [`Instanced::streams`] holds it.
+    stream: usize,
+    /// Byte offset within one instance.
+    offset: u32,
+    /// Bytes between consecutive instances.
+    stride: u32,
+}
+
+/// The per-instance half of a case.
+struct Instanced {
+    /// The streams, laid end to end after the case's per-vertex ones.
+    streams: Vec<Vec<u8>>,
+    /// One per entry in the family's instance table, in that order.
+    packing: Vec<Packed>,
+    /// Instances to draw.
+    count: u32,
 }
 
 /// An image the probe samples.
@@ -338,6 +373,52 @@ const CLIP: [f32; 16] = [
     0.0, 0.0, 1.0, 0.0, //
     0.0, 0.0, 0.0, 1.0,
 ];
+
+/// A wall's own matrix: the outline's `x` to clip `x`, and the *height* to clip `y`.
+///
+/// [`CLIP`] cannot serve here. A wall's vertical extent is its height, which `place` takes as the
+/// third component, and on a plane the drawable's matrix is what maps it -- so under the identity
+/// the height lands in clip `z` and a wall is a line of no area. This maps it to clip `y` instead,
+/// four units of clip per unit of height and down two, so a wall from a base of nought to a height
+/// of one covers the viewport and one pixel of it can be read.
+///
+/// Column-major, as the producer writes it: `transform` is `c0*x + c1*y + c2*z + c3`. The outline's
+/// `y` is dropped, which this case has no use for -- both of its points sit on the same row.
+///
+/// The sign of the `y` terms is unobservable and deliberately so: naga negates clip `y` after the
+/// body, and a wall centered on the viewport covers it either way round. What the case reads is a
+/// pixel in the middle, so which way up the wall went says nothing and is not asserted.
+const WALL_CLIP: [f32; 16] = [
+    1.0, 0.0, 0.0, 0.0, //
+    0.0, 0.0, 0.0, 0.0, //
+    0.0, 4.0, 0.0, 0.0, //
+    0.0, -2.0, 0.5, 1.0,
+];
+
+/// The unit quad the walls are instanced over, as six vertices rather than four and six indices.
+///
+/// mbgl's `fillExtrusionVertices` corners in both triangles: `x` picks which end of the outline's
+/// edge a vertex stands at and `y` picks the foot or the top. Six because a case draws without an
+/// index buffer -- `vkCmdDraw` rather than `vkCmdDrawIndexed` -- which costs two repeated corners
+/// and keeps the probe's one draw path.
+const WALL_QUAD: [i16; 12] = [1, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 1];
+
+/// The shared instance stream: one outline point per instance, packed as the producer packs it.
+///
+/// Eight bytes an instance -- two `i16` of position, the fraction and discard flag as one `u16`,
+/// and the edge distance as another. The same eight bytes the body reads ahead in as a storage
+/// element, which is the whole reason this stream is interleaved where the paint beside it is not.
+fn outline(points: &[([i16; 2], u16)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(points.len() * 8);
+    for (position, decimals) in points {
+        out.extend_from_slice(&position[0].to_le_bytes());
+        out.extend_from_slice(&position[1].to_le_bytes());
+        out.extend_from_slice(&decimals.to_le_bytes());
+        // The edge distance, which this family does not read -- a pattern does.
+        out.extend_from_slice(&0u16.to_le_bytes());
+    }
+    out
+}
 
 /// Three unflagged vertices' skirt attribute, as `Short2` pairs.
 ///
@@ -606,6 +687,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [0, 0, 255, 255],
         },
         // The second entry of a drawable buffer, which is where the entry *stride* becomes visible.
@@ -665,6 +747,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 1,
+            instanced: None,
             expect: [0, 0, 255, 255],
         },
         // A background: the only family whose color is a uniform rather than an attribute, and
@@ -690,6 +773,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [0, 0, 255, 255],
         },
         // An outline, which is the one family whose fragment stage reads its own screen position
@@ -737,6 +821,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [255, 255, 255, 255],
         },
         // An extrusion's roof, which is the one family that computes a color rather than
@@ -796,6 +881,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [255, 115, 12, 255],
         },
         // The same roof under a dim light at an angle, which is where the other half of the
@@ -847,7 +933,234 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [125, 125, 125, 255],
+        },
+        // The walls standing on that roof, which is the only case drawn per instance.
+        //
+        // Everything the family has that no other does is in this one draw: five attributes
+        // advancing per instance, `ubo_index` arriving as a push constant because `firstInstance`
+        // is the instance by then, and the *next* outline point read out of a group-one storage
+        // buffer over the same eight bytes the first two attributes are fetched from.
+        //
+        // That last one is what the case exists for. The wall runs from element nought to element
+        // one, and only the first of those arrives as an attribute -- so a body that read the
+        // lookahead wrongly, or a set that pointed at another buffer, puts the far end of the wall
+        // somewhere else and the edge vector with it. The normal is derived from that vector, so
+        // the shading is where it shows:
+        //
+        //   edge        = normalize((-2, 0) - (2, 0))              = (-1, 0)
+        //   normal      = (-edge.y, edge.x, 0)                     = (0, -1, 0)
+        //   facing      = clamp(dot((0, -1, 0), (0, -2, 0)), 0, 1) = 1
+        //
+        // A normal of (0, 0, 1) -- the roof's -- gives a facing of nought against this light and
+        // reads black, and a lookahead that returned element nought gives an edge of zero length,
+        // a normal of NaN and nothing drawn at all.
+        //
+        // The edge runs right to left so that the point read out of the *storage* buffer is the
+        // negative one, which is what puts the sign extension under test. Its two sixteen-bit
+        // halves are unpacked with signed shifts -- mbgl's `unpack_int` -- and with unsigned ones
+        // a position of -2 reads as 65534, which puts the far end of the wall a mile off the
+        // target and the read pixel outside it. The near end arrives as an attribute and needs no
+        // unpacking, so the two ends are not interchangeable here.
+        //
+        // The shading itself is the roof's arithmetic over a different color:
+        //
+        //   color       = (0, 128/255, 1),  luminance = 0.43120
+        //   ambient     = (0.03, 0.53196, 1.03)
+        //   directional = mix(1 - 1, max(1 - 0.43120 + 1, 1), 1) = 1.56880
+        //   lit         = clamp(ambient * 1.56880)  ->  (12, 213, 255)
+        //
+        // Blue saturates the clamp and the other two carry the signal, for the reason the roof
+        // case gives: equal channels make any permutation of the luminance weights look right.
+        //
+        // The vertical gradient is off here, which keeps the shade uniform over the whole wall --
+        // it is computed per vertex and interpolated, so a case that varied it would be reading an
+        // interpolation rather than the body. `extrusion_wall_dim` below turns it on and arranges
+        // for both ends to land on the same clamp.
+        Case {
+            name: "extrusion_wall",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillExtrusionInstancedShader,
+            surface: Surface::Plane,
+            layout: Layout::PerAttribute,
+            streams: vec![shorts(&WALL_QUAD)],
+            uniforms: vec![
+                block(
+                    &FILL_EXTRUSION_DRAWABLE_UBO,
+                    &[
+                        ("matrix", At::F(&WALL_CLIP)),
+                        ("base_t", At::F(&[0.0])),
+                        ("height_t", At::F(&[0.0])),
+                        ("color_t", At::F(&[0.0])),
+                    ],
+                ),
+                block(
+                    &FILL_EXTRUSION_PROPS_UBO,
+                    &[
+                        ("light_color", At::F(&[1.0, 1.0, 1.0])),
+                        ("light_position", At::F(&[0.0, -2.0, 0.0])),
+                        ("light_intensity", At::F(&[1.0])),
+                        ("vertical_gradient", At::F(&[0.0])),
+                        ("opacity", At::F(&[1.0])),
+                    ],
+                ),
+            ],
+            images: Vec::new(),
+            vertices: 6,
+            instanced: Some(Instanced {
+                // Two points, and the second is flagged: it is the ring's closing point, which is
+                // what keeps the lookahead inside the buffer on a real frame. One instance is
+                // drawn, so only the first point's flag is tested -- and that one is clear.
+                streams: vec![
+                    outline(&[([2, 0], 0), ([-2, 0], 1)]),
+                    per_vertex(&packed_color([0, 128, 255, 255]), 2),
+                    per_vertex(&[0.0, 0.0], 2),
+                    per_vertex(&[1.0, 1.0], 2),
+                ],
+                packing: vec![
+                    // The outline position and the packed decimals, interleaved at stride eight.
+                    Packed {
+                        stream: 0,
+                        offset: 0,
+                        stride: 8,
+                    },
+                    Packed {
+                        stream: 0,
+                        offset: 4,
+                        stride: 8,
+                    },
+                    // Then the data-driven paint, each in a buffer of its own.
+                    Packed {
+                        stream: 1,
+                        offset: 0,
+                        stride: 16,
+                    },
+                    Packed {
+                        stream: 2,
+                        offset: 0,
+                        stride: 8,
+                    },
+                    Packed {
+                        stream: 3,
+                        offset: 0,
+                        stride: 8,
+                    },
+                ],
+                count: 1,
+            }),
+            ubo_index: 0,
+            expect: [12, 213, 255, 255],
+        },
+        // The same wall with the vertical gradient on, which is the one term the roof has no
+        // branch for.
+        //
+        // The gradient is per vertex and interpolated across the wall, so a case reading one pixel
+        // can only pin it where both ends agree. A height of one and a half does that through the
+        // clamp's *lower* end:
+        //
+        //   dimmest = mix(0.7, 0.98, 1 - 1)                      = 0.7
+        //   factor  = clamp((t + 0) * sqrt(1.5 / 150), 0.7, 1.0) = 0.7  for t of 0 and of 1
+        //   directional *= (1 - 1) + 1 * 0.7                     = 1.09816
+        //   lit     = clamp(ambient * 1.09816)  ->  (8, 149, 255)
+        //
+        // So this separates three things the case above cannot: the gradient being applied at all
+        // (without it the pixel is the one above), the floor the clamp takes (a floor of 0.98 reads
+        // (12, 208, 255), and one of 0.7 taken from the wrong end of the `mix` reads the same as no
+        // gradient at all), and the constant 150 the height is scaled by -- at 15 the factor is
+        // 0.316 at the top, which is still clamped, but at 1.5 it is 3.16 and the whole term goes
+        // to one.
+        //
+        // It also draws the *second* entry of the drawable buffer, which is the only way to tell
+        // where this family's `ubo_index` came from. `firstInstance` is nought on an instanced draw
+        // -- it has to be -- so a body that took the slot from `@builtin(instance_index)` instead
+        // of from the push constant reads nought and gets the right answer by accident on a case
+        // drawing entry nought. Entry nought here is a decoy whose `color_t` takes the other end
+        // of the color pair, so a slot that fell back to the builtin draws red and says so.
+        Case {
+            name: "extrusion_wall_dim",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillExtrusionInstancedShader,
+            surface: Surface::Plane,
+            layout: Layout::PerAttribute,
+            streams: vec![shorts(&WALL_QUAD)],
+            uniforms: vec![
+                // Two entries at the union's stride. The decoy's matrix is the same, so a wrong
+                // index draws rather than blanks -- the outcome a decoy of zeros could not be
+                // told apart from a buffer bound at the wrong offset.
+                [
+                    block(
+                        &FILL_EXTRUSION_DRAWABLE_UBO,
+                        &[
+                            ("matrix", At::F(&WALL_CLIP)),
+                            ("base_t", At::F(&[0.0])),
+                            ("height_t", At::F(&[0.0])),
+                            ("color_t", At::F(&[0.0])),
+                        ],
+                    ),
+                    block(
+                        &FILL_EXTRUSION_DRAWABLE_UBO,
+                        &[
+                            ("matrix", At::F(&WALL_CLIP)),
+                            ("base_t", At::F(&[0.0])),
+                            ("height_t", At::F(&[0.0])),
+                            ("color_t", At::F(&[1.0])),
+                        ],
+                    ),
+                ]
+                .concat(),
+                block(
+                    &FILL_EXTRUSION_PROPS_UBO,
+                    &[
+                        ("light_color", At::F(&[1.0, 1.0, 1.0])),
+                        ("light_position", At::F(&[0.0, -2.0, 0.0])),
+                        ("light_intensity", At::F(&[1.0])),
+                        ("vertical_gradient", At::F(&[1.0])),
+                        ("opacity", At::F(&[1.0])),
+                    ],
+                ),
+            ],
+            images: Vec::new(),
+            vertices: 6,
+            instanced: Some(Instanced {
+                streams: vec![
+                    outline(&[([2, 0], 0), ([-2, 0], 1)]),
+                    // Two endpoints, so the entry's `color_t` decides which is drawn.
+                    per_vertex(&packed_pair([255, 0, 0, 255], [0, 128, 255, 255]), 2),
+                    per_vertex(&[0.0, 0.0], 2),
+                    per_vertex(&[1.5, 1.5], 2),
+                ],
+                packing: vec![
+                    Packed {
+                        stream: 0,
+                        offset: 0,
+                        stride: 8,
+                    },
+                    Packed {
+                        stream: 0,
+                        offset: 4,
+                        stride: 8,
+                    },
+                    Packed {
+                        stream: 1,
+                        offset: 0,
+                        stride: 16,
+                    },
+                    Packed {
+                        stream: 2,
+                        offset: 0,
+                        stride: 8,
+                    },
+                    Packed {
+                        stream: 3,
+                        offset: 0,
+                        stride: 8,
+                    },
+                ],
+                count: 1,
+            }),
+            ubo_index: 1,
+            expect: [8, 149, 255, 255],
         },
         // A raster tile, which is the first case to sample anything.
         //
@@ -932,6 +1245,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [64, 32, 64, 64],
         },
         // The same picture from the same numbers, in the layout the producer actually sends.
@@ -1013,6 +1327,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [64, 32, 64, 64],
         },
         // The same texel through adjustments that are not identities, which is where the chain's
@@ -1073,6 +1388,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [54, 37, 87, 255],
         },
         // The heatmap's second pass, which turns an accumulated density into a color through a
@@ -1135,6 +1451,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [128, 64, 0, 128],
         },
         // A color relief: an elevation decoded from a DEM, then looked up in a ramp by a binary
@@ -1217,6 +1534,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [10, 90, 55, 128],
         },
         // A glyph, read from the middle of its own solid texel.
@@ -1251,6 +1569,7 @@ fn cases() -> Vec<Case> {
             images: vec![glyph_atlas()],
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [200, 100, 50, 255],
         },
         // The same glyph, read one texel over, outside the letter.
@@ -1286,6 +1605,7 @@ fn cases() -> Vec<Case> {
             images: vec![glyph_atlas()],
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [0, 0, 0, 0],
         },
         // The first hillshade pass, which writes a slope rather than a picture.
@@ -1333,6 +1653,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [194, 144, 255, 255],
         },
         // The second pass, shading the slope the first one wrote.
@@ -1403,6 +1724,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [95, 47, 24, 118],
         },
         // The heatmap's first pass: one point feature's Gaussian, written into a texture.
@@ -1474,6 +1796,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 6,
             ubo_index: 0,
+            instanced: None,
             expect: [80, 255, 255, 255],
         },
         // A tiled background, which is the case for `pattern_pos` -- the one piece of the
@@ -1562,6 +1885,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [48, 24, 64, 64],
         },
         // A tiled fill, which shares `pattern_pos` with the background above and differs in
@@ -1635,6 +1959,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [48, 24, 64, 64],
         },
         // A sprite running along a line, which is the last family a pixel can reach.
@@ -1747,6 +2072,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 6,
             ubo_index: 0,
+            instanced: None,
             expect: [32, 16, 64, 64],
         },
         // A symbol's icon: a sprite from a sheet, with no color of its own and no halo.
@@ -1781,6 +2107,7 @@ fn cases() -> Vec<Case> {
             images: vec![sprite_sheet(16)],
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [40, 20, 64, 64],
         },
         // One draw holding both, read at a vertex marked as a sprite.
@@ -1810,6 +2137,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [40, 20, 64, 64],
         },
         // The same draw, read at a vertex marked as a glyph.
@@ -1838,6 +2166,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [100, 50, 25, 64],
         },
         // A fill bent onto a sphere, which is the first case on any surface but the plane.
@@ -1929,6 +2258,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [0, 255, 255, 255],
         },
         // The same fill on the anchored bend: the sphere as a quadratic about the tile's own
@@ -1989,6 +2319,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [255, 255, 0, 255],
         },
         // The raise: a fill standing on a DEM, which is the fourth and last surface.
@@ -2071,6 +2402,7 @@ fn cases() -> Vec<Case> {
             })],
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [255, 0, 255, 255],
         },
         // The curtain: a raster quad on raised ground, with every vertex flagged.
@@ -2162,6 +2494,7 @@ fn cases() -> Vec<Case> {
             ],
             vertices: 3,
             ubo_index: 0,
+            instanced: None,
             expect: [32, 16, 64, 64],
         },
         // A circle, read at its own center: the extrusion interpolates to zero there, which is
@@ -2212,6 +2545,7 @@ fn cases() -> Vec<Case> {
             images: Vec::new(),
             vertices: 6,
             ubo_index: 0,
+            instanced: None,
             expect: [0, 255, 0, 255],
         },
     ]
@@ -2490,21 +2824,109 @@ fn descriptors_for(case: &Case, table: &[ShaderAttribute]) -> Result<Vec<Attribu
 /// Stands in for `tessella_consume::slab::resolve`, which reaches into the shared region. Here the
 /// streams are `Vec<u8>` the case built, and the references were laid out over them end to end.
 fn resolve(case: &Case, reference: SlabRef) -> Option<&[u8]> {
-    match case.layout {
+    let vertex = match case.layout {
         // Laid out end to end in `descriptors_for`, so the offset locates the stream.
         Layout::PerAttribute => {
             let mut at = 0u32;
+            let mut found = None;
             for stream in &case.streams {
                 let length = u32::try_from(stream.len()).ok()?;
                 if at == reference.offset {
-                    return Some(stream);
+                    found = Some(stream.as_slice());
+                    break;
                 }
                 at += length;
             }
-            None
+            found
         }
         Layout::Interleaved { .. } => case.streams.first().map(Vec::as_slice),
+    };
+    if vertex.is_some() {
+        return vertex;
     }
+    // Then the instance streams, which `instance_descriptors` lays out after them.
+    let instanced = case.instanced.as_ref()?;
+    let mut at = instance_base(case)?;
+    for stream in &instanced.streams {
+        let length = u32::try_from(stream.len()).ok()?;
+        if at == reference.offset {
+            return Some(stream);
+        }
+        at += length;
+    }
+    None
+}
+
+/// The byte offset the instance streams begin at, after the per-vertex ones.
+///
+/// One slab for the whole case, which is what the producer sends: a geometry's attributes name one
+/// region and the offsets inside it are what tell them apart. So the instance run continues where
+/// the vertex run stopped rather than starting again.
+fn instance_base(case: &Case) -> Option<u32> {
+    let bytes: usize = match case.layout {
+        Layout::PerAttribute => case.streams.iter().map(Vec::len).sum(),
+        Layout::Interleaved { .. } => case.streams.first().map_or(0, Vec::len),
+    };
+    u32::try_from(bytes).ok()
+}
+
+/// The instance run's descriptors, from the case's explicit packing.
+///
+/// Explicit rather than derived, for the reason [`Packed`] gives: the shared pair has to be one
+/// stride-eight buffer and the paint beside it does not, which no single [`Layout`] expresses.
+///
+/// # Errors
+///
+/// A packing that names a stream the case does not have, or a declared type with no vertex format.
+fn instance_descriptors(
+    case: &Case,
+    table: &[ShaderAttribute],
+) -> Result<Vec<AttributeDesc>, String> {
+    let Some(instanced) = case.instanced.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let base = instance_base(case).ok_or_else(|| format!("{}: streams past 4GiB", case.name))?;
+    if instanced.packing.len() != table.len() {
+        return Err(format!(
+            "{}: {} packings for {} instance attributes",
+            case.name,
+            instanced.packing.len(),
+            table.len()
+        ));
+    }
+
+    // Where each stream starts, so a packing's `stream` becomes a slab reference.
+    let mut starts = Vec::with_capacity(instanced.streams.len());
+    let mut at = base;
+    for stream in &instanced.streams {
+        let length = u32::try_from(stream.len())
+            .map_err(|_| format!("{}: a stream past 4GiB", case.name))?;
+        starts.push(SlabRef {
+            slab: SLAB,
+            offset: at,
+            length,
+        });
+        at += length;
+    }
+
+    let mut out = Vec::with_capacity(table.len());
+    for (attribute, packed) in table.iter().zip(&instanced.packing) {
+        let source = *starts
+            .get(packed.stream)
+            .ok_or_else(|| format!("{}: no instance stream {}", case.name, packed.stream))?;
+        out.push(AttributeDesc {
+            attr_id: attribute.attr_id,
+            binding: attribute.binding,
+            source,
+            offset: packed.offset,
+            vertex_offset: 0,
+            stride: packed.stride,
+            data_type: attribute.declared as u8,
+            declared_data_type: attribute.declared as u8,
+            _pad: [0; 2],
+        });
+    }
+    Ok(out)
 }
 
 /// The target a case draws into, and the buffer its pixel is read back out of.
@@ -2620,6 +3042,12 @@ struct Bound<'a> {
     offsets: &'a [u64],
     vertices: u32,
     ubo_index: u32,
+    /// Instances to draw, and the group-one set they are read ahead in.
+    ///
+    /// `None` for every case but the walls, where it carries both halves of what a draw of more
+    /// than one instance needs: `ubo_index` cannot travel in `firstInstance` then, so it goes in a
+    /// push constant and the draw starts at instance nought.
+    instanced: Option<(u32, vk::DescriptorSet)>,
 }
 
 impl Probe<'_> {
@@ -2651,9 +3079,19 @@ impl Probe<'_> {
                         record.stencil_compare_mask(0);
                         record.stencil_reference(0);
                         record.bind_vertex_buffers(0, bound.streams, bound.offsets);
-                        // `firstInstance` is the drawable's entry, which the body reads as
-                        // `ubo_index`.
-                        record.draw(bound.vertices, 1, bound.ubo_index);
+                        match bound.instanced {
+                            // `firstInstance` is the drawable's entry, which the body reads as
+                            // `ubo_index`.
+                            None => record.draw(bound.vertices, 1, bound.ubo_index),
+                            // And where it cannot be, because it also addresses the instance-rate
+                            // attribute fetch: the slot goes in a push constant, the drawable's
+                            // own instance buffer in group one, and the draw starts at nought.
+                            Some((instances, set)) => {
+                                record.bind_descriptor_set_at(1, bound.layout, set);
+                                record.push_constants(bound.layout, &bound.ubo_index.to_le_bytes());
+                                record.draw(bound.vertices, instances, 0);
+                            }
+                        }
                     }
                 },
             );
@@ -2687,6 +3125,7 @@ fn draw_case<'d>(
         case.surface,
         found.blocks,
         found.attributes,
+        found.instance_attributes,
         found.textures,
         found.body,
     )
@@ -2695,14 +3134,20 @@ fn draw_case<'d>(
 
     // The producer's records, then the plan a consumer makes of them, then the key that plan is.
     let descs = descriptors_for(case, found.attributes)?;
-    let plan = vertices::plan(found.attributes, &descs)
-        .map_err(|why| format!("{}: {why:?}", case.name))?;
-    if plan.bound.len() != found.attributes.len() {
+    let instance_descs = instance_descriptors(case, found.instance_attributes)?;
+    let plan = vertices::plan_instanced(
+        found.attributes,
+        &descs,
+        found.instance_attributes,
+        &instance_descs,
+    )
+    .map_err(|why| format!("{}: {why:?}", case.name))?;
+    let declares = found.attributes.len() + found.instance_attributes.len();
+    if plan.bound.len() != declares {
         return Err(format!(
-            "{}: {} of {} attributes planned",
+            "{}: {} of {declares} attributes planned",
             case.name,
             plan.bound.len(),
-            found.attributes.len()
         ));
     }
     // A device that will not take one of these in a vertex buffer binds the attribute anyway and
@@ -2745,21 +3190,21 @@ fn draw_case<'d>(
 
     // One block buffer per slot, which is what the wire sends and what a set binds.
     let mut held = blocks::Blocks::new();
-    let declared: Vec<&UboLayout> = found
+    let blocks_named: Vec<&UboLayout> = found
         .blocks
         .iter()
         .copied()
         .chain(case.surface.blocks().iter().copied())
         .collect();
-    if declared.len() != case.uniforms.len() {
+    if blocks_named.len() != case.uniforms.len() {
         return Err(format!(
             "{}: {} blocks declared and {} supplied",
             case.name,
-            declared.len(),
+            blocks_named.len(),
             case.uniforms.len()
         ));
     }
-    for (layout, bytes) in declared.iter().zip(&case.uniforms) {
+    for (layout, bytes) in blocks_named.iter().zip(&case.uniforms) {
         let slot = slots::of(layout)
             .ok_or_else(|| format!("{}: {} has no slot", case.name, layout.name))?;
         // The stride the producer packs entries at, which for a drawable block is its union's --
@@ -2824,11 +3269,35 @@ fn draw_case<'d>(
     let layout = cache
         .layout(gpu, case.family, case.surface, &bindings)
         .map_err(|why| format!("{}: layout: {why}", case.name))?;
-    let mut sets = descriptors::Sets::new(gpu, 1, &bindings)
+    // Two sets where a case is instanced: the layer's, and the one over this geometry's own
+    // instance buffer. Sized for two always, which costs a pool entry and keeps the call the same.
+    let mut sets = descriptors::Sets::new(gpu, 2, &bindings)
         .map_err(|why| format!("{}: pool: {why}", case.name))?;
     let set = sets
         .write(layout, &bindings, WHICH, &held, &bound)
         .map_err(|why| format!("{}: set: {why}", case.name))?;
+
+    // The group-one set, over the buffer the ABI says is bound twice. Which buffer that is comes
+    // from `buffers::needs`, which took it from the family's own table -- not from a number here,
+    // so a case cannot name the wrong one.
+    let instanced = match case.instanced.as_ref() {
+        None => None,
+        Some(instanced) => {
+            let at = *needs.storage.first().ok_or_else(|| {
+                format!(
+                    "{}: an instanced case whose plan names no shared buffer",
+                    case.name
+                )
+            })?;
+            let buffer = store
+                .vertex_buffer(GEOMETRY, at)
+                .ok_or_else(|| format!("{}: no buffer {at}", case.name))?;
+            let set = sets
+                .write_instances(layout, GEOMETRY, buffer)
+                .map_err(|why| format!("{}: instance set: {why}", case.name))?;
+            Some((instanced.count, set))
+        }
+    };
 
     let (streams, offsets) = store
         .bindings(GEOMETRY)
@@ -2843,6 +3312,7 @@ fn draw_case<'d>(
             offsets,
             vertices: case.vertices,
             ubo_index: case.ubo_index,
+            instanced,
         }),
     )?;
     probe.pixel(case.at.0, case.at.1)

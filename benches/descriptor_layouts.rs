@@ -13,7 +13,7 @@
 //! floor for `maxPerStageDescriptorStorageBuffers` is four**. A conformant device may be under what
 //! the shaders need, so the number is worth knowing per part rather than assumed.
 //!
-//! So this creates all 61 and then reports the headroom, which is the measurement a later family
+//! So this creates all 63 and then reports the headroom, which is the measurement a later family
 //! would spend.
 //!
 //! Run with `cargo bench --bench descriptor_layouts`.
@@ -49,13 +49,13 @@ fn every_pair() -> Vec<(String, Vec<pipelines::Binding>)> {
 /// Every pair's layout is created, and none is refused.
 fn every_layout_is_accepted(device: &Open) -> Result<(), String> {
     let pairs = every_pair();
-    if pairs.len() != 61 {
+    if pairs.len() != 63 {
         return Err(format!(
-            "{} pairs, which is not the 61 modules the crate assembles",
+            "{} pairs, which is not the 63 modules the crate assembles",
             pairs.len()
         ));
     }
-    // Held to the end rather than dropped per iteration, so the device is carrying all 61 at once --
+    // Held to the end rather than dropped per iteration, so the device is carrying all 63 at once --
     // which is the state a frame drawing every family would be in.
     let mut held = Vec::with_capacity(pairs.len());
     for (who, bindings) in &pairs {
@@ -195,6 +195,7 @@ fn every_set_is_within_the_limits(device: &Open) -> Result<(), String> {
     } else {
         let bindings: Vec<pipelines::Binding> = (0..past)
             .map(|at| pipelines::Binding {
+                group: 0,
                 binding: at as u32,
                 kind: Kind::StorageBuffer,
                 // A set layout is built from the kinds and the binding numbers; the slot is for

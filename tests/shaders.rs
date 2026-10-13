@@ -1242,7 +1242,9 @@ fn every_attribute_is_read() {
 /// the wrong direction, which is why this is pinned rather than left to review.
 #[test]
 fn each_surface_displaces_its_own_way() {
-    let linear = "return columns[0] * delta.x + columns[1] * delta.y;";
+    // The expression rather than the whole statement: both linear surfaces hand it to
+    // `vulkan_depth`, which is where every placement puts its clip position.
+    let linear = "columns[0] * delta.x + columns[1] * delta.y";
     for surface in Surface::ALL {
         let placement = surface.placement();
         assert!(

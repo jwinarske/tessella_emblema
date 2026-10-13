@@ -317,3 +317,62 @@ fn the_suffixes_name_the_surfaces_apart() {
     suffixes.dedup();
     assert_eq!(suffixes.len(), before);
 }
+
+/// Every placement hands its clip position to `vulkan_depth`, and so does the clipping mask.
+///
+/// The producer's matrices are mbgl's, and mbgl's projection is OpenGL's: `mat4::perspective` sets
+/// `out[10] = (far + near) / (near - far)` with `out[11] = -1`, which puts clip `z` in `-w..w`.
+/// Vulkan's volume is `0..w`, so a placement that returns the matrix's own `z` throws away the near
+/// half of every frustum -- and a drawable whose whole `z` is a sublayer nudge is in that half.
+/// The producer's viewport quad is one: `DrawableEntry::for_viewport` has no camera in it at all,
+/// so its clip `z` is `-depth_offset` and nothing else.
+///
+/// Measured rather than argued: the captured Berlin frame draws 538,201 of its 786,432 pixels as
+/// the clear with any one placement left unmapped, and none of them with all of them mapped. The
+/// mask is the same rule for a different reason -- a mask outside the volume is not drawn, and what
+/// that loses is not the mask but every content draw it was meant to let through.
+#[test]
+fn every_placement_ends_in_the_vulkan_clip_volume() {
+    assert!(
+        tessella_emblema::shaders::PRELUDE.contains("fn vulkan_depth(clip: vec4<f32>)"),
+        "the preamble does not define the remap every placement calls"
+    );
+    assert!(
+        tessella_emblema::shaders::PRELUDE
+            .contains("return vec4<f32>(clip.xy, (clip.z + clip.w) * 0.5, clip.w);"),
+        "the remap is not the half-and-shift that takes -w..w to 0..w"
+    );
+
+    for surface in Surface::ALL {
+        let placement = surface.placement();
+        let place = placement
+            .split("fn place(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .unwrap_or_else(|| panic!("{} has no placement", surface.suffix()));
+        assert!(
+            place.contains("vulkan_depth("),
+            "{} returns a clip position it has not remapped",
+            surface.suffix()
+        );
+    }
+
+    // The direct bend's displacement is the one that must *not* remap again: it is the difference
+    // of two placements, and the map is linear, so the difference is already in Vulkan's volume.
+    let bent = Surface::Globe.placement();
+    let displace = bent
+        .split("fn displace(")
+        .nth(1)
+        .and_then(|rest| rest.split("\nfn ").next())
+        .expect("a displacement");
+    assert!(
+        !displace.contains("vulkan_depth("),
+        "the direct bend's displacement remaps a difference of two remapped places"
+    );
+
+    assert!(
+        tessella_emblema::masks::BODY
+            .contains("return vec4<f32>(clip.xy, (clip.z + clip.w) * 0.5, clip.w);"),
+        "a clipping mask is drawn through the producer's matrix and must be remapped too"
+    );
+}

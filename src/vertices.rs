@@ -24,7 +24,7 @@ use tessella_capture_abi::AttributeDataType;
 use tessella_capture_abi::envelope::{AttributeDesc, SlabRef};
 use tessella_capture_abi::generated::shader_attributes::ShaderAttribute;
 
-use crate::device::vertex_format;
+use crate::device::{stride_of, vertex_format};
 
 /// One attribute, ready to become a `VkVertexInputAttributeDescription` and its binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +164,37 @@ pub fn plan_instanced(
     ])
 }
 
+/// How many instances a planned drawable draws.
+///
+/// mbgl's own line is `const auto instances = instanceAttributes ? instanceAttributes->getMinCount()
+/// : 1` (`vulkan/drawable.cpp:339`), and this is the same quantity from the descriptors: the
+/// shortest instance-rate run, because a draw of more instances than the shortest buffer holds
+/// fetches past its end.
+///
+/// One where nothing advances per instance, which is every family but the instanced extrusions.
+/// One rather than zero: a `vkCmdDrawIndexed` of no instances draws nothing at all, which is the
+/// answer for a drawable whose instance buffer is empty and not for one that has none.
+///
+/// # Why this is derived and not read
+///
+/// Nothing on the wire carries the number. `AttributeDesc` carries a stride and a `SlabRef`, and
+/// the count is the one divided into the other -- so a consumer either does this or guesses, and a
+/// guess draws a wall per entry of whatever it guessed from. `vertex_offset` is subtracted because
+/// it is where the run starts: the entries before it belong to another drawable.
+#[must_use]
+pub fn instances(plan: &Plan) -> u32 {
+    plan.bound
+        .iter()
+        .filter(|bound| bound.rate == vk::VertexInputRate::INSTANCE)
+        .map(|bound| {
+            // A stride of zero would be every instance reading the same bytes; the division has to
+            // mean something, so it counts as one entry rather than dividing by nothing.
+            (bound.source.length / bound.stride.max(1)).saturating_sub(bound.vertex_offset)
+        })
+        .min()
+        .unwrap_or(1)
+}
+
 fn planned(
     runs: &[(&[ShaderAttribute], &[AttributeDesc], vk::VertexInputRate)],
 ) -> Result<Plan, Refused> {
@@ -211,10 +242,30 @@ fn planned(
                 out.undeclared.push((desc.attr_id, entry.binding));
                 continue;
             };
+            // A zero stride means tightly packed -- GL's own meaning for it in
+            // `glVertexAttribPointer`, and what the producer sends for a drawable whose vertices
+            // are nothing but this attribute. A Vulkan binding of zero is a different thing: every
+            // vertex reads the same bytes, so such a drawable collapses to its first vertex.
+            //
+            // mbgl never binds zero either. `vulkan/drawable.cpp:390` sets the attribute's stride
+            // to `VertexAttribute::getStrideOf(type)`, `vulkan/upload_pass.cpp:151` asserts the
+            // stride is positive before binding it, and the arm for an attribute with no override
+            // supplies `getStrideOf` as well. So the type's own size is the answer, and
+            // [`vertex_format`] is what has already agreed the type has one.
+            let Some(packed) = stride_of(entry.declared) else {
+                return Err(Refused::NoFormat {
+                    attr_id: desc.attr_id,
+                    declared: entry.declared,
+                });
+            };
             out.bound.push(Bound {
                 slot,
                 format,
-                stride: desc.stride,
+                stride: if desc.stride == 0 {
+                    packed
+                } else {
+                    desc.stride
+                },
                 offset: desc.offset,
                 vertex_offset: desc.vertex_offset,
                 source: desc.source,

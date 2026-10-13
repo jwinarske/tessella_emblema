@@ -21,8 +21,7 @@
 mod common;
 
 use ash::vk;
-use tessella_capture_abi::generated::mbgl_enums::AttributeDataType;
-use tessella_emblema::device::{self, Attachment};
+use tessella_emblema::device::{self, Attachment, stride_of};
 use tessella_emblema::families;
 use tessella_emblema::pipelines::{self, Key, Slot, Targets};
 use tessella_emblema::surface::Surface;
@@ -88,25 +87,6 @@ fn key_for(family: &families::Family, surface: Surface) -> Result<Key, String> {
         blend: pipelines::Blend::Alpha,
         depth: pipelines::Depth::Write,
         enabled: pipelines::Enabled::ALL,
-    })
-}
-
-/// Bytes one vertex of a declared type occupies.
-///
-/// `None` for a type with no vertex format, which `device::vertex_format` refuses first -- this is
-/// written to agree with it rather than to guess a size for something that cannot be bound.
-fn stride_of(declared: AttributeDataType) -> Option<u32> {
-    use AttributeDataType as A;
-    Some(match declared {
-        A::Byte | A::UByte => 1,
-        A::Byte2 | A::UByte2 | A::Short | A::UShort => 2,
-        A::Byte3 | A::UByte3 => 3,
-        A::Byte4 | A::UByte4 | A::Short2 | A::UShort2 | A::Int | A::UInt | A::Float => 4,
-        A::Short3 | A::UShort3 => 6,
-        A::Short4 | A::UShort4 | A::Int2 | A::UInt2 | A::Float2 => 8,
-        A::Int3 | A::UInt3 | A::Float3 => 12,
-        A::Int4 | A::UInt4 | A::Float4 | A::UShort8 => 16,
-        A::Invalid => return None,
     })
 }
 

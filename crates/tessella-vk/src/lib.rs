@@ -312,31 +312,45 @@ impl<'d> Gpu<'d> {
         })
     }
 
-    /// Creates a pipeline layout over one descriptor set and no push constants.
+    /// Creates a pipeline layout over the descriptor sets given, in group order.
     ///
-    /// One set because that is what the modules declare -- group zero and nothing else -- and no
-    /// push constants because nothing in the map pass uses them: a drawable's state is a block in
-    /// its layer's consolidated buffer, indexed by the order entry.
+    /// One set for every family whose state is entirely per layer -- group zero and nothing else,
+    /// which is what those modules declare. A family drawn with instance-rate attributes adds a
+    /// second: its per-drawable resources cannot sit in a set shared by the layer.
+    ///
+    /// `push_constant_bytes` is nought for every family but those, where it is the four bytes of
+    /// `ubo_index`. That number rides `firstInstance` everywhere else, which it cannot do on a
+    /// draw of more than one instance -- `tessella_emblema::draws` says why, and
+    /// `benches/instance_fetch.rs` measures it. Visible to the vertex stage alone, which is the
+    /// only one that reads it.
     ///
     /// # Errors
     ///
     /// [`Error::Call`] if `vkCreatePipelineLayout` fails.
     pub fn pipeline_layout(
         self,
-        set: &DescriptorSetLayout<'_>,
+        sets: &[&DescriptorSetLayout<'_>],
+        push_constant_bytes: u32,
     ) -> Result<PipelineLayout<'d>, Error> {
-        let sets = [set.raw];
-        // SAFETY: the create info is fully initialized and names a layout made by this device.
-        let raw = unsafe {
-            self.device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default().set_layouts(&sets),
-                None,
-            )
+        let handles: Vec<vk::DescriptorSetLayout> = sets.iter().map(|set| set.raw).collect();
+        let pushed = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .offset(0)
+            .size(push_constant_bytes)];
+        let mut create = vk::PipelineLayoutCreateInfo::default().set_layouts(&handles);
+        // An empty range is not the same as no range: `vkCreatePipelineLayout` refuses a range of
+        // zero bytes, so the field is left unset rather than set to nothing.
+        if push_constant_bytes > 0 {
+            create = create.push_constant_ranges(&pushed);
         }
-        .map_err(|result| Error::Call {
-            call: "vkCreatePipelineLayout",
-            result,
-        })?;
+        // SAFETY: the create info is fully initialized and names layouts made by this device.
+        let raw =
+            unsafe { self.device.create_pipeline_layout(&create, None) }.map_err(|result| {
+                Error::Call {
+                    call: "vkCreatePipelineLayout",
+                    result,
+                }
+            })?;
         Ok(PipelineLayout {
             device: self.device,
             raw,
@@ -1140,9 +1154,25 @@ impl<'c> Recorder<'c> {
 
     /// Binds one descriptor set at set zero.
     ///
-    /// Set zero and no dynamic offsets, because that is what the modules declare: group zero and
-    /// nothing else, with every block bound at offset zero in a buffer of its own.
+    /// Set zero and no dynamic offsets, because that is what most of the modules declare: group
+    /// zero and nothing else, with every block bound at offset zero in a buffer of its own. A
+    /// family with per-drawable resources binds those through [`Self::bind_descriptor_set_at`].
     pub fn bind_descriptor_set(&self, layout: vk::PipelineLayout, set: vk::DescriptorSet) {
+        self.bind_descriptor_set_at(0, layout, set);
+    }
+
+    /// Binds one descriptor set at the group given.
+    ///
+    /// Group one is where a family's per-drawable resources go: a set shared by the layer cannot
+    /// hold a buffer that belongs to one drawable, and the alternative -- an offset into a shared
+    /// buffer -- would bring `minStorageBufferOffsetAlignment` into a pass that binds everything
+    /// at offset zero to stay clear of it.
+    pub fn bind_descriptor_set_at(
+        &self,
+        group: u32,
+        layout: vk::PipelineLayout,
+        set: vk::DescriptorSet,
+    ) {
         let sets = [set];
         // SAFETY: the command buffer is recording; the layout and the set belong to this device,
         // and the slices are read only for the call.
@@ -1151,9 +1181,28 @@ impl<'c> Recorder<'c> {
                 self.raw,
                 vk::PipelineBindPoint::GRAPHICS,
                 layout,
-                0,
+                group,
                 &sets,
                 &[],
+            );
+        }
+    }
+
+    /// Writes the vertex stage's push constants from the start of the range.
+    ///
+    /// One call a drawable, and only for a family that cannot put the number in `firstInstance`.
+    /// It is not free -- 0.9 us a draw on V3D against 0.014 on RADV, measured in
+    /// `benches/draw_cost.rs` -- which is why it is not how every family reaches `ubo_index`.
+    pub fn push_constants(&self, layout: vk::PipelineLayout, bytes: &[u8]) {
+        // SAFETY: the command buffer is recording, the layout belongs to this device, and the
+        // slice is read only for the call.
+        unsafe {
+            self.device.cmd_push_constants(
+                self.raw,
+                layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                bytes,
             );
         }
     }

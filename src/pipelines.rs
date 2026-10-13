@@ -184,7 +184,15 @@ impl Kind {
 /// One entry of a family's descriptor set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Binding {
-    /// The `@binding(n)` the module declares, in group zero.
+    /// Which `@group(n)` it is in.
+    ///
+    /// Zero for everything a layer shares, which is every binding of every family whose draws
+    /// differ only by `ubo_index`. One for a family's per-drawable resources: those cannot live in
+    /// a set the layer shares, and an offset into a shared buffer is the alternative this pass
+    /// stays clear of -- [`crate::blocks`] binds at offset zero on purpose, to keep
+    /// `minStorageBufferOffsetAlignment` out of the crate.
+    pub group: u32,
+    /// The `@binding(n)` the module declares, counting from zero within its own group.
     pub binding: u32,
     /// What is bound there.
     pub kind: Kind,
@@ -226,6 +234,7 @@ pub fn bindings(family: &Family, surface: Surface) -> Vec<Binding> {
     // The family's blocks first, then the surface's, exactly as the module declares them.
     for block in family.blocks.iter().chain(surface.blocks()) {
         out.push(Binding {
+            group: 0,
             binding: out.len() as u32,
             kind: Kind::StorageBuffer,
             slot: crate::slots::of(block),
@@ -244,13 +253,42 @@ pub fn bindings(family: &Family, surface: Surface) -> Vec<Binding> {
     for slot in slots {
         for kind in [Kind::SampledImage, Kind::Sampler] {
             out.push(Binding {
+                group: 0,
                 binding: out.len() as u32,
                 kind,
                 slot: Some(slot),
             });
         }
     }
+    // And last, outside group zero, the instance buffer a family with instance-rate attributes
+    // reads ahead in. One binding whatever the family, because it is one buffer: the attributes
+    // that name a shared buffer in the ABI's table are the fields of its element, and the ABI's
+    // own note is that mbgl registers them as attributes so that the bytes are *also* bound as a
+    // storage buffer. No slot: it is a geometry's buffer rather than a layer's block, so nothing
+    // in `slots` names it.
+    if shares_a_buffer(family) {
+        out.push(Binding {
+            group: 1,
+            binding: 0,
+            kind: Kind::StorageBuffer,
+            slot: None,
+        });
+    }
     out
+}
+
+/// Whether a family's instance attributes name a buffer that is also bound as a storage buffer.
+///
+/// Read off `ShaderAttribute::shared_buffer`, which `mbgl-codegen` carries from
+/// `AttributeInfo`'s fourth argument -- the UBO binding mbgl registers the same buffer at. A
+/// family with instance attributes and none of them shared would be one whose body reads only its
+/// own instance, and would need no second group.
+#[must_use]
+pub fn shares_a_buffer(family: &Family) -> bool {
+    family
+        .instance_attributes
+        .iter()
+        .any(|attribute| attribute.shared_buffer.is_some())
 }
 
 /// How many descriptors of each kind a set needs, for sizing a pool.
@@ -275,6 +313,7 @@ pub fn pool_sizes(bindings: &[Binding]) -> Vec<(Kind, u32)> {
 /// layout binds them, and a pipeline built against one must be bound with sets from the other.
 pub struct Layout<'d> {
     set: DescriptorSetLayout<'d>,
+    instances: Option<DescriptorSetLayout<'d>>,
     pipeline: PipelineLayout<'d>,
 }
 
@@ -285,10 +324,21 @@ impl core::fmt::Debug for Layout<'_> {
 }
 
 impl Layout<'_> {
-    /// The set layout, for allocating a descriptor set.
+    /// The group-zero set layout, for allocating a layer's descriptor set.
     #[must_use]
     pub fn set(&self) -> vk::DescriptorSetLayout {
         self.set.raw()
+    }
+
+    /// The group-one set layout, for a family that has one.
+    ///
+    /// `None` for every family whose state is per layer, which is all of them but the instanced
+    /// extrusions. A caller writing a per-drawable set needs this and not [`Self::set`]: the two
+    /// layouts describe different sets and a set allocated from the wrong one binds nothing the
+    /// module declares.
+    #[must_use]
+    pub fn instances(&self) -> Option<vk::DescriptorSetLayout> {
+        self.instances.as_ref().map(DescriptorSetLayout::raw)
     }
 
     /// The pipeline layout, for creating a pipeline and binding its descriptors.
@@ -319,8 +369,21 @@ const BOTH_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::from_raw(
 /// count the kinds against the device's own limits before it tries to create anything.
 #[must_use]
 pub fn set_bindings(bindings: &[Binding]) -> Vec<vk::DescriptorSetLayoutBinding<'static>> {
+    set_bindings_of(bindings, 0)
+}
+
+/// The same for one group, which is how a layout with two sets is built.
+///
+/// Group zero is [`set_bindings`]; group one is a family's per-drawable resources. Each set
+/// numbers its bindings from zero, so the two cannot be described together.
+#[must_use]
+pub fn set_bindings_of(
+    bindings: &[Binding],
+    group: u32,
+) -> Vec<vk::DescriptorSetLayoutBinding<'static>> {
     bindings
         .iter()
+        .filter(|binding| binding.group == group)
         .map(|binding| {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(binding.binding)
@@ -343,9 +406,31 @@ pub fn set_bindings(bindings: &[Binding]) -> Vec<vk::DescriptorSetLayoutBinding<
 pub fn layout<'d>(gpu: Gpu<'d>, bindings: &[Binding]) -> Result<Layout<'d>, tessella_vk::Error> {
     let described = set_bindings(bindings);
     let set = gpu.set_layout(&described)?;
-    let pipeline = gpu.pipeline_layout(&set)?;
-    Ok(Layout { set, pipeline })
+
+    // Group one only where the bindings say there is one, so no family gains a second set layout
+    // or a push constant range it does not read. The two travel together: the group holds the
+    // instance buffer and the push constant holds the `ubo_index` that cannot ride `firstInstance`
+    // on the same draw -- see [`crate::draws`].
+    let described = set_bindings_of(bindings, 1);
+    let instances = if described.is_empty() {
+        None
+    } else {
+        Some(gpu.set_layout(&described)?)
+    };
+
+    let pipeline = match instances.as_ref() {
+        Some(second) => gpu.pipeline_layout(&[&set, second], UBO_INDEX_BYTES)?,
+        None => gpu.pipeline_layout(&[&set], 0)?,
+    };
+    Ok(Layout {
+        set,
+        instances,
+        pipeline,
+    })
 }
+
+/// Bytes of push constant a family with instance-rate attributes declares: `ubo_index`, a `u32`.
+pub const UBO_INDEX_BYTES: u32 = 4;
 
 /// The vertex input state a key describes, as Vulkan wants it.
 ///
@@ -888,7 +973,7 @@ pub fn build_mask<'d>(
 ///
 /// # Two levels, because the module is not per key
 ///
-/// A module is per `(family, surface)`: one text, two entry points, 61 of them. A *pipeline* is per
+/// A module is per `(family, surface)`: one text, two entry points, 63 of them. A *pipeline* is per
 /// [`Key`], which adds the permutation and the vertex input -- so one module serves every pipeline
 /// of its family, and the two are cached separately. Holding the module beside each pipeline would
 /// compile the same text once per stride.

@@ -59,17 +59,26 @@ fn compile(source: &str) -> Result<Vec<u32>, String> {
 /// shared-stride case is covered by `tests/vertex_input.rs` and changes nothing a driver checks.
 fn key_for(family: &families::Family, surface: Surface) -> Result<Key, String> {
     let mut layout = Vec::new();
-    for attribute in family.attributes {
-        let format = device::vertex_format(attribute.declared)
-            .ok_or_else(|| format!("{} has no vertex format", attribute.name))?;
-        layout.push(Slot {
-            slot: u32::try_from(attribute.binding).map_err(|_| "absurd binding")?,
-            format,
-            offset: 0,
-            stride: stride_of(attribute.declared)
-                .ok_or_else(|| format!("{} has no stride", attribute.name))?,
-            rate: vk::VertexInputRate::VERTEX,
-        });
+    // Both tables, each at its own rate. The rate is pipeline state, and a module declaring an
+    // input at a location the state does not describe is what this bench is here to catch: the
+    // instanced family declares six and five of them are per instance.
+    let runs = [
+        (family.attributes, vk::VertexInputRate::VERTEX),
+        (family.instance_attributes, vk::VertexInputRate::INSTANCE),
+    ];
+    for (table, rate) in runs {
+        for attribute in table {
+            let format = device::vertex_format(attribute.declared)
+                .ok_or_else(|| format!("{} has no vertex format", attribute.name))?;
+            layout.push(Slot {
+                slot: u32::try_from(attribute.binding).map_err(|_| "absurd binding")?,
+                format,
+                offset: 0,
+                stride: stride_of(attribute.declared)
+                    .ok_or_else(|| format!("{} has no stride", attribute.name))?,
+                rate,
+            });
+        }
     }
     Ok(Key {
         shader: family.shader,
@@ -122,6 +131,7 @@ fn every_pipeline_builds(device: &Open) -> Result<(), String> {
                 surface,
                 family.blocks,
                 family.attributes,
+                family.instance_attributes,
                 family.textures,
                 family.body,
             )
@@ -156,9 +166,9 @@ fn every_pipeline_builds(device: &Open) -> Result<(), String> {
             drop(module);
         }
     }
-    if built != 122 {
+    if built != 126 {
         return Err(format!(
-            "{built} pipelines, which is not 61 modules times two attachment kinds"
+            "{built} pipelines, which is not 63 modules times two attachment kinds"
         ));
     }
     println!("  every pipeline        ok   {built} pipelines, all resident at once");
@@ -187,6 +197,7 @@ fn a_bogus_location_is_reported(device: &Open) -> Result<(), String> {
         surface,
         family.blocks,
         family.attributes,
+        family.instance_attributes,
         family.textures,
         family.body,
     )
@@ -256,6 +267,7 @@ fn the_cache_reuses(device: &Open) -> Result<(), String> {
                         surface,
                         family.blocks,
                         family.attributes,
+                        family.instance_attributes,
                         family.textures,
                         family.body,
                     )
@@ -277,15 +289,15 @@ fn the_cache_reuses(device: &Open) -> Result<(), String> {
         }
     }
 
-    if cache.built() != 61 {
+    if cache.built() != 63 {
         return Err(format!(
-            "{} pipelines built for 61 keys asked {asked} times",
+            "{} pipelines built for 63 keys asked {asked} times",
             cache.built()
         ));
     }
-    if cache.len() != 61 || cache.modules() != 61 {
+    if cache.len() != 63 || cache.modules() != 63 {
         return Err(format!(
-            "{} pipelines and {} modules held, wanted 61 of each",
+            "{} pipelines and {} modules held, wanted 63 of each",
             cache.len(),
             cache.modules()
         ));
@@ -324,6 +336,7 @@ fn a_stride_is_a_different_pipeline(device: &Open) -> Result<(), String> {
         Surface::Plane,
         family.blocks,
         family.attributes,
+        family.instance_attributes,
         family.textures,
         family.body,
     )

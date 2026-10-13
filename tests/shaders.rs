@@ -40,6 +40,7 @@ fn background() -> String {
         &[&BACKGROUND_DRAWABLE_UBO, &BACKGROUND_PROPS_UBO],
         &BACKGROUND_SHADER,
         &[],
+        &[],
         BACKGROUND_BODY,
     )
     .expect("background declares")
@@ -103,6 +104,7 @@ fn the_roof_sits_at_the_top_and_keeps_its_fraction() {
         Surface::Plane,
         extrusion.blocks,
         extrusion.attributes,
+        extrusion.instance_attributes,
         extrusion.textures,
         extrusion.body,
     )
@@ -142,6 +144,7 @@ fn the_symbol_icon_keeps_its_placement_decisions() {
         Surface::Plane,
         icon.blocks,
         icon.attributes,
+        icon.instance_attributes,
         icon.textures,
         icon.body,
     )
@@ -201,6 +204,7 @@ fn the_text_and_icon_keeps_its_sheet_decisions() {
         Surface::Plane,
         both.blocks,
         both.attributes,
+        both.instance_attributes,
         both.textures,
         both.body,
     )
@@ -265,6 +269,7 @@ fn the_hillshade_keeps_its_slope_decisions() {
             Surface::Plane,
             found.blocks,
             found.attributes,
+            found.instance_attributes,
             found.textures,
             found.body,
         )
@@ -334,6 +339,7 @@ fn the_patterns_keep_their_tiling_decisions() {
             Surface::Plane,
             found.blocks,
             found.attributes,
+            found.instance_attributes,
             found.textures,
             found.body,
         )
@@ -407,6 +413,7 @@ fn the_line_pattern_keeps_its_sprite_decisions() {
         Surface::Plane,
         pattern.blocks,
         pattern.attributes,
+        pattern.instance_attributes,
         pattern.textures,
         pattern.body,
     )
@@ -466,6 +473,7 @@ fn the_heatmap_keeps_its_kernel_decisions() {
             Surface::Plane,
             found.blocks,
             found.attributes,
+            found.instance_attributes,
             found.textures,
             found.body,
         )
@@ -538,6 +546,7 @@ fn the_line_keeps_its_extrusion_decisions() {
         Surface::Plane,
         line.blocks,
         line.attributes,
+        line.instance_attributes,
         line.textures,
         line.body,
     )
@@ -596,6 +605,7 @@ fn the_symbol_sdf_keeps_its_edge_decisions() {
         Surface::Plane,
         sdf.blocks,
         sdf.attributes,
+        sdf.instance_attributes,
         sdf.textures,
         sdf.body,
     )
@@ -650,6 +660,7 @@ fn the_circle_keeps_its_extrusion_decisions() {
         Surface::Plane,
         circle.blocks,
         circle.attributes,
+        circle.instance_attributes,
         circle.textures,
         circle.body,
     )
@@ -706,6 +717,7 @@ fn the_fill_outline_keeps_its_feather() {
         Surface::Plane,
         outline.blocks,
         outline.attributes,
+        outline.instance_attributes,
         outline.textures,
         outline.body,
     )
@@ -749,6 +761,7 @@ fn the_triangulated_outline_keeps_its_width_and_its_scale() {
         Surface::Plane,
         outline.blocks,
         outline.attributes,
+        outline.instance_attributes,
         outline.textures,
         outline.body,
     )
@@ -790,6 +803,7 @@ fn the_color_relief_pins_the_poles() {
         Surface::Plane,
         relief.blocks,
         relief.attributes,
+        relief.instance_attributes,
         relief.textures,
         relief.body,
     )
@@ -872,6 +886,7 @@ fn the_color_relief_keeps_its_unpack_and_its_texel_centers() {
         Surface::Plane,
         relief.blocks,
         relief.attributes,
+        relief.instance_attributes,
         relief.textures,
         relief.body,
     )
@@ -914,6 +929,7 @@ fn a_familys_images_bind_before_the_surfaces() {
         Surface::Plane,
         raster.blocks,
         raster.attributes,
+        raster.instance_attributes,
         raster.textures,
         raster.body,
     )
@@ -949,6 +965,7 @@ fn a_familys_images_bind_before_the_surfaces() {
         Surface::Terrain,
         raster.blocks,
         raster.attributes,
+        raster.instance_attributes,
         raster.textures,
         raster.body,
     )
@@ -970,14 +987,24 @@ fn a_familys_images_bind_before_the_surfaces() {
 ///
 /// Pinned because the push constant is the obvious way to write this and nothing else would catch
 /// a change back: both spellings compile, validate and draw the same picture.
+///
+/// A family with instance-rate attributes is the exception and gets the opposite pin, in
+/// [`the_instanced_family_takes_its_slot_from_a_push_constant`]: `firstInstance` addresses the
+/// instance-rate attribute fetch as well as the builtin, so it cannot also be the slot on a draw
+/// of more than one instance. Written as two tests rather than one with a branch, so neither
+/// family can pass by taking the other's arm.
 #[test]
 fn the_slot_arrives_as_the_instance_index() {
     for family in ALL {
+        if !family.instance_attributes.is_empty() {
+            continue;
+        }
         for surface in family.surfaces {
             let source = module(
                 *surface,
                 family.blocks,
                 family.attributes,
+                family.instance_attributes,
                 family.textures,
                 family.body,
             )
@@ -1010,6 +1037,65 @@ fn the_slot_arrives_as_the_instance_index() {
             );
         }
     }
+}
+
+/// And the instanced family takes it from a push constant, because it cannot take it from there.
+///
+/// The one exception, and it is forced rather than chosen. `firstInstance` is part of the address
+/// an instance-rate vertex attribute is fetched from, measured on RADV and V3D in
+/// `benches/instance_fetch.rs`, so a draw of more than one instance cannot put the slot there --
+/// `draws::indexed` refuses the pair. The cost is one `vkCmdPushConstants` per walls drawable,
+/// which is one drawable a tile a layer rather than one per anything that scales.
+///
+/// Pinned both ways: the push constant is declared and read, and the builtin is *not* what the
+/// slot comes from. A body that went back to the builtin here would compile and draw, with every
+/// instance but the first reading another drawable's uniforms.
+#[test]
+fn the_instanced_family_takes_its_slot_from_a_push_constant() {
+    let mut seen = 0;
+    for family in ALL {
+        if family.instance_attributes.is_empty() {
+            continue;
+        }
+        for surface in family.surfaces {
+            let source = module(
+                *surface,
+                family.blocks,
+                family.attributes,
+                family.instance_attributes,
+                family.textures,
+                family.body,
+            )
+            .expect("assembles");
+            let what = format!("{}{}", family.name, surface.suffix());
+            assert!(
+                source.contains("var<push_constant> pushed: Pushed;"),
+                "{what} declares no push constant"
+            );
+            assert!(
+                source.contains("fn vertex_main(in: In) -> Out {\n    // Not `in.instance_index`"),
+                "{what} does not say why it is not the builtin"
+            );
+            assert!(
+                source.contains("ubo_index = pushed.ubo_index;"),
+                "{what} never takes the slot from the push constant"
+            );
+            assert!(
+                !source.contains("ubo_index = in.instance_index;"),
+                "{what} takes the slot from the builtin, which is its instance"
+            );
+            // And the builtin is still declared, because the body reads it as the instance.
+            assert!(
+                source.contains("@builtin(instance_index) instance_index: u32,"),
+                "{what} does not declare the builtin it indexes the shared buffer with"
+            );
+            seen += 1;
+        }
+    }
+    assert_eq!(
+        seen, 2,
+        "the instanced extrusion on a plane and on the bend"
+    );
 }
 
 /// A matrix is declared as four columns, and the body cannot treat it as a matrix by accident.
@@ -1082,6 +1168,7 @@ fn no_module_names_a_matrix_type() {
                 *surface,
                 family.blocks,
                 family.attributes,
+                family.instance_attributes,
                 family.textures,
                 family.body,
             )
@@ -1122,6 +1209,7 @@ fn a_body_naming_an_undeclared_field_fails() {
         Surface::Plane,
         &[&BACKGROUND_DRAWABLE_UBO],
         &BACKGROUND_SHADER,
+        &[],
         &[],
         r"
 @fragment
@@ -1183,6 +1271,7 @@ fn every_family_on_every_surface_compiles() {
                 *surface,
                 family.blocks,
                 family.attributes,
+                family.instance_attributes,
                 family.textures,
                 family.body,
             )
@@ -1194,7 +1283,7 @@ fn every_family_on_every_surface_compiles() {
         }
     }
     assert_eq!(
-        pairs, 61,
+        pairs, 63,
         "the matrix grew or shrank; look at the new pairs"
     );
 }
@@ -1212,11 +1301,14 @@ fn every_attribute_is_read() {
                 *surface,
                 family.blocks,
                 family.attributes,
+                family.instance_attributes,
                 family.textures,
                 family.body,
             )
             .expect("assembles");
-            for attribute in family.attributes {
+            // Both tables: a family's per-instance attributes are declared in `In` beside its
+            // per-vertex ones and a body that never read one would be the same defect.
+            for attribute in family.attributes.iter().chain(family.instance_attributes) {
                 let field = attribute_name(attribute.name);
                 // Once in the generated input, and at least once more in the body that reads it.
                 let uses = identifier_uses(&source, &field);
@@ -1348,6 +1440,14 @@ const UNREAD_COMPONENTS: &[(&str, &str, &str)] = &[
     // `a_decimals_ed.y` is the edge distance, which only `fill_extrusion_pattern.vertex.glsl`
     // reads. The plain family declares the pair and uses the first of it.
     ("fill_extrusion", "fill_extrusion_decimals_ed", "y"),
+    // The walls declare the same pair per instance and read the same half of it. The edge distance
+    // is for a pattern and this family draws none -- the patterned instanced variant is the one
+    // that would read it, and it has no body here yet.
+    (
+        "fill_extrusion_instanced",
+        "fill_extrusion_decimals_ed",
+        "y",
+    ),
     // `a_pixeloffset.zw` is the minimum font scale, which `symbol_icon.vertex.glsl` reads and
     // `symbol_sdf.vertex.glsl` does not -- the SDF family takes `a_pxoffset` from `xy` and stops.
     ("symbol_sdf", "symbol_pixel_offset", "zw"),
@@ -1390,11 +1490,15 @@ fn every_component_of_an_attribute_is_read() {
             Surface::Plane,
             family.blocks,
             family.attributes,
+            family.instance_attributes,
             family.textures,
             family.body,
         )
         .expect("assembles");
-        for attribute in family.attributes {
+        // Both tables, for the reason [`every_attribute_is_read`] walks both: an instance
+        // attribute's spare components are as easy to leave unread as a vertex attribute's, and
+        // this family's `decimals_ed.y` is exactly that case.
+        for attribute in family.attributes.iter().chain(family.instance_attributes) {
             let field = attribute_name(attribute.name);
             let width = components(attribute.declared);
             if width < 2 {
@@ -1551,6 +1655,7 @@ fn every_zoom_factor_is_used() {
                 *surface,
                 family.blocks,
                 family.attributes,
+                family.instance_attributes,
                 family.textures,
                 family.body,
             )

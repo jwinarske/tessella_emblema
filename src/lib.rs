@@ -22,7 +22,7 @@
 //! accumulate across updates and have to be kept from becoming a whole-texture write by accident.
 //!
 //! [`shaders`], the largest part: a body per family, and the assembler that joins one to a
-//! surface and to the ABI's own declarations. Eighteen families, each transcribed from
+//! surface and to the ABI's own declarations. Twenty families, each transcribed from
 //! `include/mbgl/shaders/vulkan/*.hpp` — the Vulkan backend's text, which is what the ABI's
 //! tables are generated from and which differs from the GL shaders in places that matter.
 //!
@@ -46,11 +46,11 @@
 //!
 //! Two ways, because reading a shader cannot catch what reading cannot see.
 //!
-//! `tests/shaders.rs` assembles every (family, surface) pair — 61 of them — compiles each to
+//! `tests/shaders.rs` assembles every (family, surface) pair — 63 of them — compiles each to
 //! SPIR-V, and pins the decisions that are silent when wrong. A wrong one of those still draws,
 //! which is why they are pinned at all.
 //!
-//! `benches/first_pixel.rs` *runs* them. Twenty-four cases pick inputs that make one pixel
+//! `benches/first_pixel.rs` *runs* them. Twenty-nine cases pick inputs that make one pixel
 //! predictable, derive that pixel from mbgl's own arithmetic by hand, draw, and read it back. It
 //! is a bench rather than a test because it needs a GPU and CI has none; it has caught defects
 //! the pins could not, including a feather mirrored by a coordinate flip naga applies after a
@@ -67,9 +67,9 @@
 //!
 //! [`families`] is what a producer's `builtin_shader` resolves to: the blocks, tables, body and
 //! surfaces one family's module is assembled from, keyed by the shader rather than by a name
-//! because nothing on the wire carries a name. It also states the coverage -- eighteen of mbgl's
-//! thirty-six shader entries are drawn here and the rest are listed with the reason, pinned
-//! against the enum so neither list can drift.
+//! because nothing on the wire carries a name. It also states the coverage -- twenty of mbgl's
+//! thirty-six shader entries are drawn here and the other sixteen are listed with the reason,
+//! pinned against the enum so neither list can drift.
 //!
 //! [`vertices`] is the first of those stores' decisions rather than a store: what a drawable's
 //! attribute descriptors come to once they are checked against the family's own table. [`draws`]

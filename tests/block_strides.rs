@@ -165,6 +165,7 @@ fn every_module_declares_its_blocks_at_the_producers_stride() {
                 surface,
                 family.blocks,
                 family.attributes,
+                family.instance_attributes,
                 family.textures,
                 family.body,
             )

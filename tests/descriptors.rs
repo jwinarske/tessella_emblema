@@ -29,13 +29,23 @@ use tessella_emblema::pipelines::{self, Binding, Kind};
 use tessella_emblema::shaders;
 use tessella_emblema::surface::Surface;
 
-/// Every `@group(0) @binding(n)` the assembled text declares, in binding order, with its kind read
-/// from the declaration itself.
+/// Every `@group(g) @binding(n)` the assembled text declares, in group and binding order, with its
+/// kind read from the declaration itself.
+///
+/// Both groups, because a family with instance-rate attributes declares a second: the group is
+/// part of what has to agree, and a module that moved a binding between groups would otherwise
+/// read the same here.
 fn declared(text: &str) -> Vec<Binding> {
     let mut out = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        let Some(rest) = line.strip_prefix("@group(0) @binding(") else {
+        let Some(rest) = line.strip_prefix("@group(") else {
+            continue;
+        };
+        let Some((group, rest)) = rest.split_once(") @binding(") else {
+            continue;
+        };
+        let Ok(group) = group.parse::<u32>() else {
             continue;
         };
         let Some((number, tail)) = rest.split_once(')') else {
@@ -59,12 +69,13 @@ fn declared(text: &str) -> Vec<Binding> {
         // slot the bytes arrive at -- so this leaves it out and `tests/block_slots.rs` is where the
         // slots are checked.
         out.push(Binding {
+            group,
             binding,
             kind,
             slot: None,
         });
     }
-    out.sort_unstable_by_key(|b| b.binding);
+    out.sort_unstable_by_key(|b| (b.group, b.binding));
     out
 }
 
@@ -78,6 +89,7 @@ fn assembled(family: &families::Family, surface: Surface) -> Option<String> {
             surface,
             family.blocks,
             family.attributes,
+            family.instance_attributes,
             family.textures,
             family.body,
         )
@@ -99,13 +111,13 @@ fn every_module_declares_what_the_layout_describes() {
             // The number and the kind, which is what a module declares. The slot a block's bytes
             // arrive at is not in the text and cannot be: it is the producer's name for a buffer,
             // not the shader's for a binding. `tests/block_slots.rs` is where those are checked.
-            let derived: Vec<(u32, Kind)> = pipelines::bindings(family, surface)
+            let derived: Vec<(u32, u32, Kind)> = pipelines::bindings(family, surface)
                 .iter()
-                .map(|b| (b.binding, b.kind))
+                .map(|b| (b.group, b.binding, b.kind))
                 .collect();
-            let from_text: Vec<(u32, Kind)> = declared(&text)
+            let from_text: Vec<(u32, u32, Kind)> = declared(&text)
                 .iter()
-                .map(|b| (b.binding, b.kind))
+                .map(|b| (b.group, b.binding, b.kind))
                 .collect();
             assert_eq!(
                 from_text, derived,
@@ -116,16 +128,19 @@ fn every_module_declares_what_the_layout_describes() {
         }
     }
     assert_eq!(
-        checked, 61,
-        "the crate assembles 61 modules; a different number here means the sweep drifted from \
+        checked, 63,
+        "the crate assembles 63 modules; a different number here means the sweep drifted from \
          what tests/shaders.rs compiles"
     );
 }
 
-/// The bindings are consecutive from zero, with no gaps.
+/// The bindings are consecutive from zero within each group, with no gaps.
 ///
 /// A gap is a binding the layout declares and nothing reads, which is legal and wasteful -- but it
 /// is also what an off-by-one looks like from this side, so it is worth refusing outright.
+///
+/// Per group, because each set numbers its own bindings from zero: group one's single binding is a
+/// zero beside group zero's, not a continuation of it.
 #[test]
 fn the_bindings_are_consecutive_from_zero() {
     for family in families::ALL {
@@ -134,12 +149,15 @@ fn the_bindings_are_consecutive_from_zero() {
                 continue;
             }
             let derived = pipelines::bindings(family, surface);
-            for (index, binding) in derived.iter().enumerate() {
-                assert_eq!(
-                    binding.binding, index as u32,
-                    "{} on {surface:?} has a gap at {index}",
-                    family.name
-                );
+            for group in [0, 1] {
+                for (expected, binding) in derived.iter().filter(|b| b.group == group).enumerate() {
+                    let expected = expected as u32;
+                    assert_eq!(
+                        binding.binding, expected,
+                        "{} on {surface:?} has a gap at {expected} of group {group}",
+                        family.name
+                    );
+                }
             }
         }
     }

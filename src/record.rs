@@ -33,7 +33,7 @@
 //! unclipped is a value, not a branch -- and the same two `vkCmdSet` calls serve both.
 
 use ash::vk;
-use tessella_capture_abi::envelope::ViewId;
+use tessella_capture_abi::envelope::{GeometryId, ViewId};
 use tessella_consume::batch::{Batch, Batches};
 use tessella_consume::join::Joiner;
 use tessella_consume::stencil::Partition;
@@ -56,10 +56,22 @@ pub struct Program {
     /// One for everything but the instanced families, which bind a wall outline per instance. The
     /// caller knows which family a batch is; this does not need to.
     ///
-    /// More than one and the batch's `ubo_indexes` must all be nought: `firstInstance` carries the
-    /// slot today and it also addresses the instance-rate attribute fetch, so the two cannot share
-    /// it. [`crate::draws::indexed`] refuses the pair rather than recording it.
+    /// More than one and the slot cannot travel in `firstInstance`: it also addresses the
+    /// instance-rate attribute fetch, so the two cannot share it. [`crate::draws::indexed`]
+    /// refuses the pair rather than recording it, and [`Self::per_drawable`] is how the slot
+    /// travels instead.
     pub instances: u32,
+    /// Whether this family's per-drawable state is bound rather than indexed.
+    ///
+    /// False for every family whose draws differ only by `ubo_index`: the slot rides
+    /// `firstInstance`, the layer's one descriptor set serves every drawable, and recording a
+    /// drawable is a `vkCmdDrawIndexed` and nothing else.
+    ///
+    /// True for a family drawn with instance-rate attributes, where two things move per drawable
+    /// instead -- `ubo_index` into a push constant, and the drawable's own instance buffer into a
+    /// group-one descriptor set. Both are set here per drawable rather than per batch, which is
+    /// what this flag buys and what it costs.
+    pub per_drawable: bool,
 }
 
 /// Why a frame could not be recorded.
@@ -74,12 +86,23 @@ pub enum Error {
         /// The layer.
         which: Which,
     },
+    /// A `per_drawable` family's drawable has no group-one descriptor set.
+    ///
+    /// The set names this geometry's instance buffer and is written before the frame is recorded,
+    /// as a layer's set is. A drawable without one is a caller that resolved the batch to a
+    /// `per_drawable` program and did not write the sets that program needs -- and drawing anyway
+    /// would read the instance array through whatever was bound at group one last, which is
+    /// another drawable's outline or nothing at all.
+    NoInstanceSet {
+        /// Which geometry.
+        geometry: GeometryId,
+    },
     /// A drawable's geometry is not on the device.
     ///
     /// Not the same as a geometry the order names and the consumer has not been given -- the
-    /// collapse already drops those, because `collapse_into`'s resolver returns `None` for one. This
-    /// is a geometry that resolved to a program and then had no buffers, which is a store and a
-    /// joiner that disagree.
+    /// collapse already drops those, because `collapse_into`'s resolver returns `None` for one.
+    /// This is a geometry that resolved to a program and then had no buffers, which is a store and
+    /// a joiner that disagree.
     NotResident {
         /// Which geometry.
         geometry: tessella_capture_abi::envelope::GeometryId,
@@ -102,6 +125,9 @@ impl core::fmt::Display for Error {
                 "view {:?} layer {} has no descriptor set",
                 which.view, which.layer
             ),
+            Self::NoInstanceSet { geometry } => {
+                write!(f, "geometry {} has no instance descriptor set", geometry.0)
+            }
             Self::NotResident { geometry } => {
                 write!(f, "geometry {} is not on the device", geometry.0)
             }
@@ -293,7 +319,25 @@ pub fn content(
                 record.bind_index_buffer(indexes);
             }
 
-            for draw in draws::indexed(scene.store.segments(*geometry), *slot, found.instances)? {
+            // Per drawable, for the family that cannot put its slot in `firstInstance`: the
+            // instance buffer is this geometry's own, so its set is too, and `ubo_index` goes in
+            // a push constant. The draw then starts at instance nought, which is what makes the
+            // instance-rate attributes fetch from the start of that buffer.
+            let slot = if found.per_drawable {
+                let instances = scene
+                    .sets
+                    .instances(*geometry)
+                    .ok_or(Error::NoInstanceSet {
+                        geometry: *geometry,
+                    })?;
+                record.bind_descriptor_set_at(1, found.layout, instances);
+                record.push_constants(found.layout, &slot.to_le_bytes());
+                0
+            } else {
+                *slot
+            };
+
+            for draw in draws::indexed(scene.store.segments(*geometry), slot, found.instances)? {
                 record.draw_indexed(
                     draw.index_count,
                     draw.instance_count,

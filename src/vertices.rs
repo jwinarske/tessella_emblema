@@ -48,6 +48,16 @@ pub struct Bound {
     /// splits a geometry's `attrs` from its `instance_attrs`, and an instanced family's wall
     /// outline is in the second.
     pub rate: vk::VertexInputRate,
+    /// Whether these bytes are also bound as a storage buffer.
+    ///
+    /// `ShaderAttribute::shared_buffer`, as a yes or no: the table's entry names the UBO binding
+    /// mbgl registers the same buffer at, and what the store needs from that is one more usage
+    /// flag. Which attributes are *fields* of the storage element is a question for the module,
+    /// which reads it off the same table.
+    ///
+    /// Not pipeline state, so it is not in [`crate::pipelines::Slot`]: two drawables that differ
+    /// only here cannot exist, because it comes from the family's table rather than from the wire.
+    pub shared: bool,
 }
 
 /// What a drawable's descriptors came to.
@@ -209,6 +219,7 @@ fn planned(
                 vertex_offset: desc.vertex_offset,
                 source: desc.source,
                 rate: *rate,
+                shared: entry.shared_buffer.is_some(),
             });
         }
     }

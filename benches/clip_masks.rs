@@ -259,6 +259,7 @@ fn scene(device: &Open, matrix: [f32; 16]) -> Result<Scene<'_>, String> {
 
     // The mask declares one storage buffer and nothing else, arriving at mbgl's own slot for it.
     let bindings = [Binding {
+        group: 0,
         binding: 0,
         kind: Kind::StorageBuffer,
         slot: Some(MASK_SLOT),

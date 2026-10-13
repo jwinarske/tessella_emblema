@@ -18,6 +18,14 @@
 //!
 //! The family's blocks come first, then the surface's, then a texture and a sampler for each image
 //! the surface samples. So a module is one (family, surface) pair and the pair decides the set.
+//!
+//! Group *one* exists for one family, and for a reason that has nothing to do with tidiness: the
+//! instanced extrusion reads the next instance out of a storage buffer that belongs to one
+//! geometry, where every binding above belongs to a layer. A set shared by the layer cannot hold
+//! it, and binding it at an offset into a shared buffer would bring
+//! `minStorageBufferOffsetAlignment` into a pass that binds everything at offset zero to stay
+//! clear of it. The same family takes `ubo_index` as a push constant, because by then
+//! `firstInstance` is carrying the instance -- see [`crate::draws`].
 
 use std::fmt::Write as _;
 
@@ -41,6 +49,18 @@ pub enum Error {
     InvalidAttribute {
         /// The attribute, as the header spells it.
         name: &'static str,
+    },
+    /// An attribute naming a shared buffer whose declared type is not one packed scalar.
+    ///
+    /// The shared buffer's element is the same bytes as the attributes that name it, read as the
+    /// words they were packed into: `Short2` is one `i32` and `UShort2` is one `u32`, which is
+    /// mbgl's own `OutlineInstance`. A third type would be bytes nothing here knows how to read
+    /// twice, and reading them the one way that is known would silently be the wrong way.
+    Unpackable {
+        /// The attribute, as the header spells it.
+        name: &'static str,
+        /// The declared type that has no packed scalar form.
+        declared: AttributeDataType,
     },
 }
 
@@ -166,13 +186,21 @@ pub fn attribute_name(declared: &str) -> String {
 /// texture the surface samples. The body sees each block as a binding named after its type in
 /// snake case, the vertex input as `In`, and the surface as `place`.
 ///
+/// `instance_attributes` is empty for every family but the instanced extrusions. Where it is not,
+/// its entries join `In` at their own locations, and the ones naming a `shared_buffer` are also
+/// declared as the element of a storage array in group one -- the same bytes a second way, which
+/// is how a body reads the *next* instance. Such a family also gets `ubo_index` as a push
+/// constant, because `firstInstance` is carrying the instance by then; see [`crate::draws`].
+///
 /// # Errors
 ///
-/// [`Error`] from a block that cannot be declared, or an attribute the ABI calls invalid.
+/// [`Error`] from a block that cannot be declared, an attribute the ABI calls invalid, or a shared
+/// attribute whose declared type is not one packed word.
 pub fn module(
     surface: Surface,
     blocks: &[&UboLayout],
     attributes: &[ShaderAttribute],
+    instance_attributes: &[ShaderAttribute],
     textures: &[ShaderTexture],
     body: &str,
 ) -> Result<String, Error> {
@@ -231,13 +259,49 @@ pub fn module(
     }
     out.push('\n');
 
+    // The buffer mbgl binds twice, where there is one: its attributes are registered so the bytes
+    // reach the device as vertex input, and the fourth field of each `AttributeInfo` names the
+    // binding the *same* buffer is bound at as a storage buffer. A body needs both -- the
+    // attribute for this instance and the array for the next one, because an attribute fetch
+    // cannot look ahead.
+    //
+    // The element's fields are the shared attributes in their own order, read as the words they
+    // were packed into rather than as the pairs the attribute declares. Derived from the table so
+    // it cannot drift from the attributes it is the same bytes as.
+    let shared: Vec<&ShaderAttribute> = instance_attributes
+        .iter()
+        .filter(|attribute| attribute.shared_buffer.is_some())
+        .collect();
+    if !shared.is_empty() {
+        out.push_str("struct SharedInstance {\n");
+        for attribute in &shared {
+            let Some(wgsl) = packed_type(attribute.declared) else {
+                return Err(Error::Unpackable {
+                    name: attribute.name,
+                    declared: attribute.declared,
+                });
+            };
+            let _ = writeln!(out, "    {}: {},", attribute_name(attribute.name), wgsl);
+        }
+        out.push_str("}\n\n");
+        out.push_str(
+            "@group(1) @binding(0) var<storage, read> shared_instance: array<SharedInstance>;\n\n",
+        );
+        // And the drawable's slot, which has nowhere else to travel on this family: `firstInstance`
+        // addresses the instance-rate attribute fetch as well as the builtin, so a draw of more
+        // than one instance cannot put the slot there. Vertex stage only, which is where
+        // `ubo_index` is read.
+        out.push_str("struct Pushed {\n    ubo_index: u32,\n}\n");
+        out.push_str("var<push_constant> pushed: Pushed;\n\n");
+    }
+
     // The vertex input, at the locations the producer binds its buffers to. A body naming a field
     // the family does not declare does not compile, which is the point of generating this.
     out.push_str("struct In {\n");
     // The drawable's slot, as the draw's own `firstInstance`. A builtin rather than an attribute
     // because it is one number a draw: bound as a vertex buffer it would be one number a vertex.
     out.push_str("    @builtin(instance_index) instance_index: u32,\n");
-    for attribute in attributes {
+    for attribute in attributes.iter().chain(instance_attributes) {
         let Some(wgsl) = attribute_type(attribute.declared) else {
             return Err(Error::InvalidAttribute {
                 name: attribute.name,
@@ -259,6 +323,26 @@ pub fn module(
     out.push('\n');
     out.push_str(body);
     Ok(out)
+}
+
+/// The WGSL scalar a shared attribute's bytes are read as inside the storage element.
+///
+/// The other half of [`attribute_type`] for the attributes that name a shared buffer: the *same
+/// bytes*, read once as a vertex attribute and once as a word of a storage element. `Short2` is
+/// two `i16` in one `i32` and `UShort2` is two `u16` in one `u32`, which is what mbgl's
+/// `OutlineInstance` declares for those two attributes.
+///
+/// Only those two, and the rest return `None` rather than a guess. A `Float2` is not a packed
+/// word at all, and a four-component type is two of them -- either would need the element's
+/// field count to stop matching the attribute count, which is the correspondence that makes this
+/// derivable from the table instead of written out beside it.
+#[must_use]
+pub const fn packed_type(declared: AttributeDataType) -> Option<&'static str> {
+    match declared {
+        AttributeDataType::Short2 => Some("i32"),
+        AttributeDataType::UShort2 => Some("u32"),
+        _ => None,
+    }
 }
 
 /// The binding's name from its type name: `BackgroundDrawableUbo` gives `background_drawable_ubo`.
@@ -326,6 +410,14 @@ fn fragment_main() -> @location(0) vec4<f32> {
 /// eleven times the cost of the draw it accompanies -- and 0.34 us on Adreno. `firstInstance` is a
 /// field of the draw call that is already being made, so it costs nothing on any of the three.
 /// See `tests/bench-baselines/`.
+///
+/// # Except for one family, where it cannot be
+///
+/// The instanced extrusion. `firstInstance` is part of the address an instance-rate vertex
+/// attribute is fetched from as well as being the builtin's base -- measured on RADV and V3D in
+/// `benches/instance_fetch.rs` -- so a draw of more than one instance cannot put the slot there.
+/// Its body assigns this from a push constant instead, which [`module`] declares for it, and the
+/// bill is one `vkCmdPushConstants` per walls drawable rather than per draw in the frame.
 ///
 /// `var<private>` and not a parameter: the surfaces read it too, and threading it through `place`
 /// would put it in a signature every family's body has to repeat.
@@ -2198,5 +2290,142 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
     let alpha = clamp(min(distance + blur2, in.width - distance) / blur2, 0.0, 1.0);
 
     return props.outline_color * (alpha * props.opacity);
+}
+";
+
+/// The instanced fill-extrusion family's body: a building's walls.
+///
+/// The other half of [`FILL_EXTRUSION_BODY`], and the only family here drawn with more than one
+/// instance. The geometry is four vertices -- mbgl's `fillExtrusionVertices`, a unit quad -- and
+/// the building's outline arrives per *instance*, so one quad raised once per outline point is
+/// every wall in the tile. A wall needs the edge it stands on, which is two outline points, so
+/// this body reads the next instance as well as its own.
+///
+/// # The buffer bound twice
+///
+/// An attribute fetch cannot look ahead, so the next point cannot arrive as an attribute. mbgl's
+/// answer is in `AttributeInfo`'s fourth argument: the outline position and the packed decimals
+/// name a UBO binding as well as a location, which makes `VertexAttribute::getBufferUsage` add
+/// `STORAGE_BUFFER_BIT` and `Drawable::setSharedBuffers` register the same buffer there. The bytes
+/// are vertex input *and* a storage buffer, and the body reads this instance from the first and the
+/// next instance from the second. tessella#377 is what carries that field to a consumer;
+/// `shaders::module` turns it into `SharedInstance` and group one.
+///
+/// The lookahead is unclamped, exactly as mbgl leaves it. What keeps it inside the buffer is the
+/// discard test below, which returns before the read: the closing point of every ring carries the
+/// flag, and the buffer ends at some ring's closing point. tessella#378 guards that on the
+/// producer's side, over every shape that changes which point lands last.
+///
+/// # Why `ubo_index` is a push constant here and nowhere else
+///
+/// Because `firstInstance` is carrying the instance. It addresses the instance-rate attribute
+/// fetch as well as `@builtin(instance_index)` -- measured on two drivers in
+/// `benches/instance_fetch.rs` -- so the slot cannot ride it on a draw of more than one instance.
+/// [`crate::draws`] refuses the pair rather than recording it.
+///
+/// # What this has that the roof does not
+///
+/// The vertical gradient. mbgl applies it where the surface normal is horizontal, which is every
+/// normal here and no normal on a roof, so the roof's body says it "belongs with the walls and has
+/// to arrive with them". This is that arrival. Transcribed from the Vulkan source, including the
+/// constant 150 that the height is scaled by and the 0.7-to-0.98 floor that the light intensity
+/// chooses between.
+pub const FILL_EXTRUSION_INSTANCED_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) shade: vec4<f32>,
+}
+
+// Where a wall's foot stands: the integer tile position plus the fraction packed beside the
+// discard flag, seven bits an axis. `(frac.x * 256 + frac.y) * 2 + discarded` is what the producer
+// packs and what mbgl unpacks, and both ends of a wall come through here -- this instance's from
+// its attributes and the next one's from the shared buffer, which is why that buffer is bound
+// twice. `decimals` is the sixteen-bit word alone, so the shift is the flag and nothing else.
+fn outline_point(position: vec2<f32>, decimals: u32) -> vec2<f32> {
+    let pair = f32(decimals >> 1u);
+    let high = floor(pair / 256.0);
+    return position + vec2<f32>(high, pair - high * 256.0) / 128.0;
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    // Not `in.instance_index`, which is this draw's instance. See the constant's own note.
+    ubo_index = pushed.ubo_index;
+    let drawable = fill_extrusion_drawable_ubo[ubo_index];
+    let props = fill_extrusion_props_ubo[0];
+    var out: Out;
+
+    // A ring's closing point has no edge leaving it and so no wall to raise. Tested first and
+    // returned from first, which is also what keeps the lookahead below inside the buffer.
+    // mbgl's `mod(instanceDecimalsEd.x, 2.0) > 0.0`, as the bit it is.
+    if (in.fill_extrusion_decimals_ed.x & 1u) != 0u {
+        out.clip = vec4<f32>(0.0);
+        out.shade = vec4<f32>(0.0);
+        return out;
+    }
+
+    let p1 = outline_point(
+        vec2<f32>(in.fill_extrusion_outline_pos),
+        in.fill_extrusion_decimals_ed.x
+    );
+
+    // The next outline point, from the same bytes read as a storage element. Its two words carry
+    // two sixteen-bit halves each -- mbgl's `unpack_int` and `unpack_uint` -- and the position's
+    // are signed where the decimals' are not. The edge distance rides in the high half of the
+    // second word and is masked off: it is for a pattern, and this family draws none.
+    let next = shared_instance[in.instance_index + 1u];
+    let next_position = vec2<f32>(
+        f32((next.fill_extrusion_outline_pos << 16u) >> 16u),
+        f32(next.fill_extrusion_outline_pos >> 16u)
+    );
+    let p2 = outline_point(next_position, next.fill_extrusion_decimals_ed & 0xFFFFu);
+
+    // A wall faces along the outline's normal, which is its edge turned a quarter turn. Flat in
+    // `z`, which is what makes the gradient below apply to every vertex of this family.
+    let edge = normalize(p2 - p1);
+    let normal = vec3<f32>(-edge.y, edge.x, 0.0);
+
+    let base = max(mix_value(in.fill_extrusion_base, drawable.base_t), 0.0);
+    let height = max(mix_value(in.fill_extrusion_height, drawable.height_t), 0.0);
+
+    // The template's corner chooses which end of the edge and which end of the wall: `x` picks
+    // the point, `y` picks the foot or the top.
+    let t = f32(in.fill_extrusion_pos.y);
+    let z = select(base, height, t > 0.0);
+    let foot = select(p2, p1, in.fill_extrusion_pos.x == 0);
+
+    // How bright the surface already is. A pale wall takes a narrower range of shading than a
+    // dark one, and a slight ambient keeps nothing completely black.
+    var color = mix_color(in.fill_extrusion_color, drawable.color_t);
+    let luminance = color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722;
+    color += vec4<f32>(0.03, 0.03, 0.03, 1.0);
+
+    let facing = clamp(dot(normal, props.light_position), 0.0, 1.0);
+    let least = 1.0 - props.light_intensity;
+    let most = max(1.0 - luminance + props.light_intensity, 1.0);
+    var directional = mix(least, most, facing);
+
+    // The gradient down a wall, which only a horizontal normal takes. mbgl writes it as a
+    // multiply rather than a branch and says so: without a vertical gradient the factor is a
+    // constant, and with one it falls off from the top of the building toward its base. The
+    // floor the clamp takes is chosen by the light intensity, so a dim light darkens less far.
+    let dimmest = mix(0.7, 0.98, 1.0 - props.light_intensity);
+    let factor = clamp((t + base) * pow(height / 150.0, 0.5), dimmest, 1.0);
+    directional *= (1.0 - props.vertical_gradient) + props.vertical_gradient * factor;
+
+    // Shading is floored at a tint complementary to the light, so a colored light leaves its
+    // opposite in the shadows rather than driving them to black.
+    let floor_light = mix(vec3<f32>(0.0), vec3<f32>(0.3), 1.0 - props.light_color);
+    let lit = clamp(color.rgb * directional * props.light_color, floor_light, vec3<f32>(1.0));
+
+    // Premultiplied, over a color whose alpha was one.
+    out.shade = vec4<f32>(lit, 1.0) * props.opacity;
+    out.clip = place(vec3<f32>(foot, z), drawable.matrix);
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    return in.shade;
 }
 ";

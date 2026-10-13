@@ -261,6 +261,7 @@ fn draw(
             pipeline,
             layout: layout.pipeline(),
             instances: 1,
+            per_drawable: false,
         }
     };
 
@@ -316,6 +317,7 @@ fn draw(
             pipeline,
             layout: layout.pipeline(),
             instances: 1,
+            per_drawable: false,
         }
     };
 
@@ -621,6 +623,7 @@ fn compile_family(family: &families::Family) -> Result<Vec<u32>, String> {
         Surface::Plane,
         family.blocks,
         family.attributes,
+        family.instance_attributes,
         family.textures,
         family.body,
     )

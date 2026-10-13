@@ -500,7 +500,7 @@ fn draw(
                     .get(&id)
                     .ok_or_else(|| format!("geometry {} has no plan", id.0))?,
                 fill.blend(pass.bits()),
-                pipelines::Depth::of(pass.bits()),
+                pipelines::Depth::of(pass.bits(), flags),
                 pipelines::Enabled::of(flags),
             );
             let pipeline = cache
@@ -570,7 +570,7 @@ fn draw(
                 .get(&frame::SAMPLER)
                 .ok_or("the sampling geometry has no plan")?,
             raster.blend(pass.bits()),
-            pipelines::Depth::of(pass.bits()),
+            pipelines::Depth::of(pass.bits(), flags_of(frame::SAMPLER)?),
             raster_state,
         );
         let pipeline = cache

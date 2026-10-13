@@ -49,8 +49,27 @@
 //!
 //! What it does not do is say the picture is *right*. It says every batch resolved to a program,
 //! every drawable was recorded, and no pixel was left at the clear -- and the one cross-check it
-//! prints is the commonest color, which for the Berlin capture is the background `capture-render`
-//! filled its own PNG of this frame with, to the byte.
+//! prints is the commonest color, which for the Berlin capture is `[234, 230, 221]` over 538,300
+//! pixels: `#eae6dd`, the `background-color` of `tools/parity/scenes/families_p.json`, which is the
+//! style that capture was taken through.
+//!
+//! # What the Berlin frame actually contains, which is not all of that style
+//!
+//! Worth saying, so nobody reads the picture as a reference. Seven families arrive -- background,
+//! fill, its triangulated outline, line, circle and the two extrusions -- and the colors they draw
+//! are the scene's: the water is `#9ec6dd`, the roads `#cfc7b6`, the buildings `#c9b9a8` through
+//! the light the producer sent (`light_intensity` 0.5, `light_position` 0.2875, -0.498, 0.9959).
+//!
+//! The parks layer is **black**, and that is the capture rather than this crate. Its paint is
+//! `fill-pattern: grass_pattern` and the capture carries no sprite, so the producer resolved no
+//! pattern, emitted a plain `FillShader` drawable, and sent the style spec's default `fill-color`
+//! with it -- `#000000`, which is what `FillEvaluatedPropsUBO` holds for that layer. mbgl does not
+//! have that arm: `render_fill_layer.cpp:458` branches on whether the *style* has a pattern, not on
+//! whether one resolved, so it builds a pattern drawable either way. Drawing it by hand with
+//! `TSE_ONLY_LAYER=3` is how that was found.
+//!
+//! The capture also has no raster tile, so the style's imagery layer is absent, and no symbols,
+//! because the capture was taken without glyphs.
 
 // A bench is a program, and it reports by printing.
 #![allow(
@@ -819,6 +838,10 @@ fn run(path: &str) -> Result<(), String> {
         .and_then(|layers| record::DepthRange::new(layers, frame.camera.depth_range_size))
         .ok_or("the stream carried no layer count or no depth range")?;
 
+    // Whether this run is a diagnostic rather than a check. Drawing one layer leaves most of the
+    // frame at the clear and most batches undrawn, which is what the two assertions below are
+    // about -- so under it they report and do not fail.
+    let isolating = std::env::var("TSE_ONLY_LAYER").is_ok();
     let mut counts = Err("the recording did not run".to_string());
     device
         .submit(|record: Recorder<'_>| {
@@ -860,7 +883,18 @@ fn run(path: &str) -> Result<(), String> {
                             depth: Some(bands),
                             size: (WIDTH, HEIGHT),
                         },
-                        &|batch| resolved.get(&program_key(batch.key)).copied(),
+                        // `TSE_ONLY_LAYER=<n>` draws that layer alone, which is how a color in
+                        // the frame is traced to the layer that put it there -- the parks layer's
+                        // black was found this way. The batch count below is not checked under it,
+                        // because leaving layers undrawn is the point.
+                        &|batch| {
+                            if let Ok(only) = std::env::var("TSE_ONLY_LAYER")
+                                && only.parse::<u32>() != Ok(batch.key.layer_index)
+                            {
+                                return None;
+                            }
+                            resolved.get(&program_key(batch.key)).copied()
+                        },
                     )
                     .map_err(|why| format!("recording: {why}"));
                 },
@@ -883,7 +917,7 @@ fn run(path: &str) -> Result<(), String> {
         counts.undrawn,
         counts.unclipped
     );
-    if counts.batches != batches {
+    if counts.batches != batches && !isolating {
         return Err(format!("{} of {batches} batches recorded", counts.batches));
     }
 
@@ -907,9 +941,9 @@ fn run(path: &str) -> Result<(), String> {
         *counts.entry(*pixel).or_default() += 1;
     }
     // And the commonest color, which is not an assertion -- a capture of another style has another
-    // one -- but is what a reader compares against the oracle. For the Berlin capture it is
-    // `[234, 230, 221]` over 538,300 pixels, which is the color `capture-render`'s own PNG of this
-    // frame is filled with, to the byte.
+    // one -- but is what a reader checks the frame against. For the Berlin capture it is
+    // `[234, 230, 221]` over 538,300 pixels, which is `#eae6dd`, the `background-color` of the
+    // scene that capture was taken through.
     let (common, share) = counts
         .iter()
         .max_by_key(|(_, count)| **count)
@@ -917,7 +951,9 @@ fn run(path: &str) -> Result<(), String> {
         .unwrap_or_default();
     println!(
         "  the pixels            {}   {} of {} at the clear, {} colors, {common:?} over {share}",
-        if cleared == 0 && counts.len() > 1 {
+        if isolating {
+            "one "
+        } else if cleared == 0 && counts.len() > 1 {
             "ok  "
         } else {
             "FAIL"
@@ -926,12 +962,12 @@ fn run(path: &str) -> Result<(), String> {
         pixels.len(),
         counts.len(),
     );
-    if cleared != 0 {
+    if cleared != 0 && !isolating {
         return Err(format!(
             "{cleared} pixels are still {CLEARED:?}, which the background covers"
         ));
     }
-    if counts.len() < 2 {
+    if counts.len() < 2 && !isolating {
         return Err("the frame is one color, so only the background drew".to_string());
     }
 

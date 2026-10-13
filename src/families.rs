@@ -5,6 +5,11 @@
 //! takes four things — the uniform blocks it declares, the attribute table, the texture table and
 //! the body — and which surfaces it can be drawn on. This is that table.
 //!
+//! And one thing that is not part of a module at all: [`Composite`], how a draw of the family
+//! composites over the target. That is here because mbgl keeps it in the same place -- a render
+//! layer's own source, not a style and not the wire -- and because it is the kind of fact this
+//! table exists to hold, transcribed once and pinned.
+//!
 //! Keyed by [`BuiltIn`] rather than by a name, because the wire names a shader and nothing on the
 //! wire carries a name. A consumer that had to map a discriminant to a family itself would be
 //! holding the half of this crate's knowledge that is hardest to check.
@@ -46,6 +51,7 @@ use tessella_capture_abi::generated::ubo_layouts::{
     SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
 
+use crate::pipelines::Blend;
 use crate::shaders::{
     self, BACKGROUND_BODY, BACKGROUND_PATTERN_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY,
     FILL_EXTRUSION_BODY, FILL_EXTRUSION_INSTANCED_BODY, FILL_OUTLINE_BODY,
@@ -54,6 +60,37 @@ use crate::shaders::{
     RASTER_BODY, SYMBOL_ICON_BODY, SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY,
 };
 use crate::surface::Surface;
+
+/// How a family's draws composite over the target, which is mbgl's `setColorMode`.
+///
+/// Nothing on the wire carries it -- `grep -i color_mode crates/tessella-capture-abi/src` is empty
+/// -- and nothing has to, because mbgl does not take it from a style either. Each render layer
+/// calls `setColorMode` with a mode written in its own source, so the whole of it is a property of
+/// the family and belongs here beside the blocks and the tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Composite {
+    /// One mode, whatever the pass. Thirteen of the twenty.
+    Fixed(Blend),
+    /// [`Blend::Alpha`] where the pass is translucent and [`Blend::Unblended`] where it is not.
+    ///
+    /// mbgl writes this seven times in three spellings: the background compares
+    /// `drawPasses == RenderPass::Translucent` by equality, the line masks the opaque bit out
+    /// first and then compares, and the symbol tests the translucent bit. This is the third.
+    ///
+    /// The three differ on one input, a drawable declaring `Opaque | Translucent`, which the
+    /// background's equality gives `unblended` in *both* passes. A line and a symbol cannot reach
+    /// it: their own `evaluate` sets `Translucent` or `None` and never the opaque bit, so their
+    /// other arm is unreachable in mbgl as well. A background can, and only when its opacity and
+    /// its color's alpha are both one -- that is the condition `RenderBackgroundLayer::evaluate`
+    /// supplies both passes under, and under any other it supplies `Translucent` alone.
+    ///
+    /// At an alpha of one the two modes are the same function. `alphaBlended` is
+    /// `Add{One, OneMinusSrcAlpha}` over a premultiplied source, so it is `src + dst * 0`, which
+    /// is `src` -- what `unblended` writes. Measured rather than argued: `benches/first_pixel.rs`
+    /// draws the background both ways over an opaque clear and reads the same four bytes, and
+    /// draws it faded both ways and reads two different ones.
+    ByPass,
+}
 
 /// Every surface. What a family drawn on a tile has.
 const EVERY: &[Surface] = &[
@@ -112,6 +149,8 @@ pub struct Family {
     pub surfaces: &'static [Surface],
     /// Whether the body hands `place` a height above the surface rather than zero.
     pub height: bool,
+    /// How a draw of this family composites, transcribed from mbgl's own `setColorMode`.
+    pub composite: Composite,
 }
 
 impl Family {
@@ -140,6 +179,26 @@ impl Family {
             },
             self.body,
         )
+    }
+
+    /// Which blend a draw of this family in `pass` composites with.
+    ///
+    /// `pass` is `batch::Key::pass`, the one bit `DrawOrder::resolve` left -- the same input
+    /// [`crate::pipelines::Depth::of`] reads. The translucent bit is what decides, so a pass byte
+    /// carrying neither bit blends by replacement; such a drawable is one mbgl does not draw at
+    /// all, its `evaluate` having returned `RenderPass::None`.
+    #[must_use]
+    pub fn blend(&self, pass: u8) -> Blend {
+        match self.composite {
+            Composite::Fixed(blend) => blend,
+            Composite::ByPass => {
+                if pass & tessella_capture_abi::RenderPass::TRANSLUCENT.bits() == 0 {
+                    Blend::Unblended
+                } else {
+                    Blend::Alpha
+                }
+            }
+        }
     }
 }
 
@@ -523,6 +582,7 @@ pub static ALL: &[Family] = &[
         body: BACKGROUND_BODY,
         surfaces: FLAT_OR_BENT,
         height: false,
+        composite: Composite::ByPass,
     },
     Family {
         shader: BuiltIn::BackgroundPatternShader,
@@ -539,6 +599,7 @@ pub static ALL: &[Family] = &[
         body: BACKGROUND_PATTERN_BODY,
         surfaces: FLAT_OR_BENT,
         height: false,
+        composite: Composite::ByPass,
     },
     Family {
         shader: BuiltIn::FillShader,
@@ -551,6 +612,7 @@ pub static ALL: &[Family] = &[
         body: FILL_BODY,
         surfaces: EVERY,
         height: false,
+        composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
         shader: BuiltIn::FillOutlineShader,
@@ -567,6 +629,7 @@ pub static ALL: &[Family] = &[
         body: FILL_OUTLINE_BODY,
         surfaces: EVERY,
         height: false,
+        composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
         shader: BuiltIn::FillOutlineTriangulatedShader,
@@ -587,6 +650,7 @@ pub static ALL: &[Family] = &[
         body: FILL_OUTLINE_TRIANGULATED_BODY,
         surfaces: EVERY,
         height: false,
+        composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
         shader: BuiltIn::FillPatternShader,
@@ -604,6 +668,7 @@ pub static ALL: &[Family] = &[
         body: FILL_PATTERN_BODY,
         surfaces: EVERY,
         height: false,
+        composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
         shader: BuiltIn::FillExtrusionShader,
@@ -616,6 +681,7 @@ pub static ALL: &[Family] = &[
         body: FILL_EXTRUSION_BODY,
         surfaces: PLANE_OR_ANCHORED,
         height: true,
+        composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
         shader: BuiltIn::FillExtrusionInstancedShader,
@@ -628,6 +694,7 @@ pub static ALL: &[Family] = &[
         body: FILL_EXTRUSION_INSTANCED_BODY,
         surfaces: PLANE_OR_ANCHORED,
         height: true,
+        composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
         shader: BuiltIn::LineShader,
@@ -644,6 +711,7 @@ pub static ALL: &[Family] = &[
         body: LINE_BODY,
         surfaces: EVERY,
         height: false,
+        composite: Composite::ByPass,
     },
     Family {
         shader: BuiltIn::LinePatternShader,
@@ -661,6 +729,7 @@ pub static ALL: &[Family] = &[
         body: LINE_PATTERN_BODY,
         surfaces: EVERY,
         height: false,
+        composite: Composite::ByPass,
     },
     Family {
         shader: BuiltIn::CircleShader,
@@ -677,6 +746,7 @@ pub static ALL: &[Family] = &[
         body: CIRCLE_BODY,
         surfaces: EVERY,
         height: false,
+        composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
         shader: BuiltIn::RasterShader,
@@ -689,6 +759,7 @@ pub static ALL: &[Family] = &[
         body: RASTER_BODY,
         surfaces: EVERY,
         height: false,
+        composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
         shader: BuiltIn::HillshadePrepareShader,
@@ -704,6 +775,8 @@ pub static ALL: &[Family] = &[
         body: HILLSHADE_PREPARE_BODY,
         surfaces: FLAT,
         height: false,
+        // Into its own target, where there is nothing to composite over.
+        composite: Composite::Fixed(Blend::Unblended),
     },
     Family {
         shader: BuiltIn::HillshadeShader,
@@ -720,6 +793,7 @@ pub static ALL: &[Family] = &[
         body: HILLSHADE_BODY,
         surfaces: EVERY,
         height: false,
+        composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
         shader: BuiltIn::ColorReliefShader,
@@ -736,6 +810,7 @@ pub static ALL: &[Family] = &[
         body: COLOR_RELIEF_BODY,
         surfaces: UNANCHORED,
         height: false,
+        composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
         shader: BuiltIn::HeatmapShader,
@@ -748,6 +823,8 @@ pub static ALL: &[Family] = &[
         body: HEATMAP_BODY,
         surfaces: FLAT,
         height: false,
+        // Every kernel brightens the same texel, which is what the ramp then reads.
+        composite: Composite::Fixed(Blend::Additive),
     },
     Family {
         shader: BuiltIn::HeatmapTextureShader,
@@ -760,6 +837,7 @@ pub static ALL: &[Family] = &[
         body: HEATMAP_TEXTURE_BODY,
         surfaces: FLAT_OR_BENT,
         height: false,
+        composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
         shader: BuiltIn::SymbolIconShader,
@@ -772,6 +850,7 @@ pub static ALL: &[Family] = &[
         body: SYMBOL_ICON_BODY,
         surfaces: EVERY,
         height: false,
+        composite: Composite::ByPass,
     },
     Family {
         shader: BuiltIn::SymbolSDFShader,
@@ -784,6 +863,7 @@ pub static ALL: &[Family] = &[
         body: SYMBOL_SDF_BODY,
         surfaces: EVERY,
         height: false,
+        composite: Composite::ByPass,
     },
     Family {
         shader: BuiltIn::SymbolTextAndIconShader,
@@ -796,6 +876,7 @@ pub static ALL: &[Family] = &[
         body: SYMBOL_TEXT_AND_ICON_BODY,
         surfaces: EVERY,
         height: false,
+        composite: Composite::ByPass,
     },
 ];
 

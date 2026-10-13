@@ -37,6 +37,7 @@ mod frame;
 mod passes;
 
 use ash::vk;
+use tessella_capture_abi::RenderPass;
 use tessella_capture_abi::envelope::{Rect16, ViewId};
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_consume::host::Host;
@@ -45,7 +46,7 @@ use tessella_emblema::blocks::Blocks;
 use tessella_emblema::descriptors::Sets;
 use tessella_emblema::device::{self, Attachment};
 use tessella_emblema::images::Images;
-use tessella_emblema::pipelines::{Blend, Cache, Targets};
+use tessella_emblema::pipelines::{Cache, Targets};
 use tessella_emblema::record::Program;
 use tessella_emblema::store::Store;
 use tessella_emblema::surface::Surface;
@@ -234,8 +235,9 @@ fn draw(
             BuiltIn::FillShader,
             Surface::Plane,
             plans.get(&passes::DRAWN).ok_or("the child has no plan")?,
-            Blend::Alpha,
-            // Both views draw in the translucent pass, so neither writes depth.
+            // Both views draw in the translucent pass, so neither writes depth and both take
+            // the translucent arm of whatever their family composites with.
+            fill.blend(RenderPass::TRANSLUCENT.bits()),
             pipelines::Depth::TestOnly,
         );
         // Against the *child's* formats, which are its own: a pipeline names the formats it renders
@@ -276,7 +278,7 @@ fn draw(
             BuiltIn::RasterShader,
             Surface::Plane,
             plans.get(&passes::SAMPLES).ok_or("no parent plan")?,
-            Blend::Alpha,
+            raster.blend(RenderPass::TRANSLUCENT.bits()),
             pipelines::Depth::TestOnly,
         );
         let pipeline = cache

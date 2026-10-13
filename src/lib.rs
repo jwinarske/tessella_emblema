@@ -83,7 +83,9 @@
 //! surfaces one family's module is assembled from, keyed by the shader rather than by a name
 //! because nothing on the wire carries a name. It also states the coverage -- twenty of mbgl's
 //! thirty-six shader entries are drawn here and the other sixteen are listed with the reason,
-//! pinned against the enum so neither list can drift.
+//! pinned against the enum so neither list can drift. And one fact that is not part of a module:
+//! [`families::Composite`], how a draw of the family composites over the target, which mbgl keeps
+//! in the same place -- its render layer's own source, not a style and not the wire.
 //!
 //! [`vertices`] is the first of those stores' decisions rather than a store: what a drawable's
 //! attribute descriptors come to once they are checked against the family's own table. [`draws`]

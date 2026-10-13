@@ -38,6 +38,8 @@
 //! A background is the family that has neither: it covers the viewport rather than a tile, so the
 //! producer sends it no bend block and never raises it.
 
+use tessella_capture_abi::ProjectionMode;
+use tessella_capture_abi::envelope::DrawFlags;
 use tessella_capture_abi::generated::ubo_layouts::{UboField, UboFieldKind, UboLayout};
 
 static GLOBE_CAMERA_FIELDS: [UboField; 1] = [UboField {
@@ -197,6 +199,78 @@ pub enum Surface {
 impl Surface {
     /// Every surface, for a caller walking them.
     pub const ALL: [Self; 4] = [Self::Plane, Self::Globe, Self::GlobeAnchored, Self::Terrain];
+
+    /// Which surface a drawable asks to be placed on.
+    ///
+    /// Every input is the wire's. `projection` is `CameraUpdate::projection`, which is a
+    /// [`ProjectionMode`] and not a number to interpret: the camera says which of its two matrices
+    /// is authoritative, and that is the same fact as which surface the view draws on. `draw_flags`
+    /// is `batch::Key::draw_flags`, whose `ON_TERRAIN` bit the producer sets per drawable wherever
+    /// a ground covers the drawable's tile. `bend` is whether the drawable's layer holds a
+    /// [`GLOBE_BEND_UBO`] -- `crate::blocks::Blocks::buffer` at `ID_GLOBE_BEND_UBO`, under
+    /// [`crate::slots::held_at`].
+    ///
+    /// # What the bend block's presence says
+    ///
+    /// The producer writes it beside the drawable buffer under one condition, `projection ==
+    /// ProjectionMode::Globe`, in the six arms of `write_layer_state` whose geometry is a tile's --
+    /// not the background's, not the heatmap's, and not the color relief's, which has no anchored
+    /// material to read it. So its presence is a globe frame bending a tile, and the anchored
+    /// expansion is taken wherever there is one to take.
+    ///
+    /// The anchored placement's own note reserves a zoom crossover below which the direct bend
+    /// would serve instead. No producer picks one today, and one that did would pick it by
+    /// withholding the block, which this reads with no change.
+    ///
+    /// # A globe wins
+    ///
+    /// Terrain is not a third projection: a caller picks a plane or a sphere, and the ground being
+    /// raised follows from the style instead. So both inputs can say yes at once, and the producer
+    /// resolves that the same way -- `Map::surface` takes the globe, "because this build has no
+    /// terrain on one". Resolved the other way, a consumer would raise geometry through a matrix
+    /// that does not reach clip space at all.
+    ///
+    /// # What the family then has a say in
+    ///
+    /// This is what the *drawable* asks for, which is not always a surface its family has a module
+    /// for: [`crate::families::Family::surface`] is the half that knows, and the fallback it walks
+    /// is [`Self::fallback`].
+    #[must_use]
+    pub const fn of(projection: ProjectionMode, draw_flags: u8, bend: bool) -> Self {
+        match projection {
+            ProjectionMode::Globe if bend => Self::GlobeAnchored,
+            ProjectionMode::Globe => Self::Globe,
+            ProjectionMode::Mercator => {
+                if draw_flags & DrawFlags::ON_TERRAIN.bits() == 0 {
+                    Self::Plane
+                } else {
+                    Self::Terrain
+                }
+            }
+        }
+    }
+
+    /// The surface a family with no module for this one is placed on instead, and `None` for a
+    /// plane.
+    ///
+    /// Each step is a degradation the producer has already named. `DrawFlags::ON_TERRAIN`'s own
+    /// note says it: "a consumer without a terrain variant for the family draws the flat one,
+    /// which is the picture it drew before terrain existed" -- so a raised drawable of such a
+    /// family is drawn where it was drawn before the DEM arrived, which for anything standing on
+    /// the ground is under it. The anchored bend falls to the direct one because it is an
+    /// expansion *of* it, so dropping back draws the same sphere by the arithmetic every lower
+    /// zoom already uses.
+    ///
+    /// A plane ends the chain because every family declares one -- the two that declare nothing
+    /// else draw into their own offscreen target, where there is no camera to bend to.
+    #[must_use]
+    pub const fn fallback(self) -> Option<Self> {
+        match self {
+            Self::Plane => None,
+            Self::Globe | Self::Terrain => Some(Self::Plane),
+            Self::GlobeAnchored => Some(Self::Globe),
+        }
+    }
 
     /// The suffix a module for this surface is named with, and the empty string for a plane.
     #[must_use]

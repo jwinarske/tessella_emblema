@@ -554,6 +554,7 @@ mod tests {
                     _ => BuiltIn::FillOutlineShader as i32,
                 },
                 permutation_key: 0,
+                draw_flags: 0,
                 texture_refs: &[],
             })
         });

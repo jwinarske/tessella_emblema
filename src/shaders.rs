@@ -587,6 +587,27 @@ fn fragment_main() -> @location(0) vec4<f32> {
 /// which is the four multiply-adds a matrix multiply is anyway. Two vendor compilers each refuse
 /// one half of the obvious spelling -- see [`crate::preamble::MATRIX`] -- and this is the form
 /// neither objects to. The columns are columns: the producer writes column-major.
+///
+/// # `vulkan_depth`, which every placement ends with
+///
+/// The matrices are mbgl's and mbgl's projection is OpenGL's: `mat4::perspective` sets
+/// `out[10] = (far + near) / (near - far)` and `out[11] = -1`, which puts clip `z` in `-w..w`.
+/// Vulkan's clip volume is `0..w`, so the near half of every frustum would be clipped away --
+/// along with anything whose whole `z` is a sublayer nudge. The producer's viewport quad is
+/// exactly that: `DrawableEntry::for_viewport` builds a camera-free matrix whose clip `z` is
+/// `-depth_offset`, a small negative number, so the layer that covers the frame is the first thing
+/// a Vulkan consumer drops. Measured: the captured Berlin frame draws 538,201 of 786,432 pixels as
+/// the clear without this, and none of them with it.
+///
+/// Remapped here rather than in the matrices, which are the oracle's bit for bit, and in the
+/// placements rather than per body, because a placement is where a clip position is formed. The
+/// map is linear, so a body that adds a displacement to a placement -- which the lines do -- gets
+/// the same answer whether the two are remapped separately or their sum is.
+///
+/// mbgl's own Vulkan backend does not do this. Its `applySurfaceTransform` flips `y` and leaves `z`
+/// alone, and it binds no `VK_EXT_depth_clip_control`, so it clips the near half too -- which it
+/// never notices, because its background is a tile quad through the projection and lands at
+/// `z/w = 0.99998` where tessella's camera-free quad lands just below zero.
 pub const PRELUDE: &str = r"
 var<private> ubo_index: u32;
 
@@ -595,6 +616,10 @@ fn transform(columns: array<vec4<f32>, 4>, position: vec3<f32>) -> vec4<f32> {
         + columns[1] * position.y
         + columns[2] * position.z
         + columns[3];
+}
+
+fn vulkan_depth(clip: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(clip.xy, (clip.z + clip.w) * 0.5, clip.w);
 }
 
 fn mix_value(packed: vec2<f32>, t: f32) -> f32 {

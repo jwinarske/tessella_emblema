@@ -71,7 +71,11 @@ fn vertex_main(
     let at = corner(vertex % 6u);
     // The tile's own extent, which the matrix expects in tile units.
     let position = vec4<f32>(at * 8192.0, 0.0, 1.0);
-    return mask_ubo[tile].matrix * position;
+    // The same remap every placement ends with, and for the same reason: the matrix is the
+    // producer's and its clip `z` is OpenGL's `-w..w`. A mask outside Vulkan's volume is not drawn,
+    // and what that loses is not the mask but every content draw it was meant to let through.
+    let clip = mask_ubo[tile].matrix * position;
+    return vec4<f32>(clip.xy, (clip.z + clip.w) * 0.5, clip.w);
 }
 
 @fragment

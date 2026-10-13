@@ -462,6 +462,20 @@ const CLIP: [f32; 16] = [
     0.0, 0.0, 0.0, 1.0,
 ];
 
+/// [`CLIP`] with the drawable in the near half of mbgl's clip volume.
+///
+/// Element fourteen is the translation in `z`, which is where the producer puts a drawable's
+/// sublayer nudge -- `DrawableEntry::for_viewport` builds this shape, with a nudge of a few ten
+/// thousandths, for the quad that covers the frame. Half is not a nudge: it is well inside
+/// OpenGL's `-w..w` and well outside Vulkan's `0..w`, so the case below reads the clear if a
+/// placement stops handing its clip position to `vulkan_depth`.
+const CLIP_NEAR_HALF: [f32; 16] = [
+    1.0, 0.0, 0.0, 0.0, //
+    0.0, -1.0, 0.0, 0.0, //
+    0.0, 0.0, 1.0, 0.0, //
+    0.0, 0.0, -0.5, 1.0,
+];
+
 /// A wall's own matrix: the outline's `x` to clip `x`, and the *height* to clip `y`.
 ///
 /// [`CLIP`] cannot serve here. A wall's vertical extent is its height, which `place` takes as the
@@ -766,6 +780,44 @@ fn cases() -> Vec<Case> {
                     &FILL_DRAWABLE_UBO,
                     &[
                         ("matrix", At::F(&CLIP)),
+                        ("color_t", At::F(&[1.0])),
+                        ("opacity_t", At::F(&[1.0])),
+                    ],
+                ),
+                block(&FILL_EVALUATED_PROPS_UBO, &[]),
+            ],
+            images: Vec::new(),
+            vertices: 3,
+            ubo_index: 0,
+            pass: None,
+            absent: &[],
+            instanced: None,
+            expect: [0, 0, 255, 255],
+        },
+        // The same fill in the near half of the clip volume, which must draw where it is placed
+        // rather than be clipped away.
+        //
+        // mbgl's projection is OpenGL's -- `mat4::perspective` puts clip `z` in `-w..w` -- and
+        // Vulkan's volume is `0..w`, so every placement ends at `vulkan_depth`. Without it this
+        // reads the clear, and so does the captured Berlin frame's background: its whole `z` is a
+        // sublayer nudge of a few ten thousandths below zero, and 538,201 of the frame's 786,432
+        // pixels came back unpainted.
+        Case {
+            name: "fill_near_half",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillShader,
+            wire: PLANE,
+            layout: Layout::PerAttribute,
+            streams: vec![
+                shorts(&COVERING),
+                per_vertex(&packed_pair([255, 0, 0, 255], [0, 0, 255, 255]), 3),
+                per_vertex(&[0.0, 1.0], 3),
+            ],
+            uniforms: vec![
+                block(
+                    &FILL_DRAWABLE_UBO,
+                    &[
+                        ("matrix", At::F(&CLIP_NEAR_HALF)),
                         ("color_t", At::F(&[1.0])),
                         ("opacity_t", At::F(&[1.0])),
                     ],

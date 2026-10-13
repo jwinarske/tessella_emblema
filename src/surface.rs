@@ -335,11 +335,11 @@ impl Surface {
 /// baked into the matrix at this drawable's own sub-layer.
 const PLANE_PLACEMENT: &str = r"
 fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
-    return transform(columns, position);
+    return vulkan_depth(transform(columns, position));
 }
 
 fn displace(at: vec2<f32>, delta: vec2<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
-    return columns[0] * delta.x + columns[1] * delta.y;
+    return vulkan_depth(columns[0] * delta.x + columns[1] * delta.y);
 }
 
 // Nothing to hang a curtain over: a plane's tiles are coplanar and their shared edges meet.
@@ -391,7 +391,7 @@ fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
 
     var clip = transform(globe_camera_ubo[0].globe_matrix, sphere);
     clip.z += merc.z;
-    return clip;
+    return vulkan_depth(clip);
 }
 
 // Two evaluations and their difference, because this bend has no linear part to extrude along: it
@@ -437,14 +437,14 @@ fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
     // so nothing here is a large number waiting to cancel.
     let d = position.xy - vec2<f32>(TILE_CENTER, TILE_CENTER);
 
-    return bend.anchor
+    return vulkan_depth(bend.anchor
         + bend.d_u * d.x
         + bend.d_v * d.y
         + 0.5 * (bend.d_uu * (d.x * d.x) + bend.d_vv * (d.y * d.y))
         + bend.d_uv * (d.x * d.y)
         // Clip displacement per meter above the surface, along the sphere's normal rather than
         // along the plane's z. Zero for every family but the extrusions.
-        + bend.d_h * position.z;
+        + bend.d_h * position.z);
 }
 
 // The Jacobian *here*, not at the anchor: differentiating the expansion gives the linear term plus
@@ -455,7 +455,7 @@ fn displace(at: vec2<f32>, delta: vec2<f32>, columns: array<vec4<f32>, 4>) -> ve
     let d = at - vec2<f32>(TILE_CENTER, TILE_CENTER);
     let j_u = bend.d_u + bend.d_uu * d.x + bend.d_uv * d.y;
     let j_v = bend.d_v + bend.d_vv * d.y + bend.d_uv * d.x;
-    return j_u * delta.x + j_v * delta.y;
+    return vulkan_depth(j_u * delta.x + j_v * delta.y);
 }
 
 // The direct bend's answer, for the direct bend's reason: the tiles meet.
@@ -514,14 +514,14 @@ fn place(position: vec3<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
     let meters = dot(channels, terrain.unpack.rgb) - terrain.unpack.a;
     let height = (meters - terrain.skirt.y) * terrain.params.w;
 
-    return transform(columns, vec3<f32>(position.xy, position.z + height));
+    return vulkan_depth(transform(columns, vec3<f32>(position.xy, position.z + height)));
 }
 
 // The linear part, with no second sample. A line's extrusion is a line width in tile units and the
 // ground does not climb measurably across one, so the height at the extruded point is the height
 // already read -- which the displacement does not carry anyway.
 fn displace(at: vec2<f32>, delta: vec2<f32>, columns: array<vec4<f32>, 4>) -> vec4<f32> {
-    return columns[0] * delta.x + columns[1] * delta.y;
+    return vulkan_depth(columns[0] * delta.x + columns[1] * delta.y);
 }
 
 // How far below the surface a flagged vertex hangs, in the meters `place` adds to a height. Not

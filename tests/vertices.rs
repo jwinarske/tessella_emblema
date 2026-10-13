@@ -11,7 +11,8 @@ use tessella_capture_abi::generated::shader_attributes::{
     COLOR_RELIEF_SHADER, FILL_EXTRUSION_INSTANCED_SHADER, FILL_EXTRUSION_INSTANCED_SHADER_INSTANCE,
     FILL_SHADER, RASTER_SHADER,
 };
-use tessella_emblema::vertices::{Refused, plan, plan_instanced};
+use tessella_emblema::device::stride_of;
+use tessella_emblema::vertices::{Refused, instances, plan, plan_instanced};
 
 /// A descriptor agreeing with a table entry, which is the shape the producer sends.
 fn agreeing(
@@ -270,4 +271,106 @@ fn the_plain_plan_is_all_per_vertex() {
         plan_instanced(&RASTER_SHADER, &descs, &[], &[]).expect("agrees"),
         "an empty instanced run changes nothing"
     );
+}
+
+/// A stride of zero means tightly packed, and becomes the declared type's own size.
+///
+/// GL's own meaning for it in `glVertexAttribPointer`, and what the producer sends for a drawable
+/// whose vertices are nothing but this attribute: `emit::encode_background_on` writes
+/// `stride: 0` with "as the oracle's descriptor carries". A Vulkan binding of zero is a different
+/// thing -- every vertex reads the same bytes -- so the background's quad collapsed to its first
+/// corner and the layer that covers the frame drew nothing at all. Measured: 538,201 of the
+/// captured Berlin frame's 786,432 pixels came back as the clear.
+///
+/// mbgl never binds zero either. `vulkan/drawable.cpp:390` sets the attribute's stride to
+/// `VertexAttribute::getStrideOf(type)`, and `vulkan/upload_pass.cpp:151` asserts it is positive.
+#[test]
+fn a_zero_stride_is_the_declared_types_own_size() {
+    let mut descs: Vec<AttributeDesc> = FILL_SHADER.iter().map(agreeing).collect();
+    for desc in &mut descs {
+        desc.stride = 0;
+    }
+    let got = plan(&FILL_SHADER, &descs).expect("agrees");
+    assert_eq!(got.bound.len(), FILL_SHADER.len());
+    for (bound, entry) in got.bound.iter().zip(FILL_SHADER) {
+        let packed = stride_of(entry.declared).expect("a bindable type has a size");
+        assert_eq!(
+            bound.stride, packed,
+            "{} is {:?}, which is {packed} bytes",
+            entry.name, entry.declared
+        );
+        assert_ne!(
+            bound.stride, 0,
+            "a binding of zero reads one vertex forever"
+        );
+    }
+
+    // And a stride the producer did send is the producer's. The two cases are not the same
+    // question: an interleaved run has a stride wider than its own attribute, and substituting the
+    // type's size there would read every vertex from inside the first one.
+    let interleaved: Vec<AttributeDesc> = FILL_SHADER.iter().map(agreeing).collect();
+    let got = plan(&FILL_SHADER, &interleaved).expect("agrees");
+    for bound in &got.bound {
+        assert_eq!(bound.stride, 12, "the descriptor's own stride");
+    }
+}
+
+/// How many instances a plan draws, which is the shortest instance-rate run.
+///
+/// mbgl's `instanceAttributes ? instanceAttributes->getMinCount() : 1`, from the descriptors: a
+/// draw of more instances than the shortest buffer holds fetches past its end, and one of fewer
+/// leaves walls unbuilt. Nothing on the wire carries the number -- it is a `SlabRef`'s length over
+/// a stride -- so a consumer either derives it or guesses.
+#[test]
+fn the_instance_count_is_the_shortest_run() {
+    // Nothing per instance is one instance, not none: the draw still happens.
+    let flat: Vec<AttributeDesc> = FILL_SHADER.iter().map(agreeing).collect();
+    let plan = plan(&FILL_SHADER, &flat).expect("agrees");
+    assert_eq!(instances(&plan), 1);
+
+    let vertex: Vec<AttributeDesc> = FILL_EXTRUSION_INSTANCED_SHADER
+        .iter()
+        .map(agreeing)
+        .collect();
+    let mut per_instance: Vec<AttributeDesc> = FILL_EXTRUSION_INSTANCED_SHADER_INSTANCE
+        .iter()
+        .map(agreeing)
+        .collect();
+    // Sixty-four bytes at a stride of twelve is five whole entries, and one run shorter than the
+    // rest is what decides.
+    let planned = plan_instanced(
+        &FILL_EXTRUSION_INSTANCED_SHADER,
+        &vertex,
+        &FILL_EXTRUSION_INSTANCED_SHADER_INSTANCE,
+        &per_instance,
+    )
+    .expect("agrees");
+    assert_eq!(instances(&planned), 5);
+
+    per_instance[0].source.length = 36;
+    let shorter = plan_instanced(
+        &FILL_EXTRUSION_INSTANCED_SHADER,
+        &vertex,
+        &FILL_EXTRUSION_INSTANCED_SHADER_INSTANCE,
+        &per_instance,
+    )
+    .expect("agrees");
+    assert_eq!(
+        instances(&shorter),
+        3,
+        "the shortest run is what the draw can read"
+    );
+
+    // And the run's own start is not part of it: entries before `vertex_offset` belong to another
+    // drawable.
+    per_instance[0].source.length = 64;
+    per_instance[0].vertex_offset = 2;
+    let offset = plan_instanced(
+        &FILL_EXTRUSION_INSTANCED_SHADER,
+        &vertex,
+        &FILL_EXTRUSION_INSTANCED_SHADER_INSTANCE,
+        &per_instance,
+    )
+    .expect("agrees");
+    assert_eq!(instances(&offset), 3);
 }

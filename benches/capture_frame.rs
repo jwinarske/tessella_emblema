@@ -35,11 +35,22 @@
 //!   and an extrusion with its walls -- and a set keyed by the layer alone kept only the second of
 //!   each. The write succeeded; the lookup was what was lost.
 //!
-//! What it still does *not* do is draw. That wants a pipeline per batch and the recording itself,
-//! which is its own piece of work; this stops where every resource a draw would bind is on the
-//! device and reachable, and where every input to the pipeline's key is in hand -- the surface
-//! each program is placed on, read off the camera and the batches' own flags, and the blend, which
-//! the frame's background takes two different values of because it is batched once in each pass.
+//! And then it draws: the masks, a pipeline per batch key, `record::content` over the frame's own
+//! batches, and the pixels back. Three more things were wrong and none of them could have been
+//! found by a fixture, because a fixture writes what it would read:
+//!
+//! - an `AttributeDesc` of stride zero means tightly packed, which is what the producer sends for
+//!   the background's quad and what a Vulkan binding of zero is not -- so the quad collapsed to its
+//!   first corner;
+//! - the matrices are mbgl's, whose projection is OpenGL's, so clip `z` runs `-w..w` where Vulkan's
+//!   volume is `0..w` -- and the viewport quad's whole `z` is a sublayer nudge just below zero;
+//! - a drawable with instance-rate attributes draws one instance per entry of the shortest run,
+//!   which is a number the wire carries only as a length over a stride.
+//!
+//! What it does not do is say the picture is *right*. It says every batch resolved to a program,
+//! every drawable was recorded, and no pixel was left at the clear -- and the one cross-check it
+//! prints is the commonest color, which for the Berlin capture is the background `capture-render`
+//! filled its own PNG of this frame with, to the byte.
 
 // A bench is a program, and it reports by printing.
 #![allow(
@@ -52,24 +63,87 @@
 
 mod common;
 
+#[path = "common/screen.rs"]
+mod screen;
+
 use std::collections::{BTreeMap, BTreeSet};
 
+use ash::vk;
 use tessella_capture_abi::EnvelopeKind;
 use tessella_capture_abi::RenderPass;
 use tessella_capture_abi::capture;
-use tessella_capture_abi::envelope::{DrawFlags, ViewId};
+use tessella_capture_abi::envelope::{DrawFlags, TileId, ViewId};
+use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_capture_abi::ring::Ring;
+use tessella_consume::batch;
 use tessella_consume::host::Host;
 use tessella_consume::slab::{self, Slab};
 use tessella_consume::upload::Upload;
 use tessella_emblema::blocks::Blocks;
 use tessella_emblema::descriptors::Sets;
+use tessella_emblema::device::Attachment;
 use tessella_emblema::pipelines::Blend;
 use tessella_emblema::store::Store;
 use tessella_emblema::surface::Surface;
-use tessella_emblema::{blocks, buffers, families, pipelines, slots, vertices};
+use tessella_emblema::{
+    blocks, buffers, families, masks, pipelines, record, slots, target, vertices,
+};
+use tessella_vk::Recorder;
 
 use common::Open;
+use screen::Screen;
+
+/// The viewport the capture's camera was computed for.
+///
+/// Not on the wire, and not an omission: a screen view's size belongs to the consumer, and
+/// `CameraUpdate` carries the projection rather than the extent it was built from.
+/// `capture-render`'s own default is 1024 by 768 and the PNG it wrote beside this capture is that
+/// size, so this is the size the matrices place geometry for. Drawn at another, it is this frame
+/// through the wrong aspect.
+const WIDTH: u32 = 1024;
+const HEIGHT: u32 = 768;
+
+/// What the target is cleared to, which is no color this style draws.
+///
+/// Magenta, loud on purpose: the background is the bottom layer of this style and covers the
+/// viewport, so a pixel left at this is a pixel nothing drew.
+const CLEAR: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
+
+/// The same, as the bytes a readback holds.
+const CLEARED: [u8; 4] = [255, 0, 255, 255];
+
+/// What a batch's program is looked up by.
+///
+/// `batch::Key` without its texture refs, which no batch in this frame carries: a program is a
+/// pipeline and the layout its set binds through, and both are functions of exactly these five.
+/// The pass is one of them, which is why this frame's background -- batched once in each pass --
+/// is two programs and not one.
+type ProgramKey = (i32, u32, u8, u8, u64);
+
+/// That key, off a batch.
+fn program_key(key: &batch::Key) -> ProgramKey {
+    (
+        key.builtin_shader,
+        key.layer_index,
+        key.pass,
+        key.draw_flags,
+        key.permutation_key,
+    )
+}
+
+/// WGSL to SPIR-V, as every other bench here compiles it.
+fn compile(source: &str) -> Result<Vec<u32>, String> {
+    let parsed = naga::front::wgsl::parse_str(source)
+        .map_err(|why| format!("wgsl: {}", why.emit_to_string(source)))?;
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(&parsed)
+    .map_err(|why| format!("validation: {why:?}"))?;
+    naga::back::spv::write_vec(&parsed, &info, &naga::back::spv::Options::default(), None)
+        .map_err(|why| format!("spirv: {why}"))
+}
 
 /// A render state, as the flags it is made of.
 ///
@@ -267,6 +341,7 @@ fn run(path: &str) -> Result<(), String> {
     let joiner = frame.joiner;
     let plans: Vec<(
         tessella_capture_abi::envelope::GeometryId,
+        vertices::Plan,
         buffers::Needs,
         Vec<tessella_capture_abi::envelope::Segment>,
     )> = {
@@ -305,11 +380,10 @@ fn run(path: &str) -> Result<(), String> {
                     continue;
                 }
             };
-            out.push((
-                *geometry,
-                buffers::needs(&plan, add.indexes),
-                drawable.geometry.segments.clone(),
-            ));
+            // The plan itself is kept, not only what it needs on the device: the pipeline key
+            // and the module both come off it, and this is the only place it is built.
+            let needs = buffers::needs(&plan, add.indexes);
+            out.push((*geometry, plan, needs, drawable.geometry.segments.clone()));
         }
         println!(
             "  the plans             {}   {} of {} geometries planned, {} famil{}: {}",
@@ -338,7 +412,7 @@ fn run(path: &str) -> Result<(), String> {
     let gpu = device.gpu();
     let mut store = Store::new();
     let mut failed = Vec::new();
-    for (geometry, needs, segments) in &plans {
+    for (geometry, _, needs, segments) in &plans {
         if let Err(why) = store.upload(gpu, *geometry, needs, segments, &|reference| {
             slab::resolve(region, &slabs, reference)
         }) {
@@ -452,7 +526,7 @@ fn run(path: &str) -> Result<(), String> {
         let bindings = pipelines::bindings(family, surface);
         let layout = pipelines::layout(gpu, &bindings)
             .map_err(|why| format!("{} on {surface:?}: {why}", family.name))?;
-        layouts.push((*shader, *layer, family.name, bindings, layout));
+        layouts.push((*shader, *layer, family.name, surface, bindings, layout));
     }
     println!(
         "  the surfaces          ok   a {projection:?} camera, {raised} of {batches} batches \
@@ -467,17 +541,27 @@ fn run(path: &str) -> Result<(), String> {
 
     let widest = layouts
         .iter()
-        .map(|(_, _, _, bindings, _)| bindings.clone())
+        .map(|(_, _, _, _, bindings, _)| bindings.clone())
         .max_by_key(Vec::len)
         .unwrap_or_default();
+    // Sized for every set the frame needs, which is more than one per program: the masks have one
+    // of their own at layer -1, and the instanced extrusion has a group-one set per drawable over
+    // that drawable's own instance buffer. A pool short by one answers `ERROR_OUT_OF_POOL_MEMORY`
+    // on the set it cannot allocate, which is a frame that stops rather than draws.
+    let instanced = wanted
+        .iter()
+        .filter(|(_, shader)| {
+            families::for_wire(*shader).is_some_and(|family| !family.instance_attributes.is_empty())
+        })
+        .count();
     let mut sets = Sets::new(
         gpu,
-        u32::try_from(layouts.len()).unwrap_or(u32::MAX),
+        u32::try_from(layouts.len() + 1 + instanced).unwrap_or(u32::MAX),
         &widest,
     )
     .map_err(|why| format!("the descriptor pool: {why}"))?;
     let mut written = Vec::with_capacity(layouts.len());
-    for (shader, layer, name, bindings, layout) in &layouts {
+    for (shader, layer, name, _, bindings, layout) in &layouts {
         let which = blocks::Which {
             view,
             layer: *layer,
@@ -540,6 +624,316 @@ fn run(path: &str) -> Result<(), String> {
             format!(": {}", replaced.join(", "))
         }
     );
+
+    // ------------------------------------------------------------------ the draw
+    //
+    // Everything above is what a draw would bind; this is the draw. The masks first, then one
+    // pipeline per batch key, then `record::content` over the frame's own batches, then the pixels
+    // back.
+
+    // The attachment, from the families the frame draws rather than from a constant:
+    // `Attachment::DepthStencil` is "every view that draws an extrusion", and `Family::height` is
+    // which families those are. This frame has two of them.
+    let extrudes = programs
+        .iter()
+        .any(|(shader, _)| families::for_wire(*shader).is_some_and(|family| family.height));
+    let attachment = if extrudes {
+        Attachment::DepthStencil
+    } else {
+        Attachment::StencilOnly
+    };
+    let screen = Screen::new(&device, WIDTH, HEIGHT, attachment)
+        .map_err(|why| format!("the target: {why}"))?;
+
+    // The masks, which every content draw that asked for the stencil test is held against. One
+    // matrix per tile at the slot mbgl's own constant names, keyed frame-wide: a mask belongs to
+    // the renderer rather than to any layer, which is what `slots::FRAME_WIDE` is.
+    let mask_slot = tessella_capture_abi::generated::ubo_slots::ID_CLIPPING_MASK_UBO;
+    let mask_at = blocks::Which {
+        view,
+        layer: slots::FRAME_WIDE,
+    };
+    let order: Vec<(TileId, [f32; 16])> = host
+        .clips(view)
+        .masks()
+        .map(|(tile, matrix)| (tile, *matrix))
+        .collect();
+    let mask_bytes: Vec<u8> = order
+        .iter()
+        .flat_map(|(_, matrix)| matrix.iter().flat_map(|value| value.to_le_bytes()))
+        .collect();
+    held.declare(gpu, mask_at, mask_slot, order.len(), 64)
+        .map_err(|why| format!("the mask buffer: {why}"))?;
+    held.replace(mask_at, mask_slot, &mask_bytes)
+        .map_err(|why| format!("the mask buffer: {why}"))?;
+    held.flush(mask_at, mask_slot, 0)
+        .map_err(|why| format!("the mask buffer: {why}"))?;
+
+    let mask_bindings = [pipelines::Binding {
+        group: 0,
+        binding: 0,
+        kind: pipelines::Kind::StorageBuffer,
+        slot: Some(mask_slot),
+    }];
+    let mask_layout =
+        pipelines::layout(gpu, &mask_bindings).map_err(|why| format!("the mask layout: {why}"))?;
+    let mask_module = gpu
+        .shader(&compile(masks::BODY)?)
+        .map_err(|why| format!("the mask module: {why}"))?;
+    let mask_pipeline = pipelines::build_mask(gpu, &mask_layout, &mask_module, screen.targets)
+        .map_err(|why| format!("the mask pipeline: {why}"))?;
+    let mask_set = sets
+        .write(
+            &mask_layout,
+            &mask_bindings,
+            mask_at,
+            BuiltIn::ClippingMaskProgram as i32,
+            &held,
+            &[],
+        )
+        .map_err(|why| format!("the mask set: {why}"))?;
+
+    // Re-planned, because a plan borrows the host and the first one ended at the uploads. The
+    // batches, the joiner, the clips and the camera all come out of one borrow of it.
+    let frame = host
+        .plan(view)
+        .ok_or_else(|| format!("view {} planned nothing the second time", view.0))?;
+    let partition = frame.clips.partition();
+
+    // One program per batch key: the pipeline that batch's own state asks for, and the layout its
+    // set binds through. Built here and not inside the resolver, which `record::content` takes as a
+    // `&dyn Fn` and so cannot hold the device mutably.
+    //
+    // The module is per (family, permutation): two batches of one family whose paint properties are
+    // constant in different places read different uniforms and are different text. The pipeline is
+    // per key on top of that, which is where the surface, the blend, the pass and the drawable's own
+    // state come in.
+    let mut modules: BTreeMap<(i32, u64), tessella_vk::ShaderModule<'_>> = BTreeMap::new();
+    let mut built: Vec<tessella_vk::Pipeline<'_>> = Vec::new();
+    let mut resolved: BTreeMap<ProgramKey, record::Program> = BTreeMap::new();
+    let mut undrawable = Vec::new();
+    for batch in frame.batches.iter() {
+        let at = program_key(batch.key);
+        if resolved.contains_key(&at) {
+            continue;
+        }
+        let Some(family) = families::for_wire(batch.key.builtin_shader) else {
+            undrawable.push(format!(
+                "shader {} has no family here",
+                batch.key.builtin_shader
+            ));
+            continue;
+        };
+        let layer = i32::try_from(batch.key.layer_index).unwrap_or(i32::MAX);
+        let Some((_, _, _, surface, _, layout)) = layouts
+            .iter()
+            .find(|(shader, held_at, ..)| *shader == batch.key.builtin_shader && *held_at == layer)
+        else {
+            undrawable.push(format!("{} on layer {layer} has no layout", family.name));
+            continue;
+        };
+        // The plan of the batch's first drawable. A batch is one program by construction -- the
+        // merge key carries mbgl's permutation hash -- so any of its geometries describes the
+        // vertex input, and the first is the one that certainly exists.
+        let Some(geometry) = batch.geometries.first() else {
+            undrawable.push(format!("{} on layer {layer} has no geometry", family.name));
+            continue;
+        };
+        let Some((_, plan, _, _)) = plans.iter().find(|(id, ..)| id == geometry) else {
+            undrawable.push(format!("geometry {} has no plan", geometry.0));
+            continue;
+        };
+        let key = pipelines::key(
+            family.shader,
+            *surface,
+            plan,
+            family.blend(batch.key.pass),
+            pipelines::Depth::of(batch.key.pass),
+            pipelines::Enabled::of(batch.key.draw_flags),
+        );
+        let module = match modules.entry((batch.key.builtin_shader, key.permutation)) {
+            std::collections::btree_map::Entry::Occupied(had) => had.into_mut(),
+            std::collections::btree_map::Entry::Vacant(empty) => {
+                let source = family
+                    .module(*surface, &plan.absent)
+                    .map_err(|why| format!("{} does not assemble: {why:?}", family.name))?;
+                let module = gpu
+                    .shader(&compile(&source)?)
+                    .map_err(|why| format!("{}: the module: {why}", family.name))?;
+                empty.insert(module)
+            }
+        };
+        let pipeline = pipelines::build(gpu, &key, layout, module, screen.targets)
+            .map_err(|why| format!("{} on layer {layer}: the pipeline: {why}", family.name))?;
+
+        // And the group-one set per drawable, for the one family whose attributes advance per
+        // instance: its slot cannot ride `firstInstance`, which also addresses the instance-rate
+        // fetch, so the instance buffer is bound through a set of its own.
+        let per_drawable = !family.instance_attributes.is_empty();
+        if per_drawable {
+            for geometry in batch.geometries {
+                let Some((_, _, needs, _)) = plans.iter().find(|(id, ..)| id == geometry) else {
+                    continue;
+                };
+                let shared = *needs.storage.first().ok_or_else(|| {
+                    format!("{}: an instanced plan names no shared buffer", family.name)
+                })?;
+                let buffer = store
+                    .vertex_buffer(*geometry, shared)
+                    .ok_or_else(|| format!("geometry {} has no buffer {shared}", geometry.0))?;
+                sets.write_instances(layout, *geometry, buffer)
+                    .map_err(|why| format!("geometry {}: the instance set: {why}", geometry.0))?;
+            }
+        }
+
+        resolved.insert(
+            at,
+            record::Program {
+                pipeline: pipeline.raw(),
+                layout: layout.pipeline(),
+                instances: vertices::instances(plan),
+                per_drawable,
+            },
+        );
+        built.push(pipeline);
+    }
+    println!(
+        "  the pipelines         {}   {} for {batches} batches, {} modules, {} undrawable",
+        if undrawable.is_empty() {
+            "ok  "
+        } else {
+            "WARN"
+        },
+        built.len(),
+        modules.len(),
+        undrawable.len()
+    );
+    for why in undrawable.iter().take(4) {
+        println!("                             {why}");
+    }
+
+    // The depth range the layers divide, which is the order's layer count and the camera's size --
+    // the only place either arrives.
+    let bands = frame
+        .layer_count
+        .and_then(|layers| record::DepthRange::new(layers, frame.camera.depth_range_size))
+        .ok_or("the stream carried no layer count or no depth range")?;
+
+    let mut counts = Err("the recording did not run".to_string());
+    device
+        .submit(|record: Recorder<'_>| {
+            target::frame(
+                record,
+                target::Host {
+                    image: &screen.image,
+                    view: &screen.view,
+                    width: WIDTH,
+                    height: HEIGHT,
+                    layout: vk::ImageLayout::UNDEFINED,
+                },
+                &screen.depth,
+                Some(CLEAR),
+                |record| {
+                    // The masks first: a content draw tests against a stencil they wrote, so recording
+                    // it first tests an empty buffer. One draw per tile, because the reference and the
+                    // write mask are the tile's and both are dynamic.
+                    record.bind_pipeline(mask_pipeline.raw());
+                    record.bind_descriptor_set(mask_layout.pipeline(), mask_set);
+                    for (at, (tile, _)) in order.iter().enumerate() {
+                        let Some(given) = partition.tiles.get(tile) else {
+                            continue;
+                        };
+                        record.stencil_reference(u32::from(given.value));
+                        record.stencil_write_mask(u32::from(given.write_mask));
+                        record.draw(masks::VERTICES, 1, at as u32);
+                    }
+
+                    counts = record::content(
+                        record,
+                        frame.batches,
+                        &record::Scene {
+                            store: &store,
+                            sets: &sets,
+                            joiner: frame.joiner,
+                            partition,
+                            view,
+                            depth: Some(bands),
+                            size: (WIDTH, HEIGHT),
+                        },
+                        &|batch| resolved.get(&program_key(batch.key)).copied(),
+                    )
+                    .map_err(|why| format!("recording: {why}"));
+                },
+            );
+            record.transition(
+                &screen.image,
+                target::LEAVES_IN,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            );
+            record.copy_to_buffer(&screen.image, screen.readback(), WIDTH, HEIGHT);
+        })
+        .map_err(|why| format!("the submission: {why}"))?;
+    let counts = counts?;
+    println!(
+        "  the recording         {}   {} batches, {} drawables, {} draws, {} undrawn, {} unclipped",
+        if counts.undrawn == 0 { "ok  " } else { "WARN" },
+        counts.batches,
+        counts.drawables,
+        counts.draws,
+        counts.undrawn,
+        counts.unclipped
+    );
+    if counts.batches != batches {
+        return Err(format!("{} of {batches} batches recorded", counts.batches));
+    }
+
+    // And the pixels. Two things are asked of them, and both are properties of this style rather
+    // than of any one family: the background is the bottom layer and covers the viewport, so no
+    // pixel may be left at the clear; and more than one color has to be there, or the only thing
+    // that drew was that background.
+    let pixels = screen.pixels()?;
+    // Optionally the frame itself, for a human: a binary PPM, which needs no encoder.
+    if let Ok(path) = std::env::var("TSE_IMAGE") {
+        let mut out = format!("P6\n{WIDTH} {HEIGHT}\n255\n").into_bytes();
+        for pixel in &pixels {
+            out.extend_from_slice(&pixel[0..3]);
+        }
+        std::fs::write(&path, out).map_err(|why| format!("writing {path}: {why}"))?;
+        println!("  wrote {path}");
+    }
+    let cleared = pixels.iter().filter(|pixel| **pixel == CLEARED).count();
+    let mut counts: BTreeMap<[u8; 4], usize> = BTreeMap::new();
+    for pixel in &pixels {
+        *counts.entry(*pixel).or_default() += 1;
+    }
+    // And the commonest color, which is not an assertion -- a capture of another style has another
+    // one -- but is what a reader compares against the oracle. For the Berlin capture it is
+    // `[234, 230, 221]` over 538,300 pixels, which is the color `capture-render`'s own PNG of this
+    // frame is filled with, to the byte.
+    let (common, share) = counts
+        .iter()
+        .max_by_key(|(_, count)| **count)
+        .map(|(color, count)| (*color, *count))
+        .unwrap_or_default();
+    println!(
+        "  the pixels            {}   {} of {} at the clear, {} colors, {common:?} over {share}",
+        if cleared == 0 && counts.len() > 1 {
+            "ok  "
+        } else {
+            "FAIL"
+        },
+        cleared,
+        pixels.len(),
+        counts.len(),
+    );
+    if cleared != 0 {
+        return Err(format!(
+            "{cleared} pixels are still {CLEARED:?}, which the background covers"
+        ));
+    }
+    if counts.len() < 2 {
+        return Err("the frame is one color, so only the background drew".to_string());
+    }
 
     Ok(())
 }

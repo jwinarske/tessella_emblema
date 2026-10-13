@@ -290,6 +290,52 @@ pub fn preferred(classes: &[vk::PhysicalDeviceType]) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
+/// Bytes one vertex of a declared type occupies, which is mbgl's `VertexAttribute::getStrideOf`.
+///
+/// What a binding's stride is when the wire says nothing: an `AttributeDesc` of stride zero means
+/// tightly packed, and this is what tightly packed comes to. [`crate::vertices::plan`] is the one
+/// caller, and mbgl's Vulkan backend does the same in two places --
+/// `Drawable::setVertices` sets `getStrideOf(type)` on the attribute, and `upload_pass.cpp`
+/// supplies it for an attribute with no override at all.
+///
+/// `None` for exactly the types [`vertex_format`] has none for, which is what makes the pair
+/// usable together: a caller that got a format can get a stride. `UShort8` is a real sixteen bytes
+/// and still `None` here, because a type with no vertex format cannot be bound and a size for it
+/// would be a number nothing may use.
+#[must_use]
+pub const fn stride_of(declared: AttributeDataType) -> Option<u32> {
+    // Grouped by the answer rather than by the type's own family, which is what keeps the arms
+    // distinct: two shorts and four bytes are both four bytes, and clippy refuses to see the two
+    // spellings written out separately.
+    let bytes = match declared {
+        AttributeDataType::Byte | AttributeDataType::UByte => 1,
+        AttributeDataType::Byte2
+        | AttributeDataType::UByte2
+        | AttributeDataType::Short
+        | AttributeDataType::UShort => 2,
+        AttributeDataType::Byte3 | AttributeDataType::UByte3 => 3,
+        AttributeDataType::Byte4
+        | AttributeDataType::UByte4
+        | AttributeDataType::Short2
+        | AttributeDataType::UShort2
+        | AttributeDataType::Int
+        | AttributeDataType::UInt
+        | AttributeDataType::Float => 4,
+        AttributeDataType::Short3 | AttributeDataType::UShort3 => 6,
+        AttributeDataType::Short4
+        | AttributeDataType::UShort4
+        | AttributeDataType::Int2
+        | AttributeDataType::UInt2
+        | AttributeDataType::Float2 => 8,
+        AttributeDataType::Int3 | AttributeDataType::UInt3 | AttributeDataType::Float3 => 12,
+        AttributeDataType::Int4 | AttributeDataType::UInt4 | AttributeDataType::Float4 => 16,
+        // The two [`vertex_format`] refuses, and no wildcard arm for the same reason it has none:
+        // a variant added to the generated enum should fail to compile here.
+        AttributeDataType::UShort8 | AttributeDataType::Invalid => return None,
+    };
+    Some(bytes)
+}
+
 /// The Vulkan vertex format for a type a shader declares.
 ///
 /// The declared type decides this and the supplied type does not: the producer's buffer may hold
@@ -352,9 +398,10 @@ pub const fn vertex_format(declared: AttributeDataType) -> Option<vk::Format> {
 mod tests {
     use super::{
         Attachment, DEPTH_STENCIL, Unsupported, check_vertex_formats, depth_stencil_format,
-        preferred,
+        preferred, stride_of, vertex_format,
     };
     use ash::vk;
+    use tessella_capture_abi::generated::mbgl_enums::AttributeDataType;
 
     /// A device reporting attachment support for exactly the formats listed.
     fn supports(list: &[vk::Format]) -> impl Fn(vk::Format) -> vk::FormatFeatureFlags + '_ {
@@ -561,5 +608,69 @@ mod tests {
     #[test]
     fn nothing_enumerated_is_no_answer() {
         assert_eq!(preferred(&[]), None);
+    }
+
+    /// A type has a stride exactly where it has a vertex format.
+    ///
+    /// The two are used together and the pair is what makes that safe: `vertices::plan` takes the
+    /// format first and then the stride for a descriptor that carried none, so a type with one and
+    /// not the other would be a plan that binds a format at a stride of zero -- which is a binding
+    /// where every vertex reads the first one.
+    ///
+    /// `UShort8` is the type that has neither. It is a real sixteen bytes and no vertex format, and
+    /// a size for it here would be a number nothing may use.
+    #[test]
+    fn a_type_has_a_stride_exactly_where_it_has_a_format() {
+        let every = [
+            AttributeDataType::Byte,
+            AttributeDataType::Byte2,
+            AttributeDataType::Byte3,
+            AttributeDataType::Byte4,
+            AttributeDataType::UByte,
+            AttributeDataType::UByte2,
+            AttributeDataType::UByte3,
+            AttributeDataType::UByte4,
+            AttributeDataType::Short,
+            AttributeDataType::Short2,
+            AttributeDataType::Short3,
+            AttributeDataType::Short4,
+            AttributeDataType::UShort,
+            AttributeDataType::UShort2,
+            AttributeDataType::UShort3,
+            AttributeDataType::UShort4,
+            AttributeDataType::UShort8,
+            AttributeDataType::Int,
+            AttributeDataType::Int2,
+            AttributeDataType::Int3,
+            AttributeDataType::Int4,
+            AttributeDataType::UInt,
+            AttributeDataType::UInt2,
+            AttributeDataType::UInt3,
+            AttributeDataType::UInt4,
+            AttributeDataType::Float,
+            AttributeDataType::Float2,
+            AttributeDataType::Float3,
+            AttributeDataType::Float4,
+            AttributeDataType::Invalid,
+        ];
+        let mut sized = 0;
+        for declared in every {
+            assert_eq!(
+                stride_of(declared).is_some(),
+                vertex_format(declared).is_some(),
+                "{declared:?} has one of the two and not the other"
+            );
+            if let Some(bytes) = stride_of(declared) {
+                assert!(bytes > 0, "{declared:?} occupies no bytes");
+                sized += 1;
+            }
+        }
+        assert_eq!(sized, every.len() - 2, "only UShort8 and Invalid have none");
+
+        // And the sizes themselves, on the two the tables use most: a tile position is two shorts
+        // and a packed color is four bytes, both four.
+        assert_eq!(stride_of(AttributeDataType::Short2), Some(4));
+        assert_eq!(stride_of(AttributeDataType::UByte4), Some(4));
+        assert_eq!(stride_of(AttributeDataType::Float4), Some(16));
     }
 }

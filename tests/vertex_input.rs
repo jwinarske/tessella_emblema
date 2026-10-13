@@ -43,6 +43,7 @@ fn key(layout: Vec<Slot>) -> Key {
         layout,
         blend: pipelines::Blend::Alpha,
         depth: pipelines::Depth::Write,
+        enabled: pipelines::Enabled::ALL,
     }
 }
 

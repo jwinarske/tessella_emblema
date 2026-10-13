@@ -71,6 +71,28 @@ use tessella_emblema::{blocks, buffers, families, pipelines, slots, vertices};
 
 use common::Open;
 
+/// A render state, as the flags it is made of.
+///
+/// Named rather than printed through `Debug`, which is three fields of `true` and `false` in an
+/// order a reader has to look up.
+fn state(enabled: pipelines::Enabled) -> String {
+    let mut parts = Vec::new();
+    if enabled.depth {
+        parts.push("depth");
+    }
+    if enabled.stencil {
+        parts.push("stencil");
+    }
+    if enabled.color {
+        parts.push("color");
+    }
+    if parts.is_empty() {
+        "nothing".to_owned()
+    } else {
+        parts.join("+")
+    }
+}
+
 /// A pass, as a name. An order entry carries one bit of what is a mask on the wire.
 fn named(pass: u8) -> String {
     let one = RenderPass::from_bits(pass);
@@ -213,6 +235,16 @@ fn run(path: &str) -> Result<(), String> {
         .filter(|batch| batch.key.draw_flags & DrawFlags::ON_TERRAIN.bits() != 0)
         .count();
     let batches = frame.batches.len();
+
+    // And the render state each batch asks for, which is the input to the key that only the
+    // drawable can supply: the view does not know it and the family does not either. More than one
+    // answer in one frame is the whole reason it is in the key, and this frame has three.
+    let mut states: BTreeMap<String, usize> = BTreeMap::new();
+    for batch in frame.batches.iter() {
+        *states
+            .entry(state(pipelines::Enabled::of(batch.key.draw_flags)))
+            .or_default() += 1;
+    }
 
     // And how each batch composites, which is the last thing a draw needs that nothing on the wire
     // carries: mbgl writes a `ColorMode` per render layer, and `families::Composite` is that table.
@@ -479,6 +511,16 @@ fn run(path: &str) -> Result<(), String> {
     for why in refused.iter().take(4) {
         println!("                             {why}");
     }
+
+    println!(
+        "  the state             ok   {batches} batches, {} distinct: {}",
+        states.len(),
+        states
+            .iter()
+            .map(|(name, count)| format!("{name} {count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     // The blend each of them would be built with. Not a draw, and not a pipeline: it is the one
     // input to `pipelines::Key` that the capture cannot supply, so this is where the table meets a

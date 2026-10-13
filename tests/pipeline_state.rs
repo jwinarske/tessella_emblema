@@ -34,7 +34,8 @@ use tessella_emblema::pipelines;
 #[test]
 fn depth_is_tested_where_it_is_kept_and_written_by_the_opaque_pass() {
     for depth in [pipelines::Depth::Write, pipelines::Depth::TestOnly] {
-        let flat = pipelines::depth_stencil(Attachment::StencilOnly, depth);
+        let flat =
+            pipelines::depth_stencil(Attachment::StencilOnly, depth, pipelines::Enabled::ALL);
         assert_eq!(
             flat.depth_test_enable,
             vk::FALSE,
@@ -47,7 +48,11 @@ fn depth_is_tested_where_it_is_kept_and_written_by_the_opaque_pass() {
         );
     }
 
-    let opaque = pipelines::depth_stencil(Attachment::DepthStencil, pipelines::Depth::Write);
+    let opaque = pipelines::depth_stencil(
+        Attachment::DepthStencil,
+        pipelines::Depth::Write,
+        pipelines::Enabled::ALL,
+    );
     assert_eq!(opaque.depth_test_enable, vk::TRUE);
     assert_eq!(
         opaque.depth_write_enable,
@@ -55,8 +60,11 @@ fn depth_is_tested_where_it_is_kept_and_written_by_the_opaque_pass() {
         "the opaque pass writes, which is what rejects the layers behind it"
     );
 
-    let translucent =
-        pipelines::depth_stencil(Attachment::DepthStencil, pipelines::Depth::TestOnly);
+    let translucent = pipelines::depth_stencil(
+        Attachment::DepthStencil,
+        pipelines::Depth::TestOnly,
+        pipelines::Enabled::ALL,
+    );
     assert_eq!(
         translucent.depth_test_enable,
         vk::TRUE,
@@ -105,7 +113,8 @@ fn only_the_opaque_bit_writes_depth() {
 #[test]
 fn the_stencil_test_is_always_on() {
     for attachment in [Attachment::StencilOnly, Attachment::DepthStencil] {
-        let state = pipelines::depth_stencil(attachment, pipelines::Depth::Write);
+        let state =
+            pipelines::depth_stencil(attachment, pipelines::Depth::Write, pipelines::Enabled::ALL);
         assert_eq!(
             state.stencil_test_enable,
             vk::TRUE,
@@ -122,7 +131,8 @@ fn the_stencil_test_is_always_on() {
 #[test]
 fn a_content_draw_does_not_write_the_stencil() {
     for attachment in [Attachment::StencilOnly, Attachment::DepthStencil] {
-        let state = pipelines::depth_stencil(attachment, pipelines::Depth::Write);
+        let state =
+            pipelines::depth_stencil(attachment, pipelines::Depth::Write, pipelines::Enabled::ALL);
         for (side, face) in [("front", state.front), ("back", state.back)] {
             assert_eq!(face.write_mask, 0, "{side} writes the mask");
             // The compare mask is dynamic now, set per draw from the tile's `read_mask`. See
@@ -222,6 +232,7 @@ fn the_blend_mode_is_part_of_the_key() {
         layout: Vec::new(),
         blend,
         depth: pipelines::Depth::Write,
+        enabled: pipelines::Enabled::ALL,
     };
     assert_ne!(
         of(pipelines::Blend::Alpha),
@@ -274,4 +285,196 @@ fn dynamic_rendering_is_required() {
         Err(Unsupported::NoDynamicRendering),
         "a device without it cannot run this pass at all"
     );
+}
+
+/// A drawable that did not ask for a test does not get it, whatever the view and the pass allow.
+///
+/// Three of `DrawFlags`'s bits are render state the producer sets per drawable, and this crate read
+/// none of them until it had a frame to draw: the depth test was the view's attachment alone, the
+/// stencil test was baked on, and the color write mask was baked to RGBA. The captured Berlin frame
+/// carries three different values across its twelve batches, so all three arms are reachable.
+///
+/// What each one costs when it is baked on instead: a drawable covering the viewport is held
+/// against whichever tile's mask last reached the texel, and a draw that is there for its depth
+/// paints its geometry over the layers under it.
+#[test]
+fn a_drawable_gets_only_the_tests_it_asked_for() {
+    let asked = |depth, stencil| pipelines::Enabled {
+        depth,
+        stencil,
+        color: true,
+    };
+
+    let none = pipelines::depth_stencil(
+        Attachment::DepthStencil,
+        pipelines::Depth::Write,
+        asked(false, false),
+    );
+    assert_eq!(
+        none.depth_test_enable,
+        vk::FALSE,
+        "`ENABLE_DEPTH` is clear, which is mbgl's `DepthMode::disabled()`"
+    );
+    assert_eq!(
+        none.depth_write_enable,
+        vk::FALSE,
+        "a draw that does not test depth does not write it either"
+    );
+    assert_eq!(
+        none.stencil_test_enable,
+        vk::FALSE,
+        "`ENABLE_STENCIL` is clear, and such a drawable has no mask of its own"
+    );
+
+    // And each bit on its own, so neither gates the other.
+    let depth_only = pipelines::depth_stencil(
+        Attachment::DepthStencil,
+        pipelines::Depth::Write,
+        asked(true, false),
+    );
+    assert_eq!(depth_only.depth_test_enable, vk::TRUE);
+    assert_eq!(depth_only.stencil_test_enable, vk::FALSE);
+
+    let stencil_only = pipelines::depth_stencil(
+        Attachment::DepthStencil,
+        pipelines::Depth::Write,
+        asked(false, true),
+    );
+    assert_eq!(stencil_only.depth_test_enable, vk::FALSE);
+    assert_eq!(stencil_only.depth_write_enable, vk::FALSE);
+    assert_eq!(stencil_only.stencil_test_enable, vk::TRUE);
+
+    // The view still has the last word on depth: asking for a test an attachment cannot serve does
+    // not produce one.
+    let flat = pipelines::depth_stencil(
+        Attachment::StencilOnly,
+        pipelines::Depth::Write,
+        pipelines::Enabled::ALL,
+    );
+    assert_eq!(flat.depth_test_enable, vk::FALSE);
+}
+
+/// A draw that asked not to write color writes none of it, whatever it composites with.
+///
+/// mbgl's fourth `ColorMode` is a mask of all-false rather than a blend function, so this is the one
+/// of the three that is not a test: the pipeline still blends and still runs the fragment stage, and
+/// nothing it returns reaches the attachment.
+#[test]
+fn a_draw_that_writes_no_color_has_an_empty_mask() {
+    for blend in [
+        pipelines::Blend::Unblended,
+        pipelines::Blend::Alpha,
+        pipelines::Blend::Additive,
+    ] {
+        let written = pipelines::color_attachment(blend, pipelines::Enabled::ALL);
+        assert_eq!(
+            written.color_write_mask,
+            vk::ColorComponentFlags::RGBA,
+            "{blend:?} writes every channel"
+        );
+
+        let masked = pipelines::color_attachment(
+            blend,
+            pipelines::Enabled {
+                depth: true,
+                stencil: true,
+                color: false,
+            },
+        );
+        assert_eq!(
+            masked.color_write_mask,
+            vk::ColorComponentFlags::empty(),
+            "{blend:?} with `ENABLE_COLOR` clear still wrote a channel"
+        );
+        // And it is the same state the masks draw with, which is this crate's one spelling of
+        // mbgl's `disabled()`. Field by field, because ash's struct is not `PartialEq`.
+        assert_eq!(
+            masked.color_write_mask,
+            pipelines::no_color().color_write_mask
+        );
+        assert_eq!(masked.blend_enable, pipelines::no_color().blend_enable);
+    }
+}
+
+/// The state a drawable asked for is part of the key, so one family can have two pipelines.
+///
+/// The captured frame's extrusion layer is drawn by two families twice over: once with no color for
+/// the depth it leaves behind, and once with color. Keyed without this, the second draw of each
+/// would be handed the first's pipeline and either paint what should be invisible or leave invisible
+/// what should be painted.
+#[test]
+fn the_asked_for_state_is_part_of_the_key() {
+    use tessella_capture_abi::envelope::DrawFlags;
+    use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
+    use tessella_emblema::surface::Surface;
+
+    let of = |enabled| pipelines::Key {
+        shader: BuiltIn::FillShader,
+        surface: Surface::Plane,
+        permutation: 0,
+        layout: Vec::new(),
+        blend: pipelines::Blend::Alpha,
+        depth: pipelines::Depth::Write,
+        enabled,
+    };
+    let all = of(pipelines::Enabled::ALL);
+    for one in [
+        pipelines::Enabled {
+            color: false,
+            ..pipelines::Enabled::ALL
+        },
+        pipelines::Enabled {
+            stencil: false,
+            ..pipelines::Enabled::ALL
+        },
+        pipelines::Enabled {
+            depth: false,
+            ..pipelines::Enabled::ALL
+        },
+    ] {
+        assert_ne!(of(one), all, "{one:?} and all three must be two keys");
+    }
+    assert_eq!(
+        of(pipelines::Enabled::of(
+            DrawFlags::ENABLE_DEPTH.bits()
+                | DrawFlags::ENABLE_STENCIL.bits()
+                | DrawFlags::ENABLE_COLOR.bits()
+        )),
+        all,
+        "and the three bits together are what `Enabled::ALL` is"
+    );
+}
+
+/// `Enabled::of` reads its three bits out of the byte, and reads no others.
+///
+/// The byte carries five, and the two that are left are not render state: `ON_TERRAIN` is a surface
+/// and `IS_3D` is the pass a drawable belongs to. A reading that took the wrong bit would turn a
+/// test off wherever a style has terrain, or write no color wherever an extrusion is drawn -- both
+/// of which draw rather than fail.
+#[test]
+fn the_state_is_the_three_bits_and_no_others() {
+    use tessella_capture_abi::envelope::DrawFlags;
+
+    for byte in 0..=u8::MAX {
+        assert_eq!(
+            pipelines::Enabled::of(byte),
+            pipelines::Enabled {
+                depth: byte & DrawFlags::ENABLE_DEPTH.bits() != 0,
+                stencil: byte & DrawFlags::ENABLE_STENCIL.bits() != 0,
+                color: byte & DrawFlags::ENABLE_COLOR.bits() != 0,
+            },
+            "{byte:#010b}"
+        );
+    }
+
+    // And the other two bits move nothing, whichever way the three are set.
+    for byte in 0..=u8::MAX {
+        for other in [DrawFlags::IS_3D, DrawFlags::ON_TERRAIN] {
+            assert_eq!(
+                pipelines::Enabled::of(byte),
+                pipelines::Enabled::of(byte | other.bits()),
+                "{other:?} changed the state of {byte:#010b}"
+            );
+        }
+    }
 }

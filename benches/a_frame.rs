@@ -435,6 +435,25 @@ fn draw(
     // `Cache::layout` hands back a reference out of a `&mut self` borrow, so holding one family's
     // layout while asking for another's does not compile. The same shape `Host::plan` had, and not
     // a problem here: a set is written once per layer and after that only its handle is needed.
+    // And the render state each family's drawables asked for, off the `ViewUse` the stream carried
+    // -- the field `batch::Key` carries whole, because every bit of it is pipeline state. Per
+    // family here because the pipelines are built before the batches are walked; a frame loop
+    // reads it per batch, which is where it can differ within a layer.
+    //
+    // This is what the assertions below become measurements of. The fixture's drawables ask to
+    // test their tile's mask, so the halves of the picture are the two tiles'; a drawable that did
+    // not ask would draw over the whole target, which is the #90 signature. They ask to test
+    // depth, so the opaque pass -- painted front to back -- leaves the nearer layer visible. And
+    // they ask to write color, without which the whole frame reads back as the clear.
+    let flags_of = |id: GeometryId| -> Result<u8, String> {
+        let drawable = host
+            .joiner()
+            .drawable(id, frame::VIEW)
+            .ok_or_else(|| format!("geometry {} is not used by the view", id.0))?;
+        Ok(drawable.use_.draw_flags.bits())
+    };
+    let raster_state = pipelines::Enabled::of(flags_of(frame::SAMPLER)?);
+
     let mut cache = Cache::new();
     let fill = families::family(BuiltIn::FillShader).ok_or("no fill family")?;
     let raster = families::family(BuiltIn::RasterShader).ok_or("no raster family")?;
@@ -455,24 +474,40 @@ fn draw(
     // `ERROR_OUT_OF_POOL_MEMORY` on the fourth, which is what it did.
     let mut sets = Sets::new(gpu, 4, widest).map_err(|why| format!("the pool: {why}"))?;
 
-    let program = {
+    // A program per (family, state) rather than per family, because one family's drawables do not
+    // all ask for the same pipeline: the two tiled fills test their tile's clip mask, and the layer
+    // above -- the same family, covering the viewport, with no tile of its own -- does not. One
+    // pipeline for both is wrong in one direction or the other, and one of the two is visible:
+    // binding the untiled drawable's pipeline to the tiled ones leaves them unclipped, which puts
+    // tile one's color in both halves. `batch::Key` carries the flags for this reason, and the
+    // lookup below is by them.
+    let fill_programs = {
         let words = compile(
             &fill
                 .module(Surface::Plane, &[])
                 .map_err(|why| format!("the fill does not assemble: {why:?}"))?,
         )?;
-        let key = pipelines::key(
-            BuiltIn::FillShader,
-            Surface::Plane,
-            plans
-                .get(&frame::GEOMETRIES[0])
-                .ok_or("the first geometry has no plan")?,
-            fill.blend(pass.bits()),
-            pipelines::Depth::of(pass.bits()),
-        );
-        let pipeline = cache
-            .pipeline(gpu, &key, &bindings, &words, target.targets)
-            .map_err(|why| format!("the fill pipeline: {why}"))?;
+        let mut built: BTreeMap<u8, vk::Pipeline> = BTreeMap::new();
+        for id in [frame::GEOMETRIES[0], frame::ABOVE] {
+            let flags = flags_of(id)?;
+            if built.contains_key(&flags) {
+                continue;
+            }
+            let key = pipelines::key(
+                BuiltIn::FillShader,
+                Surface::Plane,
+                plans
+                    .get(&id)
+                    .ok_or_else(|| format!("geometry {} has no plan", id.0))?,
+                fill.blend(pass.bits()),
+                pipelines::Depth::of(pass.bits()),
+                pipelines::Enabled::of(flags),
+            );
+            let pipeline = cache
+                .pipeline(gpu, &key, &bindings, &words, target.targets)
+                .map_err(|why| format!("the fill pipeline: {why}"))?;
+            built.insert(flags, pipeline);
+        }
         let layout = cache
             .layout(gpu, BuiltIn::FillShader, Surface::Plane, &bindings)
             .map_err(|why| format!("the fill layout: {why}"))?;
@@ -501,12 +536,21 @@ fn draw(
                 return Err(format!("the set for layer {layer} is null"));
             }
         }
-        Program {
-            pipeline,
-            layout: layout.pipeline(),
-            instances: 1,
-            per_drawable: false,
-        }
+        let bound = layout.pipeline();
+        built
+            .into_iter()
+            .map(|(flags, pipeline)| {
+                (
+                    flags,
+                    Program {
+                        pipeline,
+                        layout: bound,
+                        instances: 1,
+                        per_drawable: false,
+                    },
+                )
+            })
+            .collect::<BTreeMap<u8, Program>>()
     };
 
     // And the sampling layer's own program, which is a different family: its own module, its own
@@ -527,6 +571,7 @@ fn draw(
                 .ok_or("the sampling geometry has no plan")?,
             raster.blend(pass.bits()),
             pipelines::Depth::of(pass.bits()),
+            raster_state,
         );
         let pipeline = cache
             .pipeline(gpu, &key, &raster_bindings, &words, target.targets)
@@ -652,10 +697,11 @@ fn draw(
                         depth: bands,
                         size: (frame::SIDE, frame::SIDE),
                     },
-                    // By family, which is what a batch's key carries: a program is a pipeline and
-                    // the layout its set binds through, and the two families here share neither.
+                    // By family and by the drawable's own render state, which is what a batch's
+                    // key carries: a program is a pipeline and the layout its set binds through,
+                    // and the fill's two batches want the same layout and two pipelines.
                     &|batch| match BuiltIn::from_repr(batch.key.builtin_shader)? {
-                        BuiltIn::FillShader => Some(program),
+                        BuiltIn::FillShader => fill_programs.get(&batch.key.draw_flags).copied(),
                         BuiltIn::RasterShader => Some(raster_program),
                         _ => None,
                     },

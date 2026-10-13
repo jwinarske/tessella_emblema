@@ -508,6 +508,15 @@ pub fn used(
     at: Option<TileId>,
     pass: RenderPass,
 ) {
+    // What a producer sets: a drawable tests depth and writes color, and tests its tile's clip
+    // mask where it has a tile. The captured Berlin frame carries exactly this split -- its fill,
+    // outline and line batches ask for all three, its background and its circle layer for the two
+    // that are left -- and `DrawFlags::default()`, which this sent before anything read the field,
+    // asks for none of them: no depth test, no clipping and no color at all.
+    let mut flags = DrawFlags::ENABLE_DEPTH | DrawFlags::ENABLE_COLOR;
+    if at.is_some() {
+        flags = flags | DrawFlags::ENABLE_STENCIL;
+    }
     let use_ = ViewUse {
         geometry: id,
         view,
@@ -515,7 +524,7 @@ pub fn used(
         sub_layer_index: 0,
         tile: at.unwrap_or_default(),
         render_pass: pass,
-        draw_flags: DrawFlags::default(),
+        draw_flags: flags,
         has_tile: u8::from(at.is_some()),
         _pad: [0; 5],
     };

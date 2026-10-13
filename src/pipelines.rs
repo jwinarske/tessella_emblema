@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 
 use ash::vk;
+use tessella_capture_abi::envelope::DrawFlags;
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 
 use tessella_vk::{DescriptorSetLayout, Gpu, PipelineLayout};
@@ -87,6 +88,94 @@ pub struct Key {
     /// frame want different values of it, and a cache keyed without it would hand the translucent
     /// pass the opaque pass's pipeline. Which draws, and occludes what follows it.
     pub depth: Depth,
+    /// Which of the two tests and the color write the drawable asked for.
+    ///
+    /// In the key for the same reason again, and not hypothetically: the captured Berlin frame's
+    /// twelve batches carry three different values of it, and five of them ask for something other
+    /// than all three.
+    pub enabled: Enabled,
+}
+
+/// The two tests and the color write a drawable's own flags ask for.
+///
+/// Three of `DrawFlags`'s five bits, which travel on `ViewUse` beside the render pass and reach
+/// here as `batch::Key::draw_flags`. They are not a property of the family or of the pass: mbgl
+/// sets them per drawable, and tessella#379 put the whole byte in the merge key because each one
+/// is pipeline state that cannot be shared across a batch boundary.
+///
+/// # mbgl's three arms
+///
+/// Each bit is a mode or its `disabled()`, read off the oracle at `ad5e73527f3a`:
+///
+/// * `vulkan/drawable.cpp:312` -- `enableDepth` false gives `gfx::DepthMode::disabled()`.
+/// * `vulkan/drawable.cpp:325` -- `enableStencil` false gives `gfx::StencilMode::disabled()`.
+/// * `gl/drawable_gl.cpp:242` -- `enableColor ? parameters.colorModeForRenderPass() :
+///   gfx::ColorMode::disabled()`, which is the fourth `ColorMode` and this crate's [`no_color`].
+///   The Vulkan drawable does not read the flag at all, which is mbgl's own gap rather than a
+///   different rule: the ABI's note is "Draw writes color. Cleared for depth- or stencil-only
+///   passes."
+///
+/// Its builder's defaults are `enableColor = true`, `enableStencil = false`, `enableDepth = true`
+/// (`gfx/drawable_builder.hpp:234`), so the clip test is the one a layer has to ask for.
+///
+/// # The two bits that are not here
+///
+/// `ON_TERRAIN` is a surface and is read by [`crate::surface::Surface::of`]. `IS_3D` is pipeline
+/// state in mbgl and is **not transcribed yet**: it selects `depthModeFor3D` (the whole range
+/// rather than the layer's band) and `stencilModeFor3D` (`NotEqual{0xFF}` against a freshly
+/// allocated id, which writes the stencil and discards the tile clip masks) in place of the
+/// per-sublayer modes. Both are a scheme of their own, and the captured frame's four extrusion
+/// batches are what will measure them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Enabled {
+    /// `DrawFlags::ENABLE_DEPTH`: whether the draw tests depth at all.
+    ///
+    /// [`Key::depth`] is the other half and says whether it *writes* what it tests against. This
+    /// one gates both: mbgl's other arm is `DepthMode::disabled()`, which neither tests nor writes.
+    pub depth: bool,
+    /// `DrawFlags::ENABLE_STENCIL`: whether the draw tests its tile's clip mask.
+    ///
+    /// Asked for rather than assumed, which is the part worth stating. mbgl's default is false and
+    /// three layers set it: the fill and the line unconditionally
+    /// (`render_fill_layer.cpp:181`, `render_line_layer.cpp:279`), and the extrusion's color pass
+    /// only where it has a depth pass to test against (`render_fill_extrusion_layer.cpp:374`). So
+    /// the captured frame's background and circle batches carry no stencil bit, and a baked test
+    /// would hold them against whichever tile's value last reached the texel.
+    pub stencil: bool,
+    /// `DrawFlags::ENABLE_COLOR`: whether the draw writes color.
+    ///
+    /// Cleared for a draw that is there for its depth. The captured frame has two:
+    /// `render_fill_extrusion_layer.cpp:283` builds a depth-only drawable beside the color one
+    /// where `!opaque || hasPattern`, because "the non-pattern path in `render()` only uses
+    /// two-pass rendering if there's translucency" -- and the prepass is what makes a translucent
+    /// wall blend once per pixel rather than once per overlapping wall. Baked on, that drawable
+    /// paints the geometry it was built to leave invisible.
+    pub color: bool,
+}
+
+impl Enabled {
+    /// All three, which is what a caller with nothing to say about them means.
+    ///
+    /// Not a [`Default`], deliberately: `DrawFlags::NONE` is the opposite answer from the same
+    /// absence of information, and the two spellings would disagree.
+    pub const ALL: Self = Self {
+        depth: true,
+        stencil: true,
+        color: true,
+    };
+
+    /// What a drawable's `draw_flags` ask for.
+    ///
+    /// The byte whole, as `batch::Key::draw_flags` carries it. Bits this does not name are not
+    /// read: `ON_TERRAIN` is a surface, and `IS_3D` has no arm here yet.
+    #[must_use]
+    pub const fn of(draw_flags: u8) -> Self {
+        Self {
+            depth: draw_flags & DrawFlags::ENABLE_DEPTH.bits() != 0,
+            stencil: draw_flags & DrawFlags::ENABLE_STENCIL.bits() != 0,
+            color: draw_flags & DrawFlags::ENABLE_COLOR.bits() != 0,
+        }
+    }
 }
 
 /// Whether a draw writes the depth it tests against.
@@ -135,13 +224,21 @@ impl Depth {
 /// attribute is constant for this permutation and no descriptor arrived for it, and that difference
 /// is a different pipeline -- and, through [`Key::permutation`], a different module.
 #[must_use]
-pub fn key(shader: BuiltIn, surface: Surface, plan: &Plan, blend: Blend, depth: Depth) -> Key {
+pub fn key(
+    shader: BuiltIn,
+    surface: Surface,
+    plan: &Plan,
+    blend: Blend,
+    depth: Depth,
+    enabled: Enabled,
+) -> Key {
     Key {
         shader,
         surface,
         permutation: crate::shaders::permutation(&plan.absent),
         blend,
         depth,
+        enabled,
         layout: plan
             .bound
             .iter()
@@ -583,12 +680,15 @@ pub const CONTENT_DYNAMIC: [vk::DynamicState; 4] = [
     vk::DynamicState::STENCIL_REFERENCE,
 ];
 
-/// The depth and stencil state for a view.
+/// The depth and stencil state a content draw gets.
 ///
-/// Stencil always, because the per-tile clip masks are what the stencil buffer is for: §2.2 draws a
-/// mask quad per tile and every content draw tests against it. Depth only when the view has an
-/// extrusion -- [`Attachment`] is where that is decided, and a view of flat layers can take a
-/// stencil-only format, which on a tiler is less to write back.
+/// Three inputs, because the state has three sources. The **view** says whether there is depth to
+/// test at all -- [`Attachment`] is where that is decided, and a view of flat layers can take a
+/// stencil-only format, which on a tiler is less to write back. The **pass** says whether the test
+/// also writes ([`Depth`]). The **drawable** says whether either test runs at all ([`Enabled`]),
+/// which is the half mbgl keeps per drawable instead of in a mode: the per-tile clip masks are what
+/// the stencil buffer is for, and a drawable that covers the viewport rather than a tile has no
+/// mask of its own to test.
 ///
 /// `KEEP` on every stencil op and `EQUAL` as the compare: a content draw reads the mask and does not
 /// write it. Whoever draws the masks sets its own stencil state, which is a later slice -- this is
@@ -596,6 +696,7 @@ pub const CONTENT_DYNAMIC: [vk::DynamicState; 4] = [
 pub fn depth_stencil(
     attachment: Attachment,
     depth: Depth,
+    enabled: Enabled,
 ) -> vk::PipelineDepthStencilStateCreateInfo<'static> {
     let keep = vk::StencilOpState {
         fail_op: vk::StencilOp::KEEP,
@@ -608,7 +709,11 @@ pub fn depth_stencil(
         write_mask: 0,
         reference: 0,
     };
-    let kept = matches!(attachment, Attachment::DepthStencil);
+    // Two conditions, and they are different questions: the view has to keep depth, and the
+    // drawable has to have asked to test it. `Enabled::depth` is mbgl's `enableDepth`, whose other
+    // arm is `DepthMode::disabled()` -- which neither tests nor writes, so it gates both lines
+    // below.
+    let kept = matches!(attachment, Attachment::DepthStencil) && enabled.depth;
     vk::PipelineDepthStencilStateCreateInfo::default()
         // Tested only where there is depth to keep. A flat view that enabled the test against a
         // stencil-only attachment would be reading an attachment it does not have.
@@ -617,7 +722,10 @@ pub fn depth_stencil(
         // writing, so a translucent layer does not occlude the one painted in front of it.
         .depth_write_enable(kept && matches!(depth, Depth::Write))
         .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
-        .stencil_test_enable(true)
+        // And the mask is tested only by a draw that is clipped to a tile. A drawable covering the
+        // viewport carries no `ENABLE_STENCIL` and has no mask of its own, so a baked test would
+        // hold it against whichever tile's value last reached the texel.
+        .stencil_test_enable(enabled.stencil)
         .front(keep)
         .back(keep)
 }
@@ -705,6 +813,23 @@ impl Blend {
     }
 }
 
+/// The color state a content draw gets: its blend mode, or no color at all.
+///
+/// The second arm is mbgl's fourth `ColorMode` -- [`no_color`], every channel masked off -- and a
+/// draw that asked for it is there for its depth or its stencil. Written with the mask on, such a
+/// draw paints the geometry it was meant to leave invisible: the captured Berlin frame's two
+/// depth-only extrusion batches would put their walls over the layers under them.
+///
+/// A function of its own rather than a line inside [`build`], so the choice is checkable without a
+/// device. A pipeline built with the wrong one builds perfectly well.
+pub fn color_attachment(blend: Blend, enabled: Enabled) -> vk::PipelineColorBlendAttachmentState {
+    if enabled.color {
+        blend.attachment()
+    } else {
+        no_color()
+    }
+}
+
 /// No culling.
 ///
 /// A fill's triangles come from an earcut tessellation and a line's from a stroker, and neither
@@ -769,8 +894,8 @@ pub fn build<'d>(
     let raster = rasterization();
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-    let depth = depth_stencil(targets.attachment, key.depth);
-    let attachments = [key.blend.attachment()];
+    let depth = depth_stencil(targets.attachment, key.depth, key.enabled);
+    let attachments = [color_attachment(key.blend, key.enabled)];
     let blending = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
 
     // The attachments by format, which is what replaces the render pass handle. A packed

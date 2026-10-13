@@ -12,6 +12,20 @@
 //! a marker and patch it to `OpSpecConstantFalse` plus a `SpecId`.
 //!
 //! Neither is what happens, and the tests below are the evidence.
+//!
+//! # Where the paint permutation went instead
+//!
+//! Not through either shape. The shader above is the whole demonstration of why: however
+//! `color_from_attribute` folds, `@location(0) attribute_color` is still declared, and a constant
+//! paint property is precisely an attribute that *did not arrive* -- so a module reading the
+//! layer's evaluated value instead has to not declare it. A folded branch leaves the declaration
+//! where it was, and nothing refuses that: `benches/pipelines_build.rs` measures a module input
+//! with no description and RADV builds the pipeline, fetching the attribute from nowhere.
+//!
+//! So `shaders::module` takes the absent locations and leaves them out, which is what mbgl's
+//! Vulkan backend does. What these tests establish still stands, and `spec` still implements it:
+//! a switch that is a branch rather than an interface change is better folded by the driver than
+//! taken at run time, for the reason above.
 
 use std::collections::HashMap;
 

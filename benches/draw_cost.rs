@@ -42,7 +42,7 @@ use ash::vk;
 use tessella_capture_abi::generated::shader_attributes::BACKGROUND_SHADER;
 use tessella_capture_abi::generated::ubo_layouts::{BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO};
 use tessella_emblema::device::preferred;
-use tessella_emblema::shaders::{BACKGROUND_BODY, module};
+use tessella_emblema::shaders::{BACKGROUND_BODY, Paint, module};
 use tessella_emblema::surface::Surface;
 
 /// Drawables a recorded frame holds. The sibling's unmerged basemap is 640.
@@ -509,6 +509,7 @@ impl Gpu {
             &BACKGROUND_SHADER,
             &[],
             &[],
+            &Paint::NONE,
             BACKGROUND_BODY,
         )
         .map_err(|why| format!("the family does not assemble: {why:?}"))?;

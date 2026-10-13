@@ -46,7 +46,6 @@ fn the_same_drawable_twice_is_one_key() {
     let a = key(
         BuiltIn::RasterShader,
         Surface::Plane,
-        0,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -54,7 +53,6 @@ fn the_same_drawable_twice_is_one_key() {
     let b = key(
         BuiltIn::RasterShader,
         Surface::Plane,
-        0,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -68,7 +66,6 @@ fn a_different_stride_is_a_different_pipeline() {
     let a = key(
         BuiltIn::RasterShader,
         Surface::Plane,
-        0,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -76,7 +73,6 @@ fn a_different_stride_is_a_different_pipeline() {
     let b = key(
         BuiltIn::RasterShader,
         Surface::Plane,
-        0,
         &planned(16, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -92,7 +88,6 @@ fn a_different_offset_within_a_vertex_is_a_different_pipeline() {
     let a = key(
         BuiltIn::RasterShader,
         Surface::Plane,
-        0,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -100,7 +95,6 @@ fn a_different_offset_within_a_vertex_is_a_different_pipeline() {
     let b = key(
         BuiltIn::RasterShader,
         Surface::Plane,
-        0,
         &planned(12, 4, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -108,13 +102,19 @@ fn a_different_offset_within_a_vertex_is_a_different_pipeline() {
     assert_ne!(a, b);
 }
 
+/// The surface and the permutation each name a different module, so each must separate a key.
+///
+/// The permutation is not a number a caller chooses: it is which of the family's attributes the
+/// drawable sent, so the second key here is built from a drawable that sent one fewer. That is the
+/// whole of mbgl's `propertiesAsUniforms` as this crate sees it -- a descriptor that did not
+/// arrive -- and a module assembled for it leaves that location out of `In` and reads the layer's
+/// evaluated value instead.
 #[test]
 fn the_surface_and_the_permutation_each_separate_a_key() {
     let base = planned(12, 0, SOMEWHERE);
     let flat = key(
         BuiltIn::RasterShader,
         Surface::Plane,
-        0,
         &base,
         Blend::Alpha,
         Depth::Write,
@@ -122,21 +122,39 @@ fn the_surface_and_the_permutation_each_separate_a_key() {
     let bent = key(
         BuiltIn::RasterShader,
         Surface::Globe,
-        0,
         &base,
         Blend::Alpha,
         Depth::Write,
+    );
+
+    // The same drawable with its last descriptor missing. Asserted rather than assumed, because a
+    // plan that still bound three would make the comparison below vacuous.
+    let mut fewer = descs(12, 0, SOMEWHERE);
+    let dropped = fewer.pop().expect("raster declares attributes");
+    let short = plan(&RASTER_SHADER, &fewer).expect("agrees");
+    assert_eq!(
+        short.absent,
+        vec![u32::try_from(dropped.binding).expect("a declared location")],
+        "the short plan must be short by exactly the popped attribute"
     );
     let varied = key(
         BuiltIn::RasterShader,
         Surface::Plane,
-        1,
-        &base,
+        &short,
         Blend::Alpha,
         Depth::Write,
     );
+
     assert_ne!(flat, bent, "a different module");
-    assert_ne!(flat, varied, "different specialization constants");
+    assert_ne!(
+        flat, varied,
+        "a different module, and a different vertex input"
+    );
+    assert_ne!(
+        flat.permutation, varied.permutation,
+        "the permutation alone has to separate them: a cache keyed on the vertex layout only \
+         would hand this drawable the whole family's module and then not bind one of its inputs"
+    );
 }
 
 #[test]
@@ -146,7 +164,6 @@ fn the_family_separates_a_key() {
         key(
             BuiltIn::RasterShader,
             Surface::Plane,
-            0,
             &base,
             Blend::Alpha,
             Depth::Write
@@ -154,7 +171,6 @@ fn the_family_separates_a_key() {
         key(
             BuiltIn::HillshadeShader,
             Surface::Plane,
-            0,
             &base,
             Blend::Alpha,
             Depth::Write
@@ -175,7 +191,6 @@ fn where_the_bytes_live_does_not_separate_a_key() {
         key(
             BuiltIn::RasterShader,
             Surface::Plane,
-            0,
             &planned(12, 0, SOMEWHERE),
             Blend::Alpha,
             Depth::Write
@@ -183,7 +198,6 @@ fn where_the_bytes_live_does_not_separate_a_key() {
         key(
             BuiltIn::RasterShader,
             Surface::Plane,
-            0,
             &planned(12, 0, elsewhere),
             Blend::Alpha,
             Depth::Write
@@ -231,7 +245,6 @@ fn a_shorter_run_is_a_different_pipeline() {
         key(
             BuiltIn::FillShader,
             Surface::Plane,
-            0,
             &full,
             Blend::Alpha,
             Depth::Write
@@ -239,7 +252,6 @@ fn a_shorter_run_is_a_different_pipeline() {
         key(
             BuiltIn::FillShader,
             Surface::Plane,
-            0,
             &partial,
             Blend::Alpha,
             Depth::Write
@@ -254,7 +266,6 @@ fn the_key_caches() {
     let flat = key(
         BuiltIn::RasterShader,
         Surface::Plane,
-        0,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -262,7 +273,6 @@ fn the_key_caches() {
     let strided = key(
         BuiltIn::RasterShader,
         Surface::Plane,
-        0,
         &planned(16, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -275,7 +285,6 @@ fn the_key_caches() {
     let again = key(
         BuiltIn::RasterShader,
         Surface::Plane,
-        0,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -290,7 +299,6 @@ fn the_layout_records_the_format_the_table_declared() {
     let got = key(
         BuiltIn::RasterShader,
         Surface::Plane,
-        0,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -319,7 +327,6 @@ fn the_input_rate_separates_a_key() {
         key(
             BuiltIn::RasterShader,
             Surface::Plane,
-            0,
             &per_vertex,
             Blend::Alpha,
             Depth::Write
@@ -327,7 +334,6 @@ fn the_input_rate_separates_a_key() {
         key(
             BuiltIn::RasterShader,
             Surface::Plane,
-            0,
             &per_instance,
             Blend::Alpha,
             Depth::Write

@@ -28,7 +28,6 @@ use naga::front::wgsl;
 use tessella_capture_abi::generated::ubo_layouts::{LAYOUTS, UNIONS, UboLayout};
 use tessella_emblema::families::ALL;
 use tessella_emblema::preamble::{declare, type_name};
-use tessella_emblema::shaders::module;
 use tessella_emblema::slots;
 use tessella_emblema::surface::Surface;
 
@@ -161,15 +160,9 @@ fn every_module_declares_its_blocks_at_the_producers_stride() {
             if !family.surfaces.contains(&surface) {
                 continue;
             }
-            let source = module(
-                surface,
-                family.blocks,
-                family.attributes,
-                family.instance_attributes,
-                family.textures,
-                family.body,
-            )
-            .unwrap_or_else(|why| panic!("{} on {surface:?}: {why:?}", family.name));
+            let source = family
+                .module(surface, &[])
+                .unwrap_or_else(|why| panic!("{} on {surface:?}: {why:?}", family.name));
 
             for block in family.blocks.iter().chain(surface.blocks()) {
                 let wanted = slots::stride(block);

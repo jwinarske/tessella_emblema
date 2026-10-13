@@ -9,6 +9,20 @@
 //! to assemble it this way rather than writing the struct out beside the body and keeping them in
 //! step by hand.
 //!
+//! # A family has one module per permutation, not one module
+//!
+//! A data-driven paint property arrives as a vertex attribute where the style's value varies with
+//! the feature and as *nothing at all* where it does not -- the layer's one evaluated value is
+//! already in its properties block, and mbgl compiles the program with that attribute's
+//! `HAS_UNIFORM_u_*` defined. So which attributes arrived decides the module's text, and it
+//! arrives per drawable: [`crate::vertices::Plan::absent`] is the locations no descriptor
+//! supplied, [`permutation`] is that set as a bitmask, and
+//! [`crate::pipelines::Key::permutation`] carries it so the module cache can key on it.
+//!
+//! [`Property`] is one such property and both of its arms; [`Paint`] is a family's set of them
+//! paired with what a drawable sent. A body never reads a paint attribute directly -- it calls the
+//! `paint_<name>` function this module emits, which is the same text in every permutation.
+//!
 //! # What the bindings are
 //!
 //! Group zero, one binding per block, read-only storage. Storage rather than uniform because the
@@ -179,6 +193,89 @@ pub fn attribute_name(declared: &str) -> String {
     out
 }
 
+/// A data-driven paint property, and the two places its value can come from.
+///
+/// mbgl evaluates a paint property per layer and asks whether it varies: a `fill-color` given as a
+/// plain color is one value for the whole layer, and one given as an expression over a feature's
+/// own fields is a value per vertex. The first travels in the layer's evaluated-properties block,
+/// the second as a vertex attribute -- and mbgl compiles a *different program* for each, which is
+/// what its `#if !defined(HAS_UNIFORM_u_color)` guards select between and what its
+/// `propertiesAsUniforms` names.
+///
+/// So a family does not have one module. It has one per set of its properties that arrived, and
+/// which set that is comes off the wire per drawable: [`crate::vertices::Plan::absent`] is the
+/// locations no descriptor supplied. Nothing else can decide it -- the family's table says what the
+/// module *may* read and the plan says what this drawable *sent*.
+///
+/// # Why both arms are written out rather than derived
+///
+/// The uniform arm could almost be computed from the attribute's name: `idFillColorVertexAttribute`
+/// is `color`, the drawable block carries `color_t` and the props block carries `color`. Almost --
+/// mbgl spells a line's gap width `gapwidth` in the block and `GapWidth` in the attribute, and all
+/// three symbol families read `tileProps.is_text ? props.text_opacity : props.icon_opacity`, which
+/// is not a field name at all. A derivation would need a sanction list per exception, and the
+/// exception is the half that matters.
+///
+/// Written out, the derivation becomes a *test* instead: `tests/properties.rs` checks every
+/// attribute whose drawable block carries a `_t` has an entry here, which is the thing that would
+/// otherwise be silently missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Property {
+    /// The `@location` whose absence makes this a uniform read.
+    pub location: u32,
+    /// What the body calls it, without the `paint_` prefix [`module`] gives the function.
+    ///
+    /// mbgl's name for the property rather than the attribute's: a fill outline's color is
+    /// `outline_color`, and the symbol families' is `fill_color` where the attribute is
+    /// `symbol_color`.
+    pub name: &'static str,
+    /// The WGSL type both arms return.
+    pub returns: &'static str,
+    /// The arm read when the attribute arrived: the two zoom endpoints, mixed by the block's `_t`.
+    pub varies: &'static str,
+    /// The arm read when it did not: the layer's one evaluated value.
+    pub constant: &'static str,
+}
+
+/// Which of a family's paint properties arrived, for one module.
+///
+/// Two slices rather than one resolved list, because the pair is what a caller has: the properties
+/// are the family's and the absent locations are the drawable's. Holding them apart is also what
+/// lets [`permutation`] be a function of the second alone, which is what the module cache keys on.
+#[derive(Debug, Clone, Copy)]
+pub struct Paint<'a> {
+    /// The family's data-driven properties.
+    pub properties: &'a [Property],
+    /// The locations no descriptor supplied, from [`crate::vertices::Plan::absent`].
+    pub absent: &'a [u32],
+}
+
+impl Paint<'_> {
+    /// No properties and nothing absent: a family whose every attribute is geometry.
+    pub const NONE: Paint<'static> = Paint {
+        properties: &[],
+        absent: &[],
+    };
+}
+
+/// The module a set of absent locations selects, as a bitmask.
+///
+/// One bit per `@location`, so two drawables of a family whose attributes arrived alike share a
+/// module and two that did not have their own. This is what [`crate::pipelines::Key::permutation`]
+/// carries, and it is a consumer's number rather than the wire's: `batch::Key::permutation_key` is
+/// mbgl's own hash over its property names, which says nothing about this crate's locations.
+///
+/// A location at 64 or above cannot have its own bit and takes bit 63 instead, which makes such a
+/// set collide with another rather than silently equal it. No family mbgl declares comes close --
+/// the widest table here is ten attributes -- so this is a total function rather than a case.
+#[must_use]
+pub fn permutation(absent: &[u32]) -> u64 {
+    absent
+        .iter()
+        .map(|location| 1u64 << location.min(&63))
+        .fold(0, |mask, bit| mask | bit)
+}
+
 /// Assembles a module for one (family, surface) pair: the blocks, the vertex input, the surface's
 /// placement, then the family's body.
 ///
@@ -192,6 +289,18 @@ pub fn attribute_name(declared: &str) -> String {
 /// is how a body reads the *next* instance. Such a family also gets `ubo_index` as a push
 /// constant, because `firstInstance` is carrying the instance by then; see [`crate::draws`].
 ///
+/// `paint` is what makes this one module of several for a family rather than the only one. A
+/// location in [`Paint::absent`] is left out of `In`, and each of [`Paint::properties`] becomes a
+/// `paint_<name>` function reading whichever arm that leaves -- see [`Property`]. A body calls
+/// those functions and never the attribute directly, which is what lets the same body serve every
+/// permutation.
+///
+/// An absent location that no property claims is *not* refused here. The body then reads a field
+/// `In` does not declare and the module fails to compile, which is the same loud failure a body
+/// naming an undeclared block field gets and the same end [`crate::vertices::Plan::undeclared`]
+/// chooses to fail at: a refusal would make a whole family undrawable over one attribute, where
+/// this leaves a caller that can tell the two cases apart from the error it gets.
+///
 /// # Errors
 ///
 /// [`Error`] from a block that cannot be declared, an attribute the ABI calls invalid, or a shared
@@ -202,6 +311,7 @@ pub fn module(
     attributes: &[ShaderAttribute],
     instance_attributes: &[ShaderAttribute],
     textures: &[ShaderTexture],
+    paint: &Paint<'_>,
     body: &str,
 ) -> Result<String, Error> {
     let mut out = String::new();
@@ -307,6 +417,14 @@ pub fn module(
                 name: attribute.name,
             });
         };
+        // Left out where no descriptor supplied it. Vulkan asks that every input a vertex stage
+        // declares have a `VkVertexInputAttributeDescription`, and nothing enforces that --
+        // `benches/pipelines_build.rs` measures a module input with no description and RADV builds
+        // the pipeline, so the attribute would be fetched from nowhere rather than refused. The
+        // body reads this property through `paint_<name>` instead, which is declared below.
+        if u32::try_from(attribute.binding).is_ok_and(|at| paint.absent.contains(&at)) {
+            continue;
+        }
         let _ = writeln!(
             out,
             "    @location({}) {}: {},",
@@ -321,8 +439,43 @@ pub fn module(
     out.push('\n');
     out.push_str(surface.placement());
     out.push('\n');
+
+    paint_functions(&mut out, paint);
     out.push_str(body);
     Ok(out)
+}
+
+/// The family's paint properties, each as the one arm this permutation leaves.
+///
+/// Emitted after the prelude, because the varying arm mixes with `mix_color` and `mix_value`, and
+/// before the body, because that is what calls them.
+///
+/// Every property gets a function whether it varies or not, so the body is the same text either
+/// way. `in` is a parameter rather than read from anywhere: the constant arm does not use it, and
+/// giving the two arms different signatures would put the permutation back in the body.
+fn paint_functions(out: &mut String, paint: &Paint<'_>) {
+    if paint.properties.is_empty() {
+        return;
+    }
+    // Two calls rather than one continued literal, and no bare `data` in the text:
+    // `tests/shaders.rs` reads the module for which components of an attribute a body uses, and a
+    // word in a comment counts as a use. "data-driven" here excused every component of a line's
+    // packed `in.line_data`, which is how that was found.
+    out.push_str("// The family's paint properties. Each is read from the attribute the\n");
+    out.push_str("// producer sent, or from the layer's evaluated value where it sent none.\n");
+    for property in paint.properties {
+        let arm = if paint.absent.contains(&property.location) {
+            property.constant
+        } else {
+            property.varies
+        };
+        let _ = writeln!(
+            out,
+            "fn paint_{}(in: In) -> {} {{\n    return {arm};\n}}",
+            property.name, property.returns
+        );
+    }
+    out.push('\n');
 }
 
 /// The WGSL scalar a shared attribute's bytes are read as inside the storage element.
@@ -505,8 +658,8 @@ fn vertex_main(in: In) -> Out {
     let drawable = fill_drawable_ubo[ubo_index];
     var out: Out;
     out.clip = place(vec3<f32>(vec2<f32>(in.fill_pos), 0.0), drawable.matrix);
-    out.color = mix_color(in.fill_color, drawable.color_t);
-    out.opacity = mix_value(in.fill_opacity, drawable.opacity_t);
+    out.color = paint_color(in);
+    out.opacity = paint_opacity(in);
     return out;
 }
 
@@ -553,8 +706,8 @@ fn vertex_main(in: In) -> Out {
     // for the measurement that found it.
     out.screen = (vec2<f32>(clip.x, -clip.y) / clip.w + 1.0) / 2.0 * global.world_size;
 
-    out.outline_color = mix_color(in.fill_outline_color, drawable.outline_color_t);
-    out.opacity = mix_value(in.fill_opacity, drawable.opacity_t);
+    out.outline_color = paint_outline_color(in);
+    out.opacity = paint_opacity(in);
     return out;
 }
 
@@ -627,9 +780,9 @@ fn vertex_main(in: In) -> Out {
     // fourteen-bit number whose low six bits are the top of the third.
     out.along = (floor(data.z / 4.0) + data.w * 64.0) * 2.0;
 
-    let gapwidth = mix_value(in.line_gap_width, drawable.gapwidth_t) * 0.5;
-    let halfwidth = mix_value(in.line_width, drawable.width_t) * 0.5;
-    let line_offset = -1.0 * mix_value(in.line_offset, drawable.offset_t);
+    let gapwidth = paint_gapwidth(in) * 0.5;
+    let halfwidth = paint_width(in) * 0.5;
+    let line_offset = -1.0 * paint_offset(in);
 
     let inset = gapwidth + select(0.0, antialiasing, gapwidth > 0.0);
     let outset = gapwidth
@@ -655,8 +808,8 @@ fn vertex_main(in: In) -> Out {
     out.normal = normal;
     out.outset = outset;
     out.inset = inset;
-    out.blur = mix_value(in.line_blur, drawable.blur_t);
-    out.opacity = mix_value(in.line_opacity, drawable.opacity_t);
+    out.blur = paint_blur(in);
+    out.opacity = paint_opacity(in);
     // Straight through: a sprite name is not a number. See `FILL_PATTERN_BODY`.
     out.pattern_from = vec4<f32>(in.line_pattern_from);
     out.pattern_to = vec4<f32>(in.line_pattern_to);
@@ -747,8 +900,8 @@ fn vertex_main(in: In) -> Out {
     let global = global_paint_params_ubo[0];
     var out: Out;
 
-    let radius = mix_value(in.circle_radius, drawable.radius_t);
-    let stroke_width = mix_value(in.circle_stroke_width, drawable.stroke_width_t);
+    let radius = paint_radius(in);
+    let stroke_width = paint_stroke_width(in);
     let reach = radius + stroke_width;
 
     // The corner sign rides in the low bit of each coordinate, the same trick the line vertex
@@ -796,13 +949,13 @@ fn vertex_main(in: In) -> Out {
     out.antialias_blur = 1.0 / max(global.pixel_ratio, 1e-6) / max(reach, 1e-6);
 
     out.extrude = extrude;
-    out.color = mix_color(in.circle_color, drawable.color_t);
-    out.stroke_color = mix_color(in.circle_stroke_color, drawable.stroke_color_t);
+    out.color = paint_color(in);
+    out.stroke_color = paint_stroke_color(in);
     out.radius = radius;
-    out.blur = mix_value(in.circle_blur, drawable.blur_t);
-    out.opacity = mix_value(in.circle_opacity, drawable.opacity_t);
+    out.blur = paint_blur(in);
+    out.opacity = paint_opacity(in);
     out.stroke_width = stroke_width;
-    out.stroke_opacity = mix_value(in.circle_stroke_opacity, drawable.stroke_opacity_t);
+    out.stroke_opacity = paint_stroke_opacity(in);
     return out;
 }
 
@@ -1071,8 +1224,8 @@ fn vertex_main(in: In) -> Out {
     let high = floor(packed / 256.0);
     let decimals = vec2<f32>(high, packed - high * 256.0) / 128.0;
 
-    let base = max(mix_value(in.fill_extrusion_base, drawable.base_t), 0.0);
-    let height = max(mix_value(in.fill_extrusion_height, drawable.height_t), 0.0);
+    let base = max(paint_base(in), 0.0);
+    let height = max(paint_height(in), 0.0);
     // Every vertex of a roof is at the building's top, so this always takes the height. Written
     // as mbgl's selection rather than as `height` alone: the base is the other arm of the term it
     // computes, and a shader that dropped it would agree with the oracle by coincidence of what
@@ -1082,7 +1235,7 @@ fn vertex_main(in: In) -> Out {
 
     // How bright the surface already is. A pale building takes a narrower range of shading than a
     // dark one, which is what keeps a light roof from blowing out.
-    var color = mix_color(in.fill_extrusion_color, drawable.color_t);
+    var color = paint_color(in);
     let luminance = color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722;
     // Slight ambient, so nothing is ever completely black.
     color += vec4<f32>(0.03, 0.03, 0.03, 1.0);
@@ -1224,7 +1377,7 @@ fn vertex_main(in: In) -> Out {
     out.fade = clamp(whole / 127.0 + change, 0.0, 1.0);
 
     out.tex = tex / drawable.texsize;
-    out.opacity = mix_value(in.symbol_opacity, drawable.opacity_t);
+    out.opacity = paint_opacity(in);
     return out;
 }
 
@@ -1345,17 +1498,17 @@ fn vertex_main(in: In) -> Out {
     out.fade = clamp(whole / 127.0 + change, 0.0, 1.0);
 
     // The halo pass and the fill pass are two draws of the same geometry, told apart here.
-    let fill = mix_color(in.symbol_color, drawable.fill_color_t);
-    let halo = mix_color(in.symbol_halo_color, drawable.halo_color_t);
+    let fill = paint_fill_color(in);
+    let halo = paint_halo_color(in);
     out.paint = select(fill, halo, tile.is_halo != 0);
 
     out.tex = tex / drawable.texsize;
     out.font_scale = font_scale;
     // The perspective divide the threshold has to be measured in, which is the clip `w`.
     out.gamma = clip.w;
-    out.opacity = mix_value(in.symbol_opacity, drawable.opacity_t);
-    out.halo_width = mix_value(in.symbol_halo_width, drawable.halo_width_t);
-    out.halo_blur = mix_value(in.symbol_halo_blur, drawable.halo_blur_t);
+    out.opacity = paint_opacity(in);
+    out.halo_width = paint_halo_width(in);
+    out.halo_blur = paint_halo_blur(in);
     return out;
 }
 
@@ -1495,11 +1648,11 @@ fn vertex_main(in: In) -> Out {
 
     out.font_scale = font_scale;
     out.gamma_scale = clip.w;
-    out.fill_color = mix_color(in.symbol_color, drawable.fill_color_t);
-    out.halo_color = mix_color(in.symbol_halo_color, drawable.halo_color_t);
-    out.opacity = mix_value(in.symbol_opacity, drawable.opacity_t);
-    out.halo_width = mix_value(in.symbol_halo_width, drawable.halo_width_t);
-    out.halo_blur = mix_value(in.symbol_halo_blur, drawable.halo_blur_t);
+    out.fill_color = paint_fill_color(in);
+    out.halo_color = paint_halo_color(in);
+    out.opacity = paint_opacity(in);
+    out.halo_width = paint_halo_width(in);
+    out.halo_blur = paint_halo_blur(in);
     return out;
 }
 
@@ -1933,7 +2086,7 @@ fn vertex_main(in: In) -> Out {
         position
     );
 
-    out.opacity = mix_value(in.fill_opacity, drawable.opacity_t);
+    out.opacity = paint_opacity(in);
     out.clip = place(vec3<f32>(position, 0.0), drawable.matrix);
     return out;
 }
@@ -1998,8 +2151,8 @@ fn vertex_main(in: In) -> Out {
     let props = heatmap_evaluated_props_ubo[0];
     var out: Out;
 
-    let weight = mix_value(in.heatmap_weight, drawable.weight_t);
-    let radius = mix_value(in.heatmap_radius, drawable.radius_t);
+    let weight = paint_weight(in);
+    let radius = paint_radius(in);
 
     // The corner sign in the low bit of each coordinate, as the circle and the line pack it.
     let position = vec2<f32>(in.heatmap_pos);
@@ -2124,9 +2277,9 @@ fn vertex_main(in: In) -> Out {
     let extrude = data.xy - 128.0;
     let direction = (data.z % 4.0) - 1.0;
 
-    let gapwidth = mix_value(in.line_gap_width, drawable.gapwidth_t) * 0.5;
-    let halfwidth = mix_value(in.line_width, drawable.width_t) * 0.5;
-    let line_offset = -1.0 * mix_value(in.line_offset, drawable.offset_t);
+    let gapwidth = paint_gapwidth(in) * 0.5;
+    let halfwidth = paint_width(in) * 0.5;
+    let line_offset = -1.0 * paint_offset(in);
 
     // The quad reaches `outset` from the center and the fill starts at `inset`. With no gap the
     // inset is zero and the line is solid; with one, both edges are drawn and the middle left
@@ -2166,9 +2319,9 @@ fn vertex_main(in: In) -> Out {
     out.normal = normal;
     out.outset = outset;
     out.inset = inset;
-    out.color = mix_color(in.line_color, drawable.color_t);
-    out.blur = mix_value(in.line_blur, drawable.blur_t);
-    out.opacity = mix_value(in.line_opacity, drawable.opacity_t);
+    out.color = paint_color(in);
+    out.blur = paint_blur(in);
+    out.opacity = paint_opacity(in);
     return out;
 }
 
@@ -2385,8 +2538,8 @@ fn vertex_main(in: In) -> Out {
     let edge = normalize(p2 - p1);
     let normal = vec3<f32>(-edge.y, edge.x, 0.0);
 
-    let base = max(mix_value(in.fill_extrusion_base, drawable.base_t), 0.0);
-    let height = max(mix_value(in.fill_extrusion_height, drawable.height_t), 0.0);
+    let base = max(paint_base(in), 0.0);
+    let height = max(paint_height(in), 0.0);
 
     // The template's corner chooses which end of the edge and which end of the wall: `x` picks
     // the point, `y` picks the foot or the top.
@@ -2396,7 +2549,7 @@ fn vertex_main(in: In) -> Out {
 
     // How bright the surface already is. A pale wall takes a narrower range of shading than a
     // dark one, and a slight ambient keeps nothing completely black.
-    var color = mix_color(in.fill_extrusion_color, drawable.color_t);
+    var color = paint_color(in);
     let luminance = color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722;
     color += vec4<f32>(0.03, 0.03, 0.03, 1.0);
 

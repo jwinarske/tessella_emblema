@@ -12,8 +12,30 @@
 //! what its whole body needs rather than what the taken branch needs, so an unused arm has to be
 //! gone before the pipeline is compiled and not merely skipped at run time.
 //!
-//! The result is one SPIR-V module per (family, surface), with permutations as arguments to
-//! pipeline creation — no module per permutation, and nothing translated at run time.
+//! The result is one SPIR-V module per (family, surface), with a switch set at pipeline creation
+//! — nothing translated at run time.
+//!
+//! # What this is not for, which is the permutation it was written for
+//!
+//! The data-driven paint permutation. A property that is constant for a layer arrives as *no
+//! vertex attribute at all*, so the module that reads it instead out of the layer's evaluated
+//! block differs in its interface and not only in a branch: it declares one fewer `@location`. A
+//! specialization constant folds a branch; it does not remove an input declaration.
+//! `tests/naga_overrides.rs`'s own miniature shader is the demonstration -- its
+//! `@location(0) attribute_color` is declared whichever way the switch folds.
+//!
+//! Leaving it declared is not caught, either. Vulkan asks that every input a vertex stage declares
+//! have a `VkVertexInputAttributeDescription` behind it, and `benches/pipelines_build.rs` measures
+//! that nothing enforces it: on RADV such a pipeline builds and the attribute is fetched from
+//! nowhere. So the arm you believed folded away is a fetch from unbound memory rather than an
+//! error.
+//!
+//! So that permutation is folded before the module exists, by [`crate::shaders::module`] taking
+//! the locations no descriptor supplied, which is what mbgl's Vulkan backend does. This module has
+//! no user as a result, and no family's body carries an `override` for it to find. Kept because
+//! what it establishes is a fact about naga and SPIR-V rather than a choice: a switch that *is* a
+//! branch and not an interface change is still better folded by the driver than taken at run time,
+//! and this is how that would be done.
 //!
 //! # Finding the constant
 //!

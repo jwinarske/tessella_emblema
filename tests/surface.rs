@@ -6,28 +6,24 @@
 //! tessella's own, declared here as tables and checked here against the producer's own structs.
 //! Nothing generates them, which is exactly why they are checked.
 
+use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_capture_abi::generated::ubo_layouts::{LAYOUTS, UboFieldKind};
 use tessella_capture_abi::globe_ubo::GlobeBendUbo;
 use tessella_capture_abi::terrain_ubo::TerrainDrawableUbo;
+use tessella_emblema::families::family;
 use tessella_emblema::preamble::{declare, offsets, type_name};
-use tessella_emblema::shaders::{FILL_BODY, module};
 use tessella_emblema::slots;
 use tessella_emblema::surface::{GLOBE_BEND_UBO, GLOBE_CAMERA_UBO, Surface, TERRAIN_DRAWABLE_UBO};
 
-use tessella_capture_abi::generated::shader_attributes::FILL_SHADER;
-use tessella_capture_abi::generated::ubo_layouts::{FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO};
-
 /// A fill on `surface`, which is the family that has every surface and the fewest blocks.
+///
+/// Through the family rather than from the tables, because the body reads its color and opacity
+/// through the `paint_*` functions `Family::module` declares and they are the family's to name.
 fn fill(surface: Surface) -> String {
-    module(
-        surface,
-        &[&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
-        &FILL_SHADER,
-        &[],
-        &[],
-        FILL_BODY,
-    )
-    .expect("a fill assembles on every surface")
+    family(BuiltIn::FillShader)
+        .expect("a fill is drawn")
+        .module(surface, &[])
+        .expect("a fill assembles on every surface")
 }
 
 /// The bend table is the producer's struct, field for field.

@@ -156,9 +156,9 @@ fn every_pipeline_builds(device: &Open) -> Result<(), String> {
             drop(module);
         }
     }
-    if built != 114 {
+    if built != 122 {
         return Err(format!(
-            "{built} pipelines, which is not 57 modules times two attachment kinds"
+            "{built} pipelines, which is not 61 modules times two attachment kinds"
         ));
     }
     println!("  every pipeline        ok   {built} pipelines, all resident at once");
@@ -277,15 +277,15 @@ fn the_cache_reuses(device: &Open) -> Result<(), String> {
         }
     }
 
-    if cache.built() != 57 {
+    if cache.built() != 61 {
         return Err(format!(
-            "{} pipelines built for 57 keys asked {asked} times",
+            "{} pipelines built for 61 keys asked {asked} times",
             cache.built()
         ));
     }
-    if cache.len() != 57 || cache.modules() != 57 {
+    if cache.len() != 61 || cache.modules() != 61 {
         return Err(format!(
-            "{} pipelines and {} modules held, wanted 57 of each",
+            "{} pipelines and {} modules held, wanted 61 of each",
             cache.len(),
             cache.modules()
         ));

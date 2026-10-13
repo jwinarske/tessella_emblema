@@ -882,13 +882,13 @@ pub fn build_mask<'d>(
 /// # Why a cache at all
 ///
 /// `vkCreateGraphicsPipelines` compiles the shader. On the gating target that is tens of
-/// milliseconds for the 57 modules together, and a frame that rebuilt a pipeline per batch would
+/// milliseconds for the 61 modules together, and a frame that rebuilt a pipeline per batch would
 /// pay it per batch -- a styled view has thousands. So a pipeline is built once per key and bound
 /// many times, which is what the key exists for.
 ///
 /// # Two levels, because the module is not per key
 ///
-/// A module is per `(family, surface)`: one text, two entry points, 57 of them. A *pipeline* is per
+/// A module is per `(family, surface)`: one text, two entry points, 61 of them. A *pipeline* is per
 /// [`Key`], which adds the permutation and the vertex input -- so one module serves every pipeline
 /// of its family, and the two are cached separately. Holding the module beside each pipeline would
 /// compile the same text once per stride.

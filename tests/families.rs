@@ -99,7 +99,7 @@ fn the_wire_resolves_a_drawn_shader_and_skips_the_rest() {
 ///
 /// Not checked here by calling `module`: that only concatenates text and returns `Ok` for a body
 /// naming a binding nothing declared, so an assembly check that stopped there would pass a table
-/// entry missing a block. `every_family_on_every_surface_compiles` takes all 57 pairs through
+/// entry missing a block. `every_family_on_every_surface_compiles` takes all 61 pairs through
 /// naga, which is what actually catches it.
 #[test]
 fn every_family_claims_a_surface() {

@@ -252,8 +252,15 @@ fn draw(
             view: passes::CHILD,
             layer: passes::LAYER,
         };
-        sets.write(layout, &fill_bindings, at, &blocks, &[])
-            .map_err(|why| format!("the child's set: {why}"))?;
+        sets.write(
+            layout,
+            &fill_bindings,
+            at,
+            BuiltIn::FillShader as i32,
+            &blocks,
+            &[],
+        )
+        .map_err(|why| format!("the child's set: {why}"))?;
         Program {
             pipeline,
             layout: layout.pipeline(),
@@ -307,8 +314,15 @@ fn draw(
             view: passes::PARENT,
             layer: passes::LAYER,
         };
-        sets.write(layout, &raster_bindings, at, &blocks, &bound)
-            .map_err(|why| format!("the parent's set: {why}"))?;
+        sets.write(
+            layout,
+            &raster_bindings,
+            at,
+            BuiltIn::RasterShader as i32,
+            &blocks,
+            &bound,
+        )
+        .map_err(|why| format!("the parent's set: {why}"))?;
         Program {
             pipeline,
             layout: layout.pipeline(),

@@ -158,3 +158,89 @@ fn layout_named(name: &str) -> Option<&'static UboLayout> {
         .iter()
         .find(|layout| layout.name == name)
 }
+
+/// Exactly the global blocks are the frame's, and every other block a family declares is a layer's.
+///
+/// The pairing `Sets::write` depends on: a binding's buffer is found under the batch's layer for
+/// every block but these, and under `-1` for these. A block misplaced on either side is a set that
+/// cannot be written at all, which is loud -- but a *rule* that misplaced them both the same way
+/// would be silent, which is why the two directions are listed by name here rather than derived
+/// again.
+#[test]
+fn only_the_global_blocks_are_the_frames() {
+    let mut frame_wide = Vec::new();
+    for family in ALL {
+        for surface in family.surfaces {
+            for block in family.blocks.iter().chain(surface.blocks()) {
+                let slot = slots::of(block).expect("every declared block has a slot");
+                match slots::scope(slot) {
+                    slots::Scope::Frame => frame_wide.push(block.name),
+                    slots::Scope::Layer => assert!(
+                        !block.name.starts_with("Global"),
+                        "{} on {surface:?} declares {}, which is one of mbgl's globals and is \
+                         keyed as a layer's",
+                        family.name,
+                        block.name
+                    ),
+                }
+            }
+        }
+    }
+    frame_wide.sort_unstable();
+    frame_wide.dedup();
+    assert_eq!(
+        frame_wide,
+        ["GlobalPaintParamsUBO"],
+        "the frame-wide blocks moved; a layer's block keyed under -1 is a set that cannot be \
+         written, and `benches/first_pixel.rs` is where a wrong one changes a pixel"
+    );
+}
+
+/// `held_at` moves the layer and nothing else, and only for a frame-wide slot.
+///
+/// The view has to survive: a frame-wide buffer belongs to *this* view's frame, and two views
+/// drawing at once each have their own. Reaching for view zero's would be a set bound to another
+/// frame's camera, which draws.
+#[test]
+fn held_at_keeps_the_view_and_moves_only_the_layer() {
+    use tessella_capture_abi::envelope::ViewId;
+    use tessella_capture_abi::generated::ubo_slots::{
+        ID_FILL_DRAWABLE_UBO, ID_GLOBAL_PAINT_PARAMS_UBO,
+    };
+    use tessella_emblema::blocks::Which;
+
+    let drawing = Which {
+        view: ViewId(3),
+        layer: 7,
+    };
+    assert_eq!(
+        slots::held_at(drawing, ID_FILL_DRAWABLE_UBO),
+        drawing,
+        "a layer's own block is held where the batch is drawing"
+    );
+    assert_eq!(
+        slots::held_at(drawing, ID_GLOBAL_PAINT_PARAMS_UBO),
+        Which {
+            view: ViewId(3),
+            layer: slots::FRAME_WIDE,
+        },
+        "a frame-wide block keeps the view and takes the producer's reserved layer"
+    );
+}
+
+/// The reserved layer is not one the producer can also use for a real layer.
+///
+/// `-1` is agreed in prose on both sides -- the ABI's `UboUpdate::layer_index` doc and the
+/// producer's own `ubo::FRAME_WIDE` -- and nothing in the ABI names it as a constant, so this is
+/// the only place the two can be held to each other from here. Negative is the whole of the
+/// property: `OrderEntry::layer_index` is a style index and a style has no negative layers.
+#[test]
+fn the_reserved_layer_is_not_a_style_layer() {
+    const {
+        assert!(
+            slots::FRAME_WIDE < 0,
+            "a reserved layer index a style could also use is a collision waiting for a frame \
+             with that many layers"
+        );
+    }
+}

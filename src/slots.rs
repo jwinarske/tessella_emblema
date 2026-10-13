@@ -138,3 +138,78 @@ pub fn stride(layout: &UboLayout) -> u32 {
         .find(|union| union.members.contains(&layout.name))
         .map_or(layout.stride, |union| union.stride)
 }
+
+/// Whose buffer a slot's bytes are: one layer's, or the whole frame's.
+///
+/// `UboUpdate` carries a `layer_index` beside its slot, and the ABI reserves one value of it:
+///
+/// > Layer group, or `-1` for the frame-wide buffers the renderer owns rather than any layer --
+/// > `GlobalPaintParamsUBO` and friends. Layers that size geometry in screen space rather than
+/// > tile space cannot be reconstructed without those (R-2).
+///
+/// So a binding's buffer is not found under the batch's layer for every binding, and which ones
+/// differ is what this answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// One layer's, under the `layer_index` the batch carries.
+    Layer,
+    /// The frame's, under [`FRAME_WIDE`] whatever layer is drawing.
+    Frame,
+}
+
+/// The `layer_index` a frame-wide buffer arrives under.
+///
+/// The producer's own constant is `ubo::FRAME_WIDE` and says the same thing from the other side:
+/// "they belong to the renderer rather than to any layer. A consumer that keyed them by a real
+/// layer would attribute the camera's own parameters to whichever layer happened to be numbered
+/// zero."
+pub const FRAME_WIDE: i32 = -1;
+
+/// Which of the two a slot is, from mbgl's own numbering.
+///
+/// Derived, not tabulated, as [`of`] is -- and from the same chain of enums. mbgl numbers the
+/// global buffers first and then draws a line:
+///
+/// ```text
+/// idGlobalPaintParamsUBO    = 0
+/// idGlobalPlatformParamsUBO = 1
+/// globalUBOCount            = 2
+/// layerSSBOStartId          = 2
+/// ```
+///
+/// So a slot below `globalUBOCount` is a global buffer and one at or above it belongs to a layer,
+/// which is mbgl's statement rather than this crate's reading of which blocks look frame-wide.
+/// One family in three declares `GlobalPaintParamsUBO` and none declares the platform one.
+///
+/// # The three slots that are not mbgl's
+///
+/// [`GLOBE_CAMERA_SLOT`], the globe bend's eleven and the terrain block's 128 are all past the
+/// line, so all three answer [`Scope::Layer`] -- correctly for the two that travel, which the
+/// producer writes under a real `layer_index`. The globe camera does not travel at all: it is
+/// built here from `CameraUpdate::globe_matrix`, so where it is keyed is this crate's choice and
+/// not something to read off the wire. It is keyed per layer today, which costs a buffer a layer
+/// and is the reason this doc says so rather than leaving it derived by accident.
+#[must_use]
+pub const fn scope(slot: u32) -> Scope {
+    if slot < tessella_capture_abi::generated::ubo_slots::GLOBAL_UBO_COUNT {
+        Scope::Frame
+    } else {
+        Scope::Layer
+    }
+}
+
+/// Where a binding's buffer is held, for a batch drawing `which`.
+///
+/// The identity for a layer's own blocks, and [`FRAME_WIDE`] for the frame's. Takes the whole
+/// [`Which`](crate::blocks::Which) rather than its layer, because the view is the same either way
+/// and a caller that had to rebuild it could rebuild it wrong.
+#[must_use]
+pub const fn held_at(which: crate::blocks::Which, slot: u32) -> crate::blocks::Which {
+    match scope(slot) {
+        Scope::Layer => which,
+        Scope::Frame => crate::blocks::Which {
+            view: which.view,
+            layer: FRAME_WIDE,
+        },
+    }
+}

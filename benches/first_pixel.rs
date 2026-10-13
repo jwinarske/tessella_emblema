@@ -2891,6 +2891,19 @@ const WHICH: blocks::Which = blocks::Which {
     layer: 0,
 };
 
+/// The one slot a case declares that is the frame's rather than a layer's.
+///
+/// `GlobalPaintParamsUBO`, which eight of the twenty families declare. Named here rather than
+/// asked of `slots::scope`, because that is what this probe is checking: an oracle derived from
+/// the code under test moves with it.
+const FRAME_WIDE_SLOT: u32 = tessella_capture_abi::generated::ubo_slots::ID_GLOBAL_PAINT_PARAMS_UBO;
+
+/// Where such a block is held, which is the same view under the producer's reserved layer.
+const FRAME_WIDE_WHICH: blocks::Which = blocks::Which {
+    view: WHICH.view,
+    layer: -1,
+};
+
 /// The target's format, which is what the expected pixels are written in.
 const COLOR: vk::Format = vk::Format::R8G8B8A8_UNORM;
 
@@ -3412,15 +3425,53 @@ fn draw_case<'d>(
             ));
         }
         let entries = bytes.len() / stride;
-        held.declare(gpu, WHICH, slot, entries, stride)
+        // Where the producer would have put it: a frame-wide block arrives under `layer_index:
+        // -1` rather than under the layer drawing, and eight of the twenty families declare one.
+        //
+        // Decided here from the slot rather than asked of `slots::held_at`, which is the thing
+        // under test. The first version of this did ask, and the mutation that made every block
+        // the layer's passed all thirty-one cases: the decoy below was placed by the same
+        // function, so a wrong answer moved the real bytes and the decoy together and nothing was
+        // ever read from the wrong place.
+        let at = if slot == FRAME_WIDE_SLOT {
+            FRAME_WIDE_WHICH
+        } else {
+            WHICH
+        };
+        held.declare(gpu, at, slot, entries, stride)
             .map_err(|why| format!("{}: {} buffer: {why}", case.name, layout.name))?;
         for (index, entry) in bytes.chunks(stride).enumerate() {
             let index = u32::try_from(index).map_err(|_| "absurd entry count".to_string())?;
-            held.write(WHICH, slot, index, entry)
+            held.write(at, slot, index, entry)
                 .map_err(|why| format!("{}: {} write: {why}", case.name, layout.name))?;
         }
-        held.flush(WHICH, slot, 0)
+        held.flush(at, slot, 0)
             .map_err(|why| format!("{}: {} flush: {why}", case.name, layout.name))?;
+
+        // And a decoy under the case's own layer, zeroed, wherever the real one is frame-wide.
+        //
+        // Without it the scope is checked only by the lookup succeeding, and a lookup under the
+        // wrong key would fail loudly here but draw correctly anywhere the two keys happened to
+        // hold the same bytes. With it, reading the layer's copy of `GlobalPaintParamsUBO` reads
+        // a world size of nothing -- so `fill_outline`'s screen position collapses to the origin,
+        // its feather measures the whole target, and the ring fades away. The same idiom as
+        // `extrusion_wall_dim`'s second drawable block: put something wrong where a defect would
+        // look.
+        //
+        // Written rather than left to a fresh allocation, because a fresh allocation is not
+        // zeroed -- the GC7000UL hands back another process's bytes, which is why `Blocks` writes
+        // its own initial state at all.
+        if at != WHICH {
+            let zeros = vec![0u8; stride];
+            held.declare(gpu, WHICH, slot, entries, stride)
+                .map_err(|why| format!("{}: {} decoy: {why}", case.name, layout.name))?;
+            for index in 0..u32::try_from(entries).unwrap_or(0) {
+                held.write(WHICH, slot, index, &zeros)
+                    .map_err(|why| format!("{}: {} decoy write: {why}", case.name, layout.name))?;
+            }
+            held.flush(WHICH, slot, 0)
+                .map_err(|why| format!("{}: {} decoy flush: {why}", case.name, layout.name))?;
+        }
     }
 
     // The images, in one submission: declared, filled, and left where a sampler can read them.
@@ -3466,7 +3517,7 @@ fn draw_case<'d>(
     let mut sets = descriptors::Sets::new(gpu, 2, &bindings)
         .map_err(|why| format!("{}: pool: {why}", case.name))?;
     let set = sets
-        .write(layout, &bindings, WHICH, &held, &bound)
+        .write(layout, &bindings, WHICH, case.family as i32, &held, &bound)
         .map_err(|why| format!("{}: set: {why}", case.name))?;
 
     // The group-one set, over the buffer the ABI says is bound twice. Which buffer that is comes

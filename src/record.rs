@@ -18,8 +18,13 @@
 //! # One pipeline and one set per batch, the rest per drawable
 //!
 //! A batch's key pins the layer, the family and the permutation. The descriptor set is per
-//! `(view, layer)`, so it is constant across the batch; and the vertex layout is a function of the
-//! same three things, which #77 works out -- so the pipeline is too. Both bind once.
+//! `(view, layer, family)` and the batch is one of each, so it is constant across the batch; and
+//! the vertex layout is a function of the same three things, which #77 works out -- so the pipeline
+//! is too. Both bind once.
+//!
+//! The family is part of the set's key because a layer is drawn by more than one -- a fill and its
+//! outline share a `layer_index` and declare different blocks. Keyed by the layer alone, the second
+//! family's set replaced the first's and the wrong one was bound.
 //!
 //! What varies per drawable is its buffers, its segments, its slot, and its **tile** -- so the
 //! stencil reference and compare mask are set per drawable, not per batch. Two drawables of one
@@ -77,14 +82,22 @@ pub struct Program {
 /// Why a frame could not be recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// A batch's layer has no descriptor set.
+    /// A batch's layer and family have no descriptor set.
     ///
-    /// The set is per `(view, layer)` and written before the frame is recorded. A batch whose layer
-    /// has none is a layer the producer sent drawables for and no uniform block, which would draw
+    /// The set is per `(view, layer, family)` and written before the frame is recorded. A batch
+    /// with none is a layer the producer sent drawables for and no uniform block, which would draw
     /// with whatever was bound last.
+    ///
+    /// The family is part of it because a layer is drawn by more than one: mbgl's fill layer emits
+    /// a fill drawable *and* an outline drawable at the same `layer_index`, and the captured Berlin
+    /// frame has that twice over plus an extrusion drawn by two families. Keyed by the layer alone,
+    /// the second family's set replaced the first's and this error could not be reached -- the
+    /// wrong set was bound instead, to a pipeline layout it does not match.
     NoSet {
         /// The layer.
         which: Which,
+        /// The shader the batch names, as `batch::Key::builtin_shader`.
+        shader: i32,
     },
     /// A `per_drawable` family's drawable has no group-one descriptor set.
     ///
@@ -120,9 +133,9 @@ impl From<draws::Unusable> for Error {
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::NoSet { which } => write!(
+            Self::NoSet { which, shader } => write!(
                 f,
-                "view {:?} layer {} has no descriptor set",
+                "view {:?} layer {} has no descriptor set for shader {shader}",
                 which.view, which.layer
             ),
             Self::NoInstanceSet { geometry } => {
@@ -282,11 +295,19 @@ pub fn content(
 
         // Per batch: the key pins the layer, the family and the permutation, and the set and the
         // pipeline are functions of exactly those.
+        //
+        // The family as well as the layer, because one layer is drawn by more than one of them --
+        // a fill and its outline share a `layer_index` and declare different blocks, so they
+        // cannot share a set. See [`Error::NoSet`].
         let which = Which {
             view: scene.view,
             layer: layer_of(&batch),
         };
-        let set = scene.sets.get(which).ok_or(Error::NoSet { which })?;
+        let shader = batch.key.builtin_shader;
+        let set = scene
+            .sets
+            .get(which, shader)
+            .ok_or(Error::NoSet { which, shader })?;
 
         record.bind_pipeline(found.pipeline);
         record.bind_descriptor_set(found.layout, set);

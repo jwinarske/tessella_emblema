@@ -121,11 +121,24 @@ pub struct Key {
 /// # The two bits that are not here
 ///
 /// `ON_TERRAIN` is a surface and is read by [`crate::surface::Surface::of`]. `IS_3D` is pipeline
-/// state in mbgl and is **not transcribed yet**: it selects `depthModeFor3D` (the whole range
-/// rather than the layer's band) and `stencilModeFor3D` (`NotEqual{0xFF}` against a freshly
-/// allocated id, which writes the stencil and discards the tile clip masks) in place of the
-/// per-sublayer modes. Both are a scheme of their own, and the captured frame's four extrusion
-/// batches are what will measure them.
+/// state in mbgl too, and it is read by [`Depth::of`] rather than here, because what it decides is
+/// the depth *write*: `vulkan/tile_layer_group.cpp:80` hands every 3D drawable in a layer group
+/// `depthModeFor3D()`, which is `{LessEqual, ReadWrite}` whatever the pass.
+///
+/// What is still **not transcribed** is that group's stencil. mbgl draws no tile clip masks for a
+/// layer group with 3D features at all; it takes one `stencilModeFor3D()` for the whole group --
+/// `NotEqual{0b11111111}` against a freshly allocated id, with a write mask of `0b11111111` and
+/// `pass: Replace`, so the first fragment at a pixel writes the id and every later one in that
+/// group is rejected. That is how a translucent building blends once where its walls overlap, and
+/// the id comes from the same counter the clip masks use, which is why mbgl says it is
+/// "potentially destroying the stencil clipping mask" and clears `tileClippingMaskIDs` so the next
+/// group redraws its own.
+///
+/// Three things here would have to move for that: a compare op and ops this crate bakes
+/// ([`depth_stencil`] is `EQUAL` with a write mask of zero), an id allocated per layer group and
+/// per pass, and the masks redrawn after such a group -- which this crate draws once before all
+/// content. It is a scheme rather than a field, and the captured frame's four extrusion batches
+/// are what will measure it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Enabled {
     /// `DrawFlags::ENABLE_DEPTH`: whether the draw tests depth at all.
@@ -200,16 +213,32 @@ pub enum Depth {
 }
 
 impl Depth {
-    /// Which a pass draws with, from `batch::Key::pass`.
+    /// Which a drawable draws with, from `batch::Key::pass` and its own flags.
     ///
     /// `RenderPass` is a bitflag and a drawable can be in both passes -- the background is
     /// `Opaque | Translucent` -- but an `OrderEntry` carries one bit, because `DrawOrder::resolve`
     /// expands such a drawable into one entry per pass. So this reads the one bit that is set, and
     /// anything that is not the opaque bit is treated as translucent: a pass this build does not
     /// know must not be given depth writes on the strength of not being recognized.
+    ///
+    /// # A 3D drawable writes in either pass
+    ///
+    /// `DrawFlags::IS_3D` is the exception, and it is mbgl's: `vulkan/tile_layer_group.cpp:80`
+    /// gives every 3D drawable in a layer group `depthModeFor3D()`, which is
+    /// `{LessEqual, ReadWrite}` -- hardcoded to write, where `depthModeForSublayer` takes the
+    /// caller's mask and returns `DepthMode::disabled()` below the opaque cutoff.
+    ///
+    /// Without it the extrusions' two-pass scheme does nothing. mbgl builds a depth-only drawable
+    /// beside the color one for a translucent extrusion
+    /// (`render_fill_extrusion_layer.cpp:283`, `!opaque || hasPattern`), and the point of the first
+    /// is the depth the second tests against: both are in the *translucent* pass, so a depth taken
+    /// from the pass alone writes nothing, the prepass is a draw that changes no state at all, and
+    /// every overlapping wall of a building blends again over the one behind it.
     #[must_use]
-    pub fn of(pass: u8) -> Self {
-        if pass & tessella_capture_abi::RenderPass::OPAQUE.bits() != 0 {
+    pub fn of(pass: u8, draw_flags: u8) -> Self {
+        if draw_flags & DrawFlags::IS_3D.bits() != 0
+            || pass & tessella_capture_abi::RenderPass::OPAQUE.bits() != 0
+        {
             Self::Write
         } else {
             Self::TestOnly

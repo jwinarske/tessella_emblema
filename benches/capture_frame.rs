@@ -70,6 +70,25 @@
 //!
 //! The capture also has no raster tile, so the style's imagery layer is absent, and no symbols,
 //! because the capture was taken without glyphs.
+//!
+//! # Taking one with walls in it
+//!
+//! That frame is top-down, so its extrusion layer draws roofs and no walls at all -- and the depth
+//! prepass each extrusion is built with has nothing to reject. A pitched capture of the same tile
+//! shows them, and is what measured `pipelines::Depth`'s 3D arm:
+//!
+//! ```text
+//! curl -s http://127.0.0.1:8080/berlin_z15/14/8801/5374.mvt | gunzip > berlin-z14.mvt
+//! capture-render --style tools/parity/scenes/families_p.json --tile berlin-z14.mvt \
+//!     --tile-at 14/8801/5374 --source berlin --lon 13.4 --lat 52.5 --zoom 14 --pitch 60 \
+//!     --capture pitched.tslcap --out pitched.png
+//! ```
+//!
+//! The tile is the parity harness's own, off `serve.sh` on 8080, and has to be decompressed: the
+//! server sends it gzipped and the decoder refuses that with "wire type 7 at byte 0 is a group".
+//! `--tile-at` and `--source` are what place it; without them the tool draws the style's background
+//! over an empty cover, which is what the PNG beside the first capture turned out to be. The result
+//! here is 32 geometries, 54 drawables and the same 12 batches.
 
 // A bench is a program, and it reports by printing.
 #![allow(
@@ -767,7 +786,7 @@ fn run(path: &str) -> Result<(), String> {
             *surface,
             plan,
             family.blend(batch.key.pass),
-            pipelines::Depth::of(batch.key.pass),
+            pipelines::Depth::of(batch.key.pass, batch.key.draw_flags),
             pipelines::Enabled::of(batch.key.draw_flags),
         );
         let module = match modules.entry((batch.key.builtin_shader, key.permutation)) {

@@ -85,24 +85,71 @@ fn depth_is_tested_where_it_is_kept_and_written_by_the_opaque_pass() {
 #[test]
 fn only_the_opaque_bit_writes_depth() {
     use tessella_capture_abi::RenderPass;
+    let flat = 0;
     assert_eq!(
-        pipelines::Depth::of(RenderPass::OPAQUE.bits()),
+        pipelines::Depth::of(RenderPass::OPAQUE.bits(), flat),
         pipelines::Depth::Write
     );
     assert_eq!(
-        pipelines::Depth::of(RenderPass::TRANSLUCENT.bits()),
+        pipelines::Depth::of(RenderPass::TRANSLUCENT.bits(), flat),
         pipelines::Depth::TestOnly
     );
     assert_eq!(
-        pipelines::Depth::of(0),
+        pipelines::Depth::of(0, flat),
         pipelines::Depth::TestOnly,
         "no bit set is not the opaque pass"
     );
     assert_eq!(
-        pipelines::Depth::of(0b1000_0000),
+        pipelines::Depth::of(0b1000_0000, flat),
         pipelines::Depth::TestOnly,
         "nor is a bit this build does not know"
     );
+}
+
+/// A 3D drawable writes depth in either pass, which is the whole of the extrusions' two-pass scheme.
+///
+/// mbgl's Vulkan backend hands every 3D drawable in a layer group `depthModeFor3D()`
+/// (`vulkan/tile_layer_group.cpp:80`), and that mode is `{LessEqual, ReadWrite}` with the mask
+/// hardcoded -- where `depthModeForSublayer` takes the caller's mask and returns
+/// `DepthMode::disabled()` below the opaque cutoff.
+///
+/// The consequence is not subtle. A translucent extrusion is built as *two* drawables, a depth-only
+/// one and a color one (`render_fill_extrusion_layer.cpp:283`), and both are in the translucent
+/// pass -- so a depth taken from the pass alone makes the first a draw that changes nothing and
+/// leaves every overlapping wall of a building to blend again over the one behind it. The captured
+/// Berlin frame has that pair twice over, which is where it was measured.
+#[test]
+fn a_3d_drawable_writes_depth_in_either_pass() {
+    use tessella_capture_abi::RenderPass;
+    use tessella_capture_abi::envelope::DrawFlags;
+
+    for pass in [
+        RenderPass::OPAQUE.bits(),
+        RenderPass::TRANSLUCENT.bits(),
+        0,
+        0b1000_0000,
+    ] {
+        assert_eq!(
+            pipelines::Depth::of(pass, DrawFlags::IS_3D.bits()),
+            pipelines::Depth::Write,
+            "pass {pass:#010b} with IS_3D"
+        );
+    }
+
+    // And the bit is `IS_3D` and not another: the captured frame's extrusions carry four of the
+    // five flags between them, and only this one moves the write.
+    for other in [
+        DrawFlags::ENABLE_DEPTH,
+        DrawFlags::ENABLE_STENCIL,
+        DrawFlags::ENABLE_COLOR,
+        DrawFlags::ON_TERRAIN,
+    ] {
+        assert_eq!(
+            pipelines::Depth::of(RenderPass::TRANSLUCENT.bits(), other.bits()),
+            pipelines::Depth::TestOnly,
+            "{other:?} is not what makes a drawable 3D"
+        );
+    }
 }
 
 /// The stencil test is on for both, because the tile clip masks are what it is for.

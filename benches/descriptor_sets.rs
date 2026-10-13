@@ -23,12 +23,14 @@ mod common;
 
 use ash::vk;
 use tessella_capture_abi::envelope::{Extent, TextureFilter, TextureId, TextureRef, ViewId};
+use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_capture_abi::generated::mbgl_enums::{TextureChannelDataType, TexturePixelType};
 use tessella_emblema::blocks::{Blocks, Which};
 use tessella_emblema::descriptors::{self, Sets};
 use tessella_emblema::families;
 use tessella_emblema::images::Images;
 use tessella_emblema::pipelines;
+use tessella_emblema::slots;
 use tessella_emblema::surface::Surface;
 use tessella_vk::Recorder;
 
@@ -49,6 +51,13 @@ const fn which(layer: i32) -> Which {
 /// Per binding rather than one buffer for the set: a family's blocks are separate buffers, which is
 /// what `UboUpdate::slot` names. One buffer here would make every binding point at it and the bench
 /// could not tell.
+/// A shader for the checks that are not about which family it is.
+///
+/// A set is keyed by its layer *and* its family, and these cases vary the layer to keep their sets
+/// apart -- so which shader they name does not matter, and naming one rather than threading a
+/// parameter through says so.
+const SOME_SHADER: i32 = BuiltIn::FillShader as i32;
+
 fn blocks_for<'d>(
     device: &'d Open,
     which: Which,
@@ -64,8 +73,14 @@ fn blocks_for<'d>(
         let slot = binding
             .slot
             .ok_or_else(|| format!("binding {} carries no slot", binding.binding))?;
+        // Through `held_at`, because a frame-wide block is not the layer's: eight of the twenty
+        // families declare `GlobalPaintParamsUBO`, which arrives under `layer_index: -1`. Asked
+        // of the library rather than decided here, because what this bench checks is that a set
+        // can be written for every family and not where the buffers are -- `first_pixel` is where
+        // the scope has an oracle of its own, and a wrong answer there changes a pixel.
+        let at = slots::held_at(which, slot);
         blocks
-            .declare(device.gpu(), which, slot, 4, 64)
+            .declare(device.gpu(), at, slot, 4, 64)
             .map_err(|why| format!("declare slot {slot}: {why}"))?;
     }
     Ok(blocks)
@@ -177,12 +192,19 @@ fn every_set_is_written(device: &Open) -> Result<(), String> {
                 .map_err(|why| format!("{who}: {why}"))?;
 
             let set = sets
-                .write(&layout, &bindings, at, &blocks, &bound)
+                .write(
+                    &layout,
+                    &bindings,
+                    at,
+                    family.shader as i32,
+                    &blocks,
+                    &bound,
+                )
                 .map_err(|why| format!("{who}: {why}"))?;
             if set == vk::DescriptorSet::null() {
                 return Err(format!("{who}: a null set"));
             }
-            if sets.get(at) != Some(set) {
+            if sets.get(at, family.shader as i32) != Some(set) {
                 return Err(format!("{who}: the set was not remembered"));
             }
             written += 1;
@@ -201,6 +223,83 @@ fn every_set_is_written(device: &Open) -> Result<(), String> {
         return Err("resetting the pool left sets behind".into());
     }
     println!("  the pool resets       ok   nothing allocated afterwards");
+    Ok(())
+}
+
+/// Two families drawing one layer get a set each.
+///
+/// The case the keying was wrong for, and a real frame has it: mbgl's fill layer emits a fill
+/// drawable *and* an outline drawable at the same `layer_index`, so two families with different
+/// blocks share a layer. The captured Berlin frame has that twice over -- layers two and three are
+/// each drawn by `fill` and `fill_outline_triangulated` -- plus an extrusion layer drawn by
+/// `fill_extrusion` and `fill_extrusion_instanced`.
+///
+/// Keyed by the layer alone, the second write replaced the first in the map and the first set was
+/// left allocated and unreachable. `record::content` then bound whichever landed last to both
+/// families' pipeline layouts, which is a set of the wrong shape against bindings that do not
+/// match it.
+fn two_families_at_one_layer(device: &Open) -> Result<(), String> {
+    let gpu = device.gpu();
+    let surface = Surface::Plane;
+    let at = which(200);
+
+    // A fill and its triangulated outline, which is the pair a fill layer actually emits. Their
+    // blocks differ -- the outline carries the globals and the fill does not -- so a set written
+    // for one is not a set the other can bind.
+    let named = ["fill", "fill_outline_triangulated"];
+    let mut held = Vec::new();
+    let mut widest = Vec::new();
+    for name in named {
+        let family = families::ALL
+            .iter()
+            .find(|f| f.name == name)
+            .ok_or_else(|| format!("the {name} family"))?;
+        let bindings = pipelines::bindings(family, surface);
+        if bindings.len() > widest.len() {
+            widest.clone_from(&bindings);
+        }
+        held.push((family, bindings));
+    }
+    if held[0].1.len() == held[1].1.len() {
+        return Err(
+            "the two families declare the same number of bindings, so this pair cannot \
+                    show a set of the wrong shape being bound"
+                .into(),
+        );
+    }
+
+    let mut sets = Sets::new(gpu, 2, &widest).map_err(|why| format!("sets: {why}"))?;
+    let mut written = Vec::new();
+    for (family, bindings) in &held {
+        let layout =
+            pipelines::layout(gpu, bindings).map_err(|why| format!("{}: {why}", family.name))?;
+        let blocks = blocks_for(device, at, bindings)?;
+        let set = sets
+            .write(&layout, bindings, at, family.shader as i32, &blocks, &[])
+            .map_err(|why| format!("{}: {why}", family.name))?;
+        written.push((family.shader as i32, set));
+    }
+
+    if written[0].1 == written[1].1 {
+        return Err("one set served both families".into());
+    }
+    // Both still reachable, which is the half a replacing map fails: the first family's set is
+    // what `record::content` would ask for when its batch comes round.
+    for (shader, set) in &written {
+        if sets.get(at, *shader) != Some(*set) {
+            return Err(format!("the set for shader {shader} was not kept"));
+        }
+    }
+    if sets.allocated() != 2 {
+        return Err(format!(
+            "{} sets allocated for two families",
+            sets.allocated()
+        ));
+    }
+    println!(
+        "  two at one layer      ok   {} and {} each keep their own set",
+        named[0], named[1]
+    );
     Ok(())
 }
 
@@ -239,7 +338,7 @@ fn each_binding_resolves_its_own_slot(device: &Open) -> Result<(), String> {
                 .declare(device.gpu(), at, *slot, 4, 64)
                 .map_err(|why| format!("declare {slot}: {why}"))?;
         }
-        match sets.write(&layout, &bindings, at, &blocks, &[]) {
+        match sets.write(&layout, &bindings, at, SOME_SHADER, &blocks, &[]) {
             Err(descriptors::Error::NoBlocks { slot, .. }) if slot == *missing => {}
             other => {
                 return Err(format!(
@@ -256,7 +355,7 @@ fn each_binding_resolves_its_own_slot(device: &Open) -> Result<(), String> {
     // everything would pass the loop above.
     let at = which(120);
     let blocks = blocks_for(device, at, &bindings)?;
-    sets.write(&layout, &bindings, at, &blocks, &[])
+    sets.write(&layout, &bindings, at, SOME_SHADER, &blocks, &[])
         .map_err(|why| format!("all slots present: {why}"))?;
     println!(
         "  bindings per slot     ok   {} slots, each refused by name, then all written",
@@ -353,19 +452,19 @@ fn refusals(device: &Open) -> Result<(), String> {
         descriptors::bound_from(&images, &bindings, &refs).map_err(|why| why.to_string())?;
 
     // Too few textures for the set's bindings.
-    match sets.write(&layout, &bindings, at, &blocks, &[]) {
+    match sets.write(&layout, &bindings, at, SOME_SHADER, &blocks, &[]) {
         Err(descriptors::Error::WrongTextureCount { wanted: 1, got: 0 }) => {}
         other => return Err(format!("no textures gave {other:?}")),
     }
     // Too many.
     let twice = [bound[0], bound[0]];
-    match sets.write(&layout, &bindings, at, &blocks, &twice) {
+    match sets.write(&layout, &bindings, at, SOME_SHADER, &blocks, &twice) {
         Err(descriptors::Error::WrongTextureCount { wanted: 1, got: 2 }) => {}
         other => return Err(format!("two textures gave {other:?}")),
     }
     // A layer with no block buffer at all.
     let empty = Blocks::new();
-    match sets.write(&layout, &bindings, at, &empty, &bound) {
+    match sets.write(&layout, &bindings, at, SOME_SHADER, &empty, &bound) {
         Err(descriptors::Error::NoBlocks { .. }) => {}
         other => return Err(format!("no blocks gave {other:?}")),
     }
@@ -420,7 +519,7 @@ fn refusals(device: &Open) -> Result<(), String> {
     }
 
     // And the good write still works afterwards.
-    sets.write(&layout, &bindings, at, &blocks, &bound)
+    sets.write(&layout, &bindings, at, SOME_SHADER, &blocks, &bound)
         .map_err(|why| format!("after the refusals: {why}"))?;
     println!(
         "  refusals              ok   eight refused, none left a set, a good write still works"
@@ -445,6 +544,7 @@ fn main() {
         ("out_of_order", an_out_of_order_run),
         ("refusals", refusals),
         ("bindings_per_slot", each_binding_resolves_its_own_slot),
+        ("two_at_one_layer", two_families_at_one_layer),
     ] {
         if let Err(why) = case(&device) {
             println!("  {name:<21} FAIL {why}");

@@ -26,6 +26,7 @@ use ash::vk;
 use std::collections::{BTreeMap, BTreeSet};
 
 use tessella_capture_abi::envelope::TileId;
+use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_consume::stencil;
 use tessella_emblema::device::{self, Attachment};
 use tessella_emblema::pipelines::{self, Targets};
@@ -44,6 +45,14 @@ const SIDE: u32 = 64;
 /// mbgl's own, through the generated constant: a mask is a shader family like any other and its
 /// block travels on `UboUpdate` like any other.
 const MASK_SLOT: u32 = tessella_capture_abi::generated::ubo_slots::ID_CLIPPING_MASK_UBO;
+
+/// The shader a mask's set is keyed by.
+///
+/// A set is keyed by its layer and its family, and the mask is not a family -- but mbgl numbers it
+/// in the same enum, so its own id is the honest answer rather than a spare number. It is in
+/// `families::UNDRAWN` for the matching reason: "the stencil mask, which the consumer draws from
+/// the partition rather than from a family".
+const MASK_SHADER: i32 = BuiltIn::ClippingMaskProgram as i32;
 const COLOR: vk::Format = vk::Format::B8G8R8A8_UNORM;
 /// The tile whose mask is drawn, and the one the partition is asked about.
 fn tile() -> TileId {
@@ -277,7 +286,7 @@ fn scene(device: &Open, matrix: [f32; 16]) -> Result<Scene<'_>, String> {
         .shader(&compile(FILL)?)
         .map_err(|why| format!("fill module: {why}"))?;
     let fill_key = pipelines::Key {
-        shader: tessella_capture_abi::generated::mbgl_enums::BuiltIn::BackgroundShader,
+        shader: BuiltIn::BackgroundShader,
         surface: tessella_emblema::surface::Surface::Plane,
         permutation: 0,
         layout: Vec::new(),
@@ -307,7 +316,7 @@ fn scene(device: &Open, matrix: [f32; 16]) -> Result<Scene<'_>, String> {
         .map_err(|why| format!("flush: {why}"))?;
 
     let mut sets = Sets::new(gpu, 2, &bindings).map_err(|why| format!("sets: {why}"))?;
-    sets.write(&mask_layout, &bindings, which, &blocks, &[])
+    sets.write(&mask_layout, &bindings, which, MASK_SHADER, &blocks, &[])
         .map_err(|why| format!("set: {why}"))?;
 
     Ok(Scene {
@@ -379,7 +388,7 @@ fn mask_then_fill_masked(
     let given = assignment();
     let set = scene
         .sets
-        .get(scene.which)
+        .get(scene.which, MASK_SHADER)
         .ok_or("the descriptor set was not written")?;
     device.submit(|record| {
         target::frame(
@@ -539,7 +548,7 @@ fn the_mask_writes_no_color(device: &Open) -> Result<(), String> {
     let scene = scene(device, whole())?;
     let set = scene
         .sets
-        .get(scene.which)
+        .get(scene.which, MASK_SHADER)
         .ok_or("the descriptor set was not written")?;
     device.submit(|record| {
         target::frame(

@@ -191,12 +191,19 @@ pub struct Bound {
 
 /// The two samplers, and the pool the sets come from.
 ///
+/// A group-zero set is held per `(view, layer, shader)`. The shader as well as the layer, because
+/// one layer is drawn by more than one family and their sets are not interchangeable: mbgl's fill
+/// layer emits a fill drawable and an outline drawable at the same `layer_index`, and the outline
+/// declares a block the fill does not. The captured Berlin frame has three such layers of six.
+///
+/// The group-one sets are held per geometry instead, for the reason [`Self::instances`] gives.
+///
 /// `'d` is the device's lifetime: these cannot outlive the device, which the compiler checks.
 pub struct Sets<'d> {
     pool: DescriptorPool<'d>,
     linear: Sampler<'d>,
     nearest: Sampler<'d>,
-    held: BTreeMap<Which, vk::DescriptorSet>,
+    held: BTreeMap<(Which, i32), vk::DescriptorSet>,
     per_drawable: BTreeMap<GeometryId, vk::DescriptorSet>,
 }
 
@@ -243,8 +250,8 @@ impl<'d> Sets<'d> {
 
     /// The set for a layer, once it has one.
     #[must_use]
-    pub fn get(&self, which: Which) -> Option<vk::DescriptorSet> {
-        self.held.get(&which).copied()
+    pub fn get(&self, which: Which, shader: i32) -> Option<vk::DescriptorSet> {
+        self.held.get(&(which, shader)).copied()
     }
 
     /// The group-one set for a drawable, once it has one.
@@ -288,6 +295,7 @@ impl<'d> Sets<'d> {
         layout: &Layout<'_>,
         bindings: &[Binding],
         which: Which,
+        shader: i32,
         blocks: &Blocks<'_>,
         textures: &[Bound],
     ) -> Result<vk::DescriptorSet, Error> {
@@ -321,9 +329,15 @@ impl<'d> Sets<'d> {
             let slot = binding.slot.ok_or(Error::UnknownSlot {
                 binding: binding.binding,
             })?;
+            // Not always `which`. A frame-wide buffer arrives under `layer_index: -1` because it
+            // belongs to the renderer rather than to a layer, and eight of the twenty families
+            // declare one -- so a set written for layer four still finds `GlobalPaintParamsUBO`
+            // where the producer put it. `slots::held_at` is which, and mbgl's own numbering is
+            // what decides.
+            let held = crate::slots::held_at(which, slot);
             let buffer = blocks
-                .buffer(which, slot)
-                .ok_or(Error::NoBlocks { which, slot })?;
+                .buffer(held, slot)
+                .ok_or(Error::NoBlocks { which: held, slot })?;
             buffers.push(
                 vk::DescriptorBufferInfo::default()
                     .buffer(buffer)
@@ -389,7 +403,7 @@ impl<'d> Sets<'d> {
             });
         }
         self.pool.write(&writes);
-        self.held.insert(which, set);
+        self.held.insert((which, shader), set);
         Ok(set)
     }
 

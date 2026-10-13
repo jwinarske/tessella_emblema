@@ -371,8 +371,12 @@ fn draw(
     //
     // Keyed at layer -1, which is the producer's own convention for a buffer that "belongs to the
     // renderer rather than to any layer" -- `UboUpdate::layer_index` says so of the frame-wide
-    // blocks. It has to be a layer no content set uses: `Sets` holds one set per `Which`, so a mask
-    // keyed at layer zero would replace the set the first layer's batches bind.
+    // blocks, and `slots::FRAME_WIDE` is the same value from this side. A mask belongs to the
+    // frame in exactly that sense.
+    //
+    // It no longer has to be a layer no content set uses. It did when a set was keyed by the layer
+    // alone: a mask at layer zero replaced the set the first layer's batches bind. The key carries
+    // the family now, and the mask's is `ClippingMaskProgram` -- mbgl's own id for it.
     let mask_at = blocks::Which {
         view: frame::VIEW,
         layer: -1,
@@ -483,7 +487,14 @@ fn draw(
                 layer,
             };
             if sets
-                .write(layout, &bindings, at, &blocks, &[])
+                .write(
+                    layout,
+                    &bindings,
+                    at,
+                    BuiltIn::FillShader as i32,
+                    &blocks,
+                    &[],
+                )
                 .map_err(|why| format!("the set for layer {layer}: {why}"))?
                 == vk::DescriptorSet::null()
             {
@@ -540,8 +551,15 @@ fn draw(
             view: frame::VIEW,
             layer: frame::SAMPLED,
         };
-        sets.write(layout, &raster_bindings, at, &blocks, &bound)
-            .map_err(|why| format!("the raster set: {why}"))?;
+        sets.write(
+            layout,
+            &raster_bindings,
+            at,
+            BuiltIn::RasterShader as i32,
+            &blocks,
+            &bound,
+        )
+        .map_err(|why| format!("the raster set: {why}"))?;
         Program {
             pipeline,
             layout: layout.pipeline(),
@@ -565,7 +583,14 @@ fn draw(
     let mask_pipeline = pipelines::build_mask(gpu, &mask_layout, &mask_module, target.targets)
         .map_err(|why| format!("the mask pipeline: {why}"))?;
     let mask_set = sets
-        .write(&mask_layout, &mask_bindings, mask_at, &blocks, &[])
+        .write(
+            &mask_layout,
+            &mask_bindings,
+            mask_at,
+            BuiltIn::ClippingMaskProgram as i32,
+            &blocks,
+            &[],
+        )
         .map_err(|why| format!("the mask set: {why}"))?;
 
     let found = host.plan(frame::VIEW).ok_or("no plan for the view")?;

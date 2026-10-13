@@ -50,9 +50,16 @@ use crate::uniforms::{Consolidated, Rejected};
 /// Which layer of which view a buffer belongs to.
 ///
 /// The pair `UboUpdate` carries, and not the whole of a buffer's identity: a layer has one buffer
-/// per slot, so the methods here take a `slot` beside this. It is the key on its own for a
-/// *descriptor set*, which is per layer rather than per buffer -- which is why it stays a type of
-/// its own rather than growing a third field.
+/// per slot, so the methods here take a `slot` beside this.
+///
+/// Nor is it the whole of a descriptor set's. A set is per `(view, layer, family)`, because one
+/// layer is drawn by more than one family -- mbgl's fill layer emits a fill drawable and an
+/// outline drawable at the same `layer_index` -- so [`crate::descriptors::Sets`] takes the shader
+/// beside this too. This stays two fields because a *buffer* is not per family: the fill and the
+/// outline share the layer's evaluated properties.
+///
+/// And `layer` is not always the layer drawing. A frame-wide buffer arrives under `-1`, which
+/// [`crate::slots::held_at`] is what resolves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Which {
     /// The view whose frame holds it.

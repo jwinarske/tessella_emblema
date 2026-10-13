@@ -154,47 +154,70 @@ enum Layout {
     },
 }
 
-/// What a drawable says about where it is placed, as the three inputs `Surface::of` reads.
+/// What the wire says about one drawable, which is what both of a case's pipeline decisions read.
 ///
-/// A case names these and not the surface, so a pixel here is drawn on the surface the two calls a
-/// frame loop makes arrive at -- `Surface::of` for what the wire asks for, `Family::surface` for
-/// what this family has a module for. A rule that chose differently assembles a different
-/// placement and the geometry lands somewhere else, which is what these cases read.
+/// A case names these and not what they resolve to, so a pixel here is drawn through the calls a
+/// frame loop makes: `Surface::of` and `Family::surface` for where the vertices land, and
+/// `Enabled::of` for which tests run and whether the draw writes color at all. A rule that
+/// resolved any of them differently builds a different pipeline, which is what these cases read.
+///
+/// One byte serves two of those. `draw_flags` carries five bits -- a surface, three pieces of
+/// render state, and the 3D pass's -- and the two readings take different ones, which is why it is
+/// here whole rather than split into what each caller wants.
 #[derive(Debug, Clone, Copy)]
-struct Placement {
+struct Wire {
     /// The view's camera, as `CameraUpdate::projection`.
     projection: ProjectionMode,
-    /// The drawable's own flags, as `ViewUse::draw_flags`. One bit of it is a surface.
+    /// The drawable's own flags, as `ViewUse::draw_flags`.
     draw_flags: u8,
     /// Whether this drawable's layer holds a `GlobeBendUBO`, which the case supplies as a block.
     bend: bool,
 }
 
+/// What a producer sets on a drawable clipped to a tile: it tests depth, tests its tile's clip
+/// mask, and writes color.
+///
+/// The captured Berlin frame's fill, outline and line batches all carry exactly these three, and
+/// its background -- which covers the viewport and so has no mask -- carries the two that are left.
+const TILE_STATE: u8 = DrawFlags::ENABLE_DEPTH.bits()
+    | DrawFlags::ENABLE_STENCIL.bits()
+    | DrawFlags::ENABLE_COLOR.bits();
+
 /// A flat Mercator frame, with nothing covering the drawable.
-const PLANE: Placement = Placement {
+const PLANE: Wire = Wire {
     projection: ProjectionMode::Mercator,
-    draw_flags: 0,
+    draw_flags: TILE_STATE,
     bend: false,
 };
 
 /// A globe frame whose layer was sent no bend block, which is the direct bend.
-const BENT: Placement = Placement {
+const BENT: Wire = Wire {
     projection: ProjectionMode::Globe,
-    draw_flags: 0,
+    draw_flags: TILE_STATE,
     bend: false,
 };
 
 /// A globe frame whose layer was sent one, which is the anchored bend.
-const ANCHORED: Placement = Placement {
+const ANCHORED: Wire = Wire {
     projection: ProjectionMode::Globe,
-    draw_flags: 0,
+    draw_flags: TILE_STATE,
     bend: true,
 };
 
 /// A Mercator frame with a ground covering the drawable's tile.
-const RAISED: Placement = Placement {
+const RAISED: Wire = Wire {
     projection: ProjectionMode::Mercator,
-    draw_flags: DrawFlags::ON_TERRAIN.bits(),
+    draw_flags: TILE_STATE | DrawFlags::ON_TERRAIN.bits(),
+    bend: false,
+};
+
+/// A drawable that is there for its depth and writes no color, which the captured frame has two of.
+///
+/// `ENABLE_COLOR` cleared and the other two left alone, so a case drawn through this differs from
+/// the same case on [`PLANE`] in one bit.
+const NO_COLOR: Wire = Wire {
+    projection: ProjectionMode::Mercator,
+    draw_flags: TILE_STATE & !DrawFlags::ENABLE_COLOR.bits(),
     bend: false,
 };
 
@@ -208,12 +231,12 @@ struct Case {
     /// went, so it reads a pixel chosen for being covered by the right placement and by no wrong
     /// one, which is rarely the middle.
     at: (u32, u32),
-    /// What the wire says about where this drawable is placed, which is what names the surface.
+    /// What the wire says about this drawable, which is where the surface and the state come from.
     ///
-    /// [`PLANE`] for all but four of the cases. That is not a preference: a surface is only
+    /// [`PLANE`] for all but five of the cases. That is not a preference: a surface is only
     /// observable through *where* geometry lands, and the families' own arithmetic is easier to
     /// read off a surface that does nothing.
-    on: Placement,
+    wire: Wire,
     /// Which family's module to draw, resolved through `families::family`.
     ///
     /// Named rather than restated: the oracle's value is that it runs the modules the library
@@ -731,7 +754,7 @@ fn cases() -> Vec<Case> {
             name: "fill",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::FillShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
@@ -756,6 +779,47 @@ fn cases() -> Vec<Case> {
             absent: &[],
             instanced: None,
             expect: [0, 0, 255, 255],
+        },
+        // The same fill with `ENABLE_COLOR` cleared, which must leave the clear where the case
+        // above draws blue.
+        //
+        // One bit apart from it: the geometry, the blocks, the module and the blend are the fill's,
+        // and the only difference is the write mask the key takes from the flags. So this is not
+        // "a draw that did nothing" -- the case above proves these inputs draw -- it is a draw
+        // whose color went nowhere, which is mbgl's fourth `ColorMode` and what the captured
+        // frame's two depth-only extrusion batches ask for.
+        //
+        // Without it the two extrusion batches paint their walls twice, once invisibly as mbgl
+        // intends and once over the layers under them.
+        Case {
+            name: "fill_no_color",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillShader,
+            wire: NO_COLOR,
+            layout: Layout::PerAttribute,
+            streams: vec![
+                shorts(&COVERING),
+                per_vertex(&packed_pair([255, 0, 0, 255], [0, 0, 255, 255]), 3),
+                per_vertex(&[0.0, 1.0], 3),
+            ],
+            uniforms: vec![
+                block(
+                    &FILL_DRAWABLE_UBO,
+                    &[
+                        ("matrix", At::F(&CLIP)),
+                        ("color_t", At::F(&[1.0])),
+                        ("opacity_t", At::F(&[1.0])),
+                    ],
+                ),
+                block(&FILL_EVALUATED_PROPS_UBO, &[]),
+            ],
+            images: Vec::new(),
+            vertices: 3,
+            ubo_index: 0,
+            pass: None,
+            absent: &[],
+            instanced: None,
+            expect: CLEARED,
         },
         // The same fill with both of its paint properties *constant*, which is a different module.
         //
@@ -782,7 +846,7 @@ fn cases() -> Vec<Case> {
             name: "fill_constant",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::FillShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             // The two empty streams keep their place in the table's order, which is what
             // `descriptors_for` indexes by.
@@ -831,7 +895,7 @@ fn cases() -> Vec<Case> {
             name: "drawable_at_one",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::FillShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
@@ -882,7 +946,7 @@ fn cases() -> Vec<Case> {
             name: "background",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::BackgroundShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![shorts(&COVERING)],
             uniforms: vec![
@@ -921,7 +985,7 @@ fn cases() -> Vec<Case> {
             name: "background_blended",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::BackgroundShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![shorts(&COVERING)],
             uniforms: vec![
@@ -951,7 +1015,7 @@ fn cases() -> Vec<Case> {
             name: "background_faded",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::BackgroundShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![shorts(&COVERING)],
             uniforms: vec![
@@ -983,7 +1047,7 @@ fn cases() -> Vec<Case> {
             name: "background_faded_over",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::BackgroundShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![shorts(&COVERING)],
             uniforms: vec![
@@ -1021,7 +1085,7 @@ fn cases() -> Vec<Case> {
             name: "fill_outline",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::FillOutlineShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
@@ -1078,7 +1142,7 @@ fn cases() -> Vec<Case> {
             name: "fill_extrusion",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::FillExtrusionShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
@@ -1132,7 +1196,7 @@ fn cases() -> Vec<Case> {
             name: "extrusion_dim",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::FillExtrusionShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
@@ -1216,7 +1280,7 @@ fn cases() -> Vec<Case> {
             name: "extrusion_wall",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::FillExtrusionInstancedShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![shorts(&WALL_QUAD)],
             uniforms: vec![
@@ -1317,7 +1381,7 @@ fn cases() -> Vec<Case> {
             name: "extrusion_wall_dim",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::FillExtrusionInstancedShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![shorts(&WALL_QUAD)],
             uniforms: vec![
@@ -1436,7 +1500,7 @@ fn cases() -> Vec<Case> {
             name: "raster",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::RasterShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
@@ -1521,7 +1585,7 @@ fn cases() -> Vec<Case> {
             name: "raster_interleaved",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::RasterShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::Interleaved {
                 stride: 12,
                 offsets: &[0, 4, 8],
@@ -1592,7 +1656,7 @@ fn cases() -> Vec<Case> {
             name: "raster_adjusted",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::RasterShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
@@ -1660,7 +1724,7 @@ fn cases() -> Vec<Case> {
             name: "heatmap_texture",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::HeatmapTextureShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![shorts(&UNIT)],
             uniforms: vec![
@@ -1730,7 +1794,7 @@ fn cases() -> Vec<Case> {
             name: "color_relief",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::ColorReliefShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
@@ -1810,7 +1874,7 @@ fn cases() -> Vec<Case> {
             name: "symbol_sdf",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::SymbolSDFShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: symbol_streams(5),
             uniforms: symbol_blocks(symbol_drawable()),
@@ -1848,7 +1912,7 @@ fn cases() -> Vec<Case> {
             name: "symbol_below",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::SymbolSDFShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: symbol_streams(6),
             uniforms: symbol_blocks(symbol_drawable()),
@@ -1880,7 +1944,7 @@ fn cases() -> Vec<Case> {
             name: "hillshade_prep",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::HillshadePrepareShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
@@ -1935,7 +1999,7 @@ fn cases() -> Vec<Case> {
             name: "hillshade",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::HillshadeShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
@@ -2027,7 +2091,7 @@ fn cases() -> Vec<Case> {
             name: "heatmap",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::HeatmapShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&CORNERED_QUAD_AT_ONE),
@@ -2100,7 +2164,7 @@ fn cases() -> Vec<Case> {
             name: "background_pattern",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::BackgroundPatternShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![shorts(&COVERING)],
             uniforms: vec![
@@ -2174,7 +2238,7 @@ fn cases() -> Vec<Case> {
             name: "fill_pattern",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::FillPatternShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
@@ -2268,7 +2332,7 @@ fn cases() -> Vec<Case> {
             name: "line_pattern",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::LinePatternShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
                 // Two triangles: the centerline at -4 and +4, the normal bit low.
@@ -2357,7 +2421,7 @@ fn cases() -> Vec<Case> {
             name: "symbol_icon",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::SymbolIconShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&[0, 0, -1, -1, 0, 0, 3, -1, 0, 0, -1, 3]),
@@ -2393,7 +2457,7 @@ fn cases() -> Vec<Case> {
             name: "both_as_icon",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::SymbolTextAndIconShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: text_and_icon_streams(5, 0),
             uniforms: symbol_blocks(symbol_drawable_sized(768.0, 32.0, 16.0)),
@@ -2424,7 +2488,7 @@ fn cases() -> Vec<Case> {
             name: "both_as_glyph",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::SymbolTextAndIconShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: text_and_icon_streams(5, 1),
             uniforms: symbol_blocks(symbol_drawable_sized(768.0, 32.0, 16.0)),
@@ -2481,7 +2545,7 @@ fn cases() -> Vec<Case> {
             name: "fill_on_globe",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::FillShader,
-            on: BENT,
+            wire: BENT,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
@@ -2561,7 +2625,7 @@ fn cases() -> Vec<Case> {
             name: "fill_anchored",
             at: (25, 22),
             family: BuiltIn::FillShader,
-            on: ANCHORED,
+            wire: ANCHORED,
             layout: Layout::PerAttribute,
             streams: vec![
                 // 4096 plus and minus 3072, which a `Short2` holds.
@@ -2625,7 +2689,7 @@ fn cases() -> Vec<Case> {
             name: "fill_raised",
             at: (8, 13),
             family: BuiltIn::FillShader,
-            on: RAISED,
+            wire: RAISED,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
@@ -2705,7 +2769,7 @@ fn cases() -> Vec<Case> {
             name: "raster_raised_skirt",
             at: (5, 25),
             family: BuiltIn::RasterShader,
-            on: RAISED,
+            wire: RAISED,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&COVERING),
@@ -2785,7 +2849,7 @@ fn cases() -> Vec<Case> {
             name: "circle",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::CircleShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&CORNERED_QUAD),
@@ -2853,7 +2917,7 @@ fn cases() -> Vec<Case> {
             name: "circle_constant",
             at: (SIDE / 2, SIDE / 2),
             family: BuiltIn::CircleShader,
-            on: PLANE,
+            wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
                 shorts(&CORNERED_QUAD),
@@ -3564,9 +3628,9 @@ fn draw_case<'d>(
     // of the pairs have a module. A frame loop makes those two calls and nothing else, so a rule
     // that answers wrongly shows up here as a pixel in the wrong place.
     let surface = found.surface(Surface::of(
-        case.on.projection,
-        case.on.draw_flags,
-        case.on.bend,
+        case.wire.projection,
+        case.wire.draw_flags,
+        case.wire.bend,
     ));
 
     let source = found
@@ -3591,6 +3655,11 @@ fn draw_case<'d>(
         &plan,
         case.pass.map_or(Blend::Unblended, |pass| found.blend(pass)),
         pipelines::Depth::Write,
+        // The other reading of the case's flags byte. Every case but one asks for all three, and
+        // the two tests pass whatever they are given here -- the depth buffer is cleared and the
+        // compare mask is zero -- so what this measures is the third: the one case that clears
+        // `ENABLE_COLOR` reads the clear back.
+        pipelines::Enabled::of(case.wire.draw_flags),
     );
     let bindings = pipelines::bindings(found, surface);
 

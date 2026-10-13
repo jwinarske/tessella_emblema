@@ -294,6 +294,7 @@ fn scene(device: &Open, matrix: [f32; 16]) -> Result<Scene<'_>, String> {
         // returned composited over the clear -- which is what this bench reads back.
         blend: pipelines::Blend::Unblended,
         depth: pipelines::Depth::Write,
+        enabled: pipelines::Enabled::ALL,
     };
     let fill_pipeline = pipelines::build(gpu, &fill_key, &mask_layout, &fill_module, targets)
         .map_err(|why| format!("fill pipeline: {why}"))?;

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use tessella_capture_abi::envelope::{AttributeDesc, SlabRef};
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_capture_abi::generated::shader_attributes::{FILL_SHADER, RASTER_SHADER};
-use tessella_emblema::pipelines::{Blend, Depth, key};
+use tessella_emblema::pipelines::{Blend, Depth, Enabled, key};
 use tessella_emblema::surface::Surface;
 use tessella_emblema::vertices::{Plan, plan, plan_instanced};
 
@@ -49,6 +49,7 @@ fn the_same_drawable_twice_is_one_key() {
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
+        Enabled::ALL,
     );
     let b = key(
         BuiltIn::RasterShader,
@@ -56,6 +57,7 @@ fn the_same_drawable_twice_is_one_key() {
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
+        Enabled::ALL,
     );
     assert_eq!(a, b);
 }
@@ -69,6 +71,7 @@ fn a_different_stride_is_a_different_pipeline() {
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
+        Enabled::ALL,
     );
     let b = key(
         BuiltIn::RasterShader,
@@ -76,6 +79,7 @@ fn a_different_stride_is_a_different_pipeline() {
         &planned(16, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
+        Enabled::ALL,
     );
     assert_ne!(
         a, b,
@@ -91,6 +95,7 @@ fn a_different_offset_within_a_vertex_is_a_different_pipeline() {
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
+        Enabled::ALL,
     );
     let b = key(
         BuiltIn::RasterShader,
@@ -98,6 +103,7 @@ fn a_different_offset_within_a_vertex_is_a_different_pipeline() {
         &planned(12, 4, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
+        Enabled::ALL,
     );
     assert_ne!(a, b);
 }
@@ -118,6 +124,7 @@ fn the_surface_and_the_permutation_each_separate_a_key() {
         &base,
         Blend::Alpha,
         Depth::Write,
+        Enabled::ALL,
     );
     let bent = key(
         BuiltIn::RasterShader,
@@ -125,6 +132,7 @@ fn the_surface_and_the_permutation_each_separate_a_key() {
         &base,
         Blend::Alpha,
         Depth::Write,
+        Enabled::ALL,
     );
 
     // The same drawable with its last descriptor missing. Asserted rather than assumed, because a
@@ -143,6 +151,7 @@ fn the_surface_and_the_permutation_each_separate_a_key() {
         &short,
         Blend::Alpha,
         Depth::Write,
+        Enabled::ALL,
     );
 
     assert_ne!(flat, bent, "a different module");
@@ -166,14 +175,16 @@ fn the_family_separates_a_key() {
             Surface::Plane,
             &base,
             Blend::Alpha,
-            Depth::Write
+            Depth::Write,
+            Enabled::ALL
         ),
         key(
             BuiltIn::HillshadeShader,
             Surface::Plane,
             &base,
             Blend::Alpha,
-            Depth::Write
+            Depth::Write,
+            Enabled::ALL
         ),
         "raster and hillshade declare the same attributes and are not the same shader"
     );
@@ -193,14 +204,16 @@ fn where_the_bytes_live_does_not_separate_a_key() {
             Surface::Plane,
             &planned(12, 0, SOMEWHERE),
             Blend::Alpha,
-            Depth::Write
+            Depth::Write,
+            Enabled::ALL
         ),
         key(
             BuiltIn::RasterShader,
             Surface::Plane,
             &planned(12, 0, elsewhere),
             Blend::Alpha,
-            Depth::Write
+            Depth::Write,
+            Enabled::ALL
         ),
         "two drawables in different slabs share a pipeline"
     );
@@ -247,14 +260,16 @@ fn a_shorter_run_is_a_different_pipeline() {
             Surface::Plane,
             &full,
             Blend::Alpha,
-            Depth::Write
+            Depth::Write,
+            Enabled::ALL
         ),
         key(
             BuiltIn::FillShader,
             Surface::Plane,
             &partial,
             Blend::Alpha,
-            Depth::Write
+            Depth::Write,
+            Enabled::ALL
         )
     );
 }
@@ -269,6 +284,7 @@ fn the_key_caches() {
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
+        Enabled::ALL,
     );
     let strided = key(
         BuiltIn::RasterShader,
@@ -276,6 +292,7 @@ fn the_key_caches() {
         &planned(16, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
+        Enabled::ALL,
     );
     cache.insert(flat.clone(), 1);
     cache.insert(strided, 2);
@@ -288,6 +305,7 @@ fn the_key_caches() {
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
+        Enabled::ALL,
     );
     assert_eq!(cache.get(&again), Some(&1));
 }
@@ -302,6 +320,7 @@ fn the_layout_records_the_format_the_table_declared() {
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
+        Enabled::ALL,
     );
     assert_eq!(got.layout.len(), RASTER_SHADER.len());
     for slot in &got.layout {
@@ -329,14 +348,16 @@ fn the_input_rate_separates_a_key() {
             Surface::Plane,
             &per_vertex,
             Blend::Alpha,
-            Depth::Write
+            Depth::Write,
+            Enabled::ALL
         ),
         key(
             BuiltIn::RasterShader,
             Surface::Plane,
             &per_instance,
             Blend::Alpha,
-            Depth::Write
+            Depth::Write,
+            Enabled::ALL
         ),
         "one advances per vertex and one per instance"
     );

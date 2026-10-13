@@ -135,7 +135,8 @@ fn the_pipelines_bake_no_mask() {
     use tessella_emblema::device::Attachment;
 
     for attachment in [Attachment::StencilOnly, Attachment::DepthStencil] {
-        let content = pipelines::depth_stencil(attachment, pipelines::Depth::Write);
+        let content =
+            pipelines::depth_stencil(attachment, pipelines::Depth::Write, pipelines::Enabled::ALL);
         for face in [content.front, content.back] {
             assert_eq!(face.compare_mask, 0, "a baked compare mask");
             assert_eq!(face.write_mask, 0, "content never writes the stencil");

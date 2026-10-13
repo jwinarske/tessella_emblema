@@ -420,6 +420,7 @@ fn pipeline<'d>(
         layout: layout_slots(rate),
         blend: Blend::Unblended,
         depth: pipelines::Depth::Write,
+        enabled: pipelines::Enabled::ALL,
     };
     let built = pipelines::build(gpu, &key, &layout, &module, rig.targets)
         .map_err(|why| format!("pipeline: {why:?}"))?;

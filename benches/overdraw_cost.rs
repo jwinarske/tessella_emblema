@@ -309,6 +309,7 @@ fn measure(
             blend: Blend::Unblended,
             // Every arm writes; the attachment is what turns the test off in `test-off`.
             depth: pipelines::Depth::Write,
+            enabled: pipelines::Enabled::ALL,
         };
         let pipeline = pipelines::build(gpu, &key, layout, module, targets)
             .map_err(|why| format!("{}: the pipeline: {why}", arm.name()))?;

@@ -13,7 +13,7 @@
 //! floor for `maxPerStageDescriptorStorageBuffers` is four**. A conformant device may be under what
 //! the shaders need, so the number is worth knowing per part rather than assumed.
 //!
-//! So this creates all 63 and then reports the headroom, which is the measurement a later family
+//! So this creates all 65 and then reports the headroom, which is the measurement a later family
 //! would spend.
 //!
 //! Run with `cargo bench --bench descriptor_layouts`.
@@ -49,13 +49,13 @@ fn every_pair() -> Vec<(String, Vec<pipelines::Binding>)> {
 /// Every pair's layout is created, and none is refused.
 fn every_layout_is_accepted(device: &Open) -> Result<(), String> {
     let pairs = every_pair();
-    if pairs.len() != 63 {
+    if pairs.len() != 65 {
         return Err(format!(
-            "{} pairs, which is not the 63 modules the crate assembles",
+            "{} pairs, which is not the 65 modules the crate assembles",
             pairs.len()
         ));
     }
-    // Held to the end rather than dropped per iteration, so the device is carrying all 63 at once --
+    // Held to the end rather than dropped per iteration, so the device is carrying all 65 at once --
     // which is the state a frame drawing every family would be in.
     let mut held = Vec::with_capacity(pairs.len());
     for (who, bindings) in &pairs {

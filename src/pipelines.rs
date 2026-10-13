@@ -1109,7 +1109,7 @@ pub fn build_mask<'d>(
 ///
 /// # Two levels, because the module is not per key
 ///
-/// A module is per `(family, surface)`: one text, two entry points, 63 of them. A *pipeline* is per
+/// A module is per `(family, surface)`: one text, two entry points, 65 of them. A *pipeline* is per
 /// [`Key`], which adds the permutation and the vertex input -- so one module serves every pipeline
 /// of its family, and the two are cached separately. Holding the module beside each pipeline would
 /// compile the same text once per stride.

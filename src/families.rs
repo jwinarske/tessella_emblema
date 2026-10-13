@@ -329,6 +329,17 @@ const SYMBOL_BLOCKS: &[&UboLayout] = &[
 /// The shaders mbgl declares that this crate does not draw, with why.
 ///
 /// Pinned by a test against [`ALL`] and the `BuiltIn` enum, so this cannot drift from either.
+///
+/// # "The producer emits no drawable for it yet" is a claim, and one of them was wrong
+///
+/// Until a real frame could be replayed here, that reason was unfalsifiable: every fixture writes
+/// the records its author chose, so a family nothing sent looked the same as a family nothing
+/// *will* send. `benches/capture_frame.rs` replays a capture of a real style and reports the
+/// shaders it names that have no family -- and a Berlin z14 frame through `families_p` names
+/// `FillOutlineTriangulatedShader` twice and `FillExtrusionInstancedShader` twice.
+///
+/// So one reason here is now measured rather than assumed, and the rest stay claims. A capture of
+/// a style that uses them is what would settle the others.
 pub static UNDRAWN: &[(BuiltIn, &str)] = &[
     (
         BuiltIn::None,
@@ -365,7 +376,7 @@ pub static UNDRAWN: &[(BuiltIn, &str)] = &[
     ),
     (
         BuiltIn::FillOutlineTriangulatedShader,
-        "the producer emits no drawable for it yet",
+        "the producer does emit drawables for it -- two in a captured Berlin frame -- and the          body is unported",
     ),
     (
         BuiltIn::FillExtrusionInstancedShader,

@@ -465,6 +465,27 @@ fn run(path: &str) -> Result<(), String> {
 
     let mut host = Host::new();
     let progress = host.read(ring.consumer());
+    // Every record, or this is a replay of something else. A capture is written by this
+    // workspace's own producer, so any of these four is a disagreement between the two halves
+    // rather than a stream from elsewhere -- and the two that read as silence are `undeclared`,
+    // which drops a record naming a view, and `unsupported`, which drops one whose discriminant
+    // this build has no case for. Either leaves the frame short of a camera, a view or a texture
+    // with nothing in the picture to say which.
+    if progress.unknown != 0
+        || progress.malformed != 0
+        || progress.undeclared != 0
+        || progress.unsupported != 0
+    {
+        return Err(format!(
+            "{} unknown, {} malformed, {} undeclared and {} this build cannot honor, of {} \
+             records",
+            progress.unknown,
+            progress.malformed,
+            progress.undeclared,
+            progress.unsupported,
+            progress.records
+        ));
+    }
     let view = (0..8u32)
         .map(ViewId)
         .find(|id| host.declared(*id))

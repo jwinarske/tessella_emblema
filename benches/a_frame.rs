@@ -210,10 +210,23 @@ fn one_pass(pass: RenderPass) -> Result<(), String> {
     let (mut ring, geometry) = frame::write(1 << 16, pass);
     let mut host = Host::new();
     let progress = host.read(ring.consumer());
-    if progress.unknown != 0 || progress.malformed != 0 || progress.undeclared != 0 {
+    // All four, because a fixture that trips any of them is a fixture this bench is not drawing
+    // what it thinks it is. `unsupported` is the one that reads as nothing at all: the record
+    // parses, the kind is known, and a discriminant this build has no case for leaves the frame
+    // short of a camera, a view or a texture with nothing in the counts to say so.
+    if progress.unknown != 0
+        || progress.malformed != 0
+        || progress.undeclared != 0
+        || progress.unsupported != 0
+    {
         return Err(format!(
-            "{} unknown, {} malformed and {} naming an undeclared view, of {} records",
-            progress.unknown, progress.malformed, progress.undeclared, progress.records
+            "{} unknown, {} malformed, {} naming an undeclared view and {} this build cannot \
+             honor, of {} records",
+            progress.unknown,
+            progress.malformed,
+            progress.undeclared,
+            progress.unsupported,
+            progress.records
         ));
     }
     if !host.declared(frame::VIEW) {

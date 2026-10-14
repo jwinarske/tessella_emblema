@@ -72,13 +72,13 @@
 //! transparent black. Three outcomes are distinguishable there now where two were.
 //!
 //! So a new case is not finished when it draws the expected pixel. Nudge each input to a
-//! neighbouring value and check the pixel moves: a texel of each image, each stream, each uniform
+//! neighboring value and check the pixel moves: a texel of each image, each stream, each uniform
 //! field the body reads. An input that can be changed without moving the pixel is not under test,
 //! whatever the case's comment says.
 //!
 //! Every case here was audited that way for its images, one texel at a time. Each moves on
 //! exactly the texels it should, and the three that move on more than one have reasons:
-//! `hillshade_prepare` reads a 3x3 neighbourhood to compute a slope, `color_relief` mixes two
+//! `hillshade_prepare` reads a 3x3 neighborhood to compute a slope, `color_relief` mixes two
 //! ramp stops, and a raised surface samples the DEM per vertex and interpolates, so several
 //! texels reach one pixel. The two text-and-icon cases are the sharpest result: `both_as_icon`
 //! moves only on the icon sheet and `both_as_glyph` only on the glyph atlas, which is the pair

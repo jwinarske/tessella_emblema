@@ -54,6 +54,22 @@ pub enum Error {
         /// And with which channels.
         channel: TextureChannelDataType,
     },
+    /// The texture has no area, and Vulkan has no image of that shape.
+    ///
+    /// `VkImageCreateInfo` requires every extent to be at least one, so a zero width or height is
+    /// invalid usage rather than an empty image -- and what a driver does with it is its own
+    /// business. RADV makes the allocation and says nothing; V3D 7.1.7.0 answers
+    /// "Failed to allocate device memory for BO" and the submission fails with
+    /// `VK_ERROR_OUT_OF_HOST_MEMORY`, which names neither the texture nor the extent.
+    ///
+    /// A real case rather than a guard: the captured Berlin frame carries a texture at `0x0`,
+    /// which a producer sends for an atlas with nothing in it. Nothing samples it -- a drawable
+    /// naming it would be refused at [`Error::Short`] or by `descriptors::bound_from` -- so the
+    /// answer for a caller staging a stream is to skip it.
+    NoArea {
+        /// The extent asked for.
+        size: Extent,
+    },
     /// A texture already exists at a different size or format.
     ///
     /// Not an error the producer can cause by writing: it is the caller asking for an image that
@@ -90,6 +106,11 @@ impl core::fmt::Display for Error {
             Self::NoFormat { pixel, channel } => {
                 write!(f, "{pixel:?} with {channel:?} channels has no format here")
             }
+            Self::NoArea { size } => write!(
+                f,
+                "a texture of {}x{} has no area, and Vulkan has no image of that shape",
+                size.width, size.height
+            ),
             Self::Reshaped { size, format } => write!(
                 f,
                 "this texture is already {}x{} {format:?}, which is a different image",
@@ -216,8 +237,9 @@ impl<'d> Images<'d> {
     ///
     /// # Errors
     ///
-    /// [`Error::NoFormat`] for a pair with no format, [`Error::Reshaped`] when the texture exists at
-    /// another shape -- forget it first -- and [`Error::Device`] when the device refuses.
+    /// [`Error::NoFormat`] for a pair with no format, [`Error::NoArea`] for an extent with a zero
+    /// side, [`Error::Reshaped`] when the texture exists at another shape -- forget it first -- and
+    /// [`Error::Device`] when the device refuses.
     pub fn declare(
         &mut self,
         gpu: Gpu<'d>,
@@ -229,6 +251,12 @@ impl<'d> Images<'d> {
     ) -> Result<bool, Error> {
         let format =
             device::texture_format(pixel, channel).ok_or(Error::NoFormat { pixel, channel })?;
+        // Before the device sees it: an image of no area is invalid usage, and the one driver that
+        // refuses it does so three calls later with an error that names nothing. See
+        // [`Error::NoArea`].
+        if size.width == 0 || size.height == 0 {
+            return Err(Error::NoArea { size });
+        }
         if let Some(held) = self.held.get(&texture) {
             if held.size == size && held.format == format {
                 return Ok(false);

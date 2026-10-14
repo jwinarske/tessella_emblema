@@ -229,8 +229,33 @@ fn refusals(device: &Open) -> Result<(), String> {
     let texture = TextureId(4);
     let extent = size(4, 4);
 
-    // A pair with no format, which is what mbgl gives luminance and depth.
+    // A texture of no area, which a producer sends for an atlas with nothing in it -- the captured
+    // Berlin frame carries one at `0x0`. `VkImageCreateInfo` requires every extent to be at least
+    // one, so this is invalid usage rather than an empty image, and the two devices here answer it
+    // differently: RADV makes the allocation and says nothing, V3D 7.1.7.0 logs
+    // "Failed to allocate device memory for BO" and fails the *submission* with
+    // `VK_ERROR_OUT_OF_HOST_MEMORY` -- three calls later, naming neither the texture nor the
+    // extent. Refused here, where it can say which.
     let mut outcome = Ok(false);
+    for empty in [size(0, 0), size(0, 4), size(4, 0)] {
+        device.submit(|record| {
+            outcome = images.declare(device.gpu(), record, TextureId(8), empty, RGBA, BYTE);
+        })?;
+        match outcome {
+            Err(Error::NoArea { size: had }) if had == empty => {}
+            other => {
+                return Err(format!(
+                    "a {}x{} texture gave {other:?}",
+                    empty.width, empty.height
+                ));
+            }
+        }
+    }
+    if images.textures() != 0 {
+        return Err("a texture of no area was made anyway".into());
+    }
+
+    // A pair with no format, which is what mbgl gives luminance and depth.
     device.submit(|record| {
         outcome = images.declare(
             device.gpu(),

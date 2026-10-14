@@ -283,7 +283,9 @@ impl<'d> Images<'d> {
         )?;
         // Bound before the view is made, which `Memory::bind_image` states and nothing can check.
         memory.bind_image(&image, 0)?;
-        let view = gpu.view(&image, format)?;
+        // Through the swizzle the pixel type asks for, which for a one-channel texture puts the
+        // value where mbgl's bodies read it. See `device::component_swizzle`.
+        let view = gpu.view_as(&image, format, device::component_swizzle(pixel))?;
 
         record.transition(
             &image,

@@ -275,3 +275,50 @@ fn stored_regions_never_meet() {
         }
     }
 }
+
+/// A one-channel texture's view puts its value where mbgl's bodies read it.
+///
+/// `texture_format` maps `Alpha` to `R8_UNORM`, so a sampler reads the value in `r` with `(0, 0, 1)`
+/// beside it -- and every mbgl body that samples such a texture reads its **alpha**: a glyph's
+/// distance field, a dash's. That is not a mistake on their part. `vulkan/texture2d.cpp:359` gives
+/// an `Alpha` texture's view the mapping `(Zero, Zero, Zero, R)`, so by the time a sampler is
+/// involved the value *is* in alpha.
+///
+/// Pinned because the alternative worked. This crate read `r` and said so in three bodies, which
+/// draws the same pixels and leaves the next transcribed body to sample alpha, get 1.0 for every
+/// texel, and draw a dash pattern that is solid everywhere -- which is what a capture of
+/// `dash_style.json` drew before the view swizzled.
+///
+/// Everything else is the identity. An `RGBA` texture is four channels in the order the shader
+/// expects, and swizzling one would move a sprite's red into its alpha.
+#[test]
+fn a_one_channel_texture_reads_back_as_alpha() {
+    use ash::vk;
+    use tessella_capture_abi::TexturePixelType;
+    use tessella_emblema::device::component_swizzle;
+
+    let alpha = component_swizzle(TexturePixelType::Alpha);
+    assert_eq!(alpha.r, vk::ComponentSwizzle::ZERO);
+    assert_eq!(alpha.g, vk::ComponentSwizzle::ZERO);
+    assert_eq!(alpha.b, vk::ComponentSwizzle::ZERO);
+    assert_eq!(
+        alpha.a,
+        vk::ComponentSwizzle::R,
+        "the one channel has to arrive in alpha, which is where the bodies read it"
+    );
+
+    // `vk::ComponentMapping` is not `PartialEq`, so the four are compared one at a time -- which
+    // is also what says *which* channel an entry got wrong.
+    for pixel in [
+        TexturePixelType::RGBA,
+        TexturePixelType::Depth,
+        TexturePixelType::Stencil,
+    ] {
+        let mapping = component_swizzle(pixel);
+        let identity = vk::ComponentSwizzle::IDENTITY;
+        assert_eq!(mapping.r, identity, "{pixel:?} swizzles red");
+        assert_eq!(mapping.g, identity, "{pixel:?} swizzles green");
+        assert_eq!(mapping.b, identity, "{pixel:?} swizzles blue");
+        assert_eq!(mapping.a, identity, "{pixel:?} swizzles alpha");
+    }
+}

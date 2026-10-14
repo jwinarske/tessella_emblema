@@ -157,6 +157,34 @@ pub fn line_width(wide_lines: bool, range: [f32; 2]) -> f32 {
     OUTLINE_WIDTH.clamp(low, high)
 }
 
+/// How a sampler reads a texture of this pixel type, which is not always the identity.
+///
+/// A one-channel texture is `R8_UNORM` here -- [`texture_format`] says so -- and a shader sampling
+/// one gets the value in `r`, zero in `gb` and one in `a`. Every mbgl body that reads such a
+/// texture reads its **alpha**: `symbol_sdf`'s glyph field, `line_sdf`'s dash field. That is not a
+/// mistake on their part. `vulkan/texture2d.cpp:359` gives an `Alpha` texture's view the mapping
+/// `(Zero, Zero, Zero, R)`, so by the time a sampler is involved the value *is* in alpha.
+///
+/// This crate read `r` instead and said so in two bodies. It worked, and it is the kind of
+/// deviation that costs a frame the third time: a body transcribed faithfully from mbgl samples
+/// alpha, gets 1.0 for every texel, and draws a dash pattern that is solid everywhere --
+/// which is what a capture of `dash_style.json` drew before this. Matching the oracle's view is
+/// what lets a transcribed body be taken at its word.
+///
+/// Identity for everything else. `RGBA` is four channels in the order the shader expects, and a
+/// `Stencil` or `Depth` texture is not sampled through this path at all.
+pub fn component_swizzle(pixel: TexturePixelType) -> vk::ComponentMapping {
+    match pixel {
+        TexturePixelType::Alpha => vk::ComponentMapping {
+            r: vk::ComponentSwizzle::ZERO,
+            g: vk::ComponentSwizzle::ZERO,
+            b: vk::ComponentSwizzle::ZERO,
+            a: vk::ComponentSwizzle::R,
+        },
+        _ => vk::ComponentMapping::default(),
+    }
+}
+
 /// Which `VkFormat` a texture of this pixel and channel type is, as mbgl's Vulkan backend decides.
 ///
 /// Transcribed from `Texture2D::vulkanFormat` in `src/mbgl/vulkan/texture2d.cpp`, which is the

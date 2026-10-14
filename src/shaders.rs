@@ -1584,8 +1584,9 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
     let fill_edge = (256.0 - 64.0) / 256.0;
     let inner = select(fill_edge, fill_edge + halo_gamma * in.gamma, is_halo);
 
-    // `.r`, where mbgl reads `.a`: a one-channel format is `R8_UNORM` here and alpha reads 1.0.
-    let distance = textureSample(symbol_image, symbol_image_sampler, in.tex).r;
+    // `.a`, as mbgl reads it. A one-channel texture is `R8_UNORM` and the value lands in `r`, so
+    // the view swizzles it to alpha -- `device::component_swizzle`, which is mbgl's own mapping.
+    let distance = textureSample(symbol_image, symbol_image_sampler, in.tex).a;
     var alpha = smoothstep(inner - gamma, inner + gamma, distance);
     if is_halo {
         // Subtracted rather than drawn under, so a translucent fill keeps a translucent halo.
@@ -1737,8 +1738,8 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
     let fill_edge = (256.0 - 64.0) / 256.0;
     let inner = select(fill_edge, fill_edge + halo_gamma * in.gamma_scale, is_halo);
 
-    // `.r`, where mbgl reads `.a`: see `SYMBOL_SDF_BODY` for which of the two the view decides.
-    let distance = textureSample(symbol_image, symbol_image_sampler, in.tex).r;
+    // `.a`, as mbgl reads it: see `SYMBOL_SDF_BODY` for the swizzle that puts it there.
+    let distance = textureSample(symbol_image, symbol_image_sampler, in.tex).a;
     var alpha = smoothstep(inner - gamma_scaled, inner + gamma_scaled, distance);
     if is_halo {
         let halo_edge = (6.0 - in.halo_width / in.font_scale) / sdf_px;
@@ -2808,14 +2809,14 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
     // zoom and *narrowed* by the line's width: a wide line stretches the field across more pixels,
     // so the same gamma would soften its edges more. Dividing by the width is what keeps a dash's
     // edge as sharp on a thick road as on a thin one.
-    // `.r`, where mbgl reads `.a`: a one-channel format is `R8_UNORM` here and alpha reads 1.0.
-    // mbgl's Vulkan backend swizzles an `Alpha` texture's view to `(0, 0, 0, R)`
-    // (`texture2d.cpp:359`) and this crate does not, which is the same difference the glyph atlas
-    // is read across -- see `SYMBOL_SDF_BODY`. Read as alpha, every dash is solid: the field comes
-    // back as one everywhere and the `smoothstep` saturates, which is exactly what a capture of
-    // `dash_style.json` drew before this line said `.r`.
-    let sdfdist_a = textureSample(line_image, line_image_sampler, in.tex_a).r;
-    let sdfdist_b = textureSample(line_image, line_image_sampler, in.tex_b).r;
+    // `.a`, as mbgl reads it. The dash atlas is one channel -- it holds a distance field, and
+    // three of four channels would be copies of the one the shader reads -- and the view swizzles
+    // that channel to alpha. Read as `r` through such a view the field is zero everywhere and the
+    // line disappears; read as `a` through an *unswizzled* view it is one everywhere and every
+    // dash is solid, which is what a capture of `dash_style.json` drew while this crate had no
+    // swizzle. `device::component_swizzle` is the one place that decides it.
+    let sdfdist_a = textureSample(line_image, line_image_sampler, in.tex_a).a;
+    let sdfdist_b = textureSample(line_image, line_image_sampler, in.tex_b).a;
     let sdfdist = mix(sdfdist_a, sdfdist_b, tile.mix);
     let gamma = tile.sdfgamma / max(in.floorwidth, 1e-6);
     let dash = smoothstep(0.5 - gamma, 0.5 + gamma, sdfdist);

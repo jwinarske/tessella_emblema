@@ -344,7 +344,7 @@ fn the_patterns_keep_their_tiling_decisions() {
         "a pattern reads the other family's atlas size"
     );
     assert!(
-        fill.contains("let pattern_from = vec4<f32>(in.fill_pattern_from);")
+        fill.contains("    return vec4<f32>(in.fill_pattern_from);")
             && !fill.contains("drawable.pattern_from_t")
             && !fill.contains("drawable.pattern_to_t"),
         "the fill pattern interpolates a sprite name"
@@ -1116,32 +1116,51 @@ const fn is_identifier(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-/// A per-drawable block is read at the slot the draw carries, never at entry nought.
+/// A per-drawable block is read at the slot the draw carries, never at entry zero.
 ///
 /// The one mutation the pixel oracle cannot see, because every case it draws but one sits at slot
-/// nought -- `drawable_at_one` is that one, and it is a single family. A body indexing its own
+/// zero -- `drawable_at_one` is that one, and it is a single family. A body indexing its own
 /// drawable block at `[0]` draws the first tile of a layer correctly and every other tile with the
 /// first one's matrix, which reads as a camera fault rather than as a typo.
 ///
 /// Over the block *names* rather than over a list: mbgl calls a per-drawable block
-/// `<Family>DrawableUBO` and this crate's two extensions follow it, so what is checked is every
-/// block whose name says it is per drawable -- on every surface, because two of the three that add
-/// a block add one of these.
+/// `<Family>DrawableUBO` or `<Family>TilePropsUBO`, so what is checked is every block the name or
+/// [`per_drawable`] says is per drawable -- on every surface, because two of the three that add a
+/// block add one of these.
 ///
-/// A properties block is the opposite case and is not checked here: it is one entry for the whole
-/// layer, so `[0]` is right for it and `[ubo_index]` would be the defect.
+/// The tile blocks are here for the producer's reason rather than for mbgl's spelling:
+/// `ubo::pack_pattern_tile_props` and its siblings are "one entry per drawable", because a
+/// sprite's place in the atlas and a hillshade's latitude range are per tile.
+///
+/// A properties block is the opposite case, and the *complement* is checked: it is one entry for
+/// the whole layer, so `[0]` is right for it and `[ubo_index]` would read past the one entry the
+/// producer sent.
 #[test]
 fn a_drawable_block_is_read_at_the_draws_own_slot() {
     let mut checked = 0;
+    let mut layer_wide = 0;
     for family in ALL {
         for surface in family.surfaces {
             let source = family.module(*surface, &[]).expect("assembles");
             for block in family.blocks.iter().chain(surface.blocks()) {
-                if !block.name.contains("Drawable") {
-                    continue;
-                }
                 let binding = binding_name_of(&tessella_emblema::preamble::type_name(block.name));
                 let what = format!("{}{}", family.name, surface.suffix());
+                if !per_drawable(block.name) {
+                    assert!(
+                        !source.contains(&format!("{binding}[ubo_index]")),
+                        "{what} reads {} at the draw's slot, where the producer sent one entry \
+                         for the layer",
+                        block.name
+                    );
+                    layer_wide += 1;
+                    continue;
+                }
+                // A family can declare a block its body never reads: mbgl's three symbol
+                // families share one block set and the icon needs no tile properties. So this is
+                // asked of the blocks a body does read.
+                if !source.contains(&format!("{binding}[")) {
+                    continue;
+                }
                 assert!(
                     source.contains(&format!("{binding}[ubo_index]")),
                     "{what} never reads {} at the draw's own slot",
@@ -1149,7 +1168,7 @@ fn a_drawable_block_is_read_at_the_draws_own_slot() {
                 );
                 assert!(
                     !source.contains(&format!("{binding}[0]")),
-                    "{what} reads {} at entry nought, which is the first drawable's",
+                    "{what} reads {} at entry zero, which is the first drawable's",
                     block.name
                 );
                 checked += 1;
@@ -1157,6 +1176,60 @@ fn a_drawable_block_is_read_at_the_draws_own_slot() {
         }
     }
     assert!(checked > 0, "no family declares a per-drawable block");
+    assert!(layer_wide > 0, "no family declares a layer-wide block");
+}
+
+/// Whether the producer sends one entry of this block per drawable or one for the layer.
+///
+/// By the name, which is mbgl's and is what `ubo::pack_*` follows: a `DrawableUBO` and a
+/// `TilePropsUBO` are per drawable, and the evaluated-properties blocks, the camera and the
+/// frame-wide ones are not.
+///
+/// `GlobeBendUBO` is the one that the name does not say. It is this crate's own extension rather
+/// than mbgl's, and `ubo::pack_globe_bend_buffer` is "one per drawable, in the order the drawables
+/// were sent" -- the bend coefficients are a tile's own corner of the sphere.
+fn per_drawable(name: &str) -> bool {
+    name.contains("Drawable") || name.contains("TileProps") || name == "GlobeBendUBO"
+}
+
+/// A fragment stage reading a per-drawable block takes the slot from its own input.
+///
+/// `ubo_index` is a private variable the *vertex* stage assigns from `@builtin(instance_index)`,
+/// and a fragment invocation has its own copy of a private -- zero. So a fragment stage that
+/// read it would draw every tile of a layer with the first tile's properties: the second tile of
+/// a patterned fill sampled against the first tile's atlas size, which is a texel rather than a
+/// blank.
+///
+/// `benches/first_pixel.rs`'s `fill_pattern_at_one` is the pixel that says so on a device. This
+/// is the same claim over every body, which is the half a case cannot cover: seven families read
+/// a tile block in their fragment stage and the oracle draws one of them.
+#[test]
+fn a_fragment_stage_carries_the_slot_it_reads_by() {
+    let mut carried = 0;
+    for family in ALL {
+        for surface in family.surfaces {
+            let source = family.module(*surface, &[]).expect("assembles");
+            let what = format!("{}{}", family.name, surface.suffix());
+            let (_, fragment) = source
+                .split_once("@fragment")
+                .unwrap_or_else(|| panic!("{what} has no fragment stage"));
+            if !fragment.contains("[ubo_index]") {
+                continue;
+            }
+            assert!(
+                fragment.contains("ubo_index = in.ubo;"),
+                "{what} indexes by the slot in its fragment stage and never takes it from the \
+                 vertex stage, so it reads entry zero"
+            );
+            assert!(
+                source.contains("@interpolate(flat) ubo: u32,")
+                    && source.contains("out.ubo = ubo_index;"),
+                "{what} assigns the slot in its fragment stage and its vertex stage never sends it"
+            );
+            carried += 1;
+        }
+    }
+    assert!(carried > 0, "no fragment stage reads a per-drawable block");
 }
 
 /// The WGSL binding name a block's type gets, which is the type's own name in snake case.
@@ -1261,7 +1334,7 @@ fn every_permutation_of_every_family_compiles() {
     // Not a round number and not worth deriving: it is the shape of the table, and a change to it
     // is a change worth looking at.
     assert_eq!(
-        modules, 199,
+        modules, 215,
         "the permutations grew or shrank; look at the new ones"
     );
 }

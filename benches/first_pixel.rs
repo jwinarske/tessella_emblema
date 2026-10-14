@@ -303,7 +303,7 @@ struct Case {
 /// that name a shared buffer have to be *interleaved in one buffer at stride eight*, because the
 /// storage element the body reads ahead in is those same eight bytes, while the data-driven paint
 /// beside them is in buffers of its own. That is what the producer sends:
-/// `encode_extrusion_walls` puts the outline position and the packed decimals at offsets nought
+/// `encode_extrusion_walls` puts the outline position and the packed decimals at offsets zero
 /// and four of the roof's own buffer, and the paint in the binder's interleaved one.
 #[derive(Debug, Clone, Copy)]
 struct Packed {
@@ -488,7 +488,7 @@ const CLIP_NEAR_HALF: [f32; 16] = [
 /// [`CLIP`] cannot serve here. A wall's vertical extent is its height, which `place` takes as the
 /// third component, and on a plane the drawable's matrix is what maps it -- so under the identity
 /// the height lands in clip `z` and a wall is a line of no area. This maps it to clip `y` instead,
-/// four units of clip per unit of height and down two, so a wall from a base of nought to a height
+/// four units of clip per unit of height and down two, so a wall from a base of zero to a height
 /// of one covers the viewport and one pixel of it can be read.
 ///
 /// Column-major, as the producer writes it: `transform` is `c0*x + c1*y + c2*z + c3`. The outline's
@@ -534,20 +534,20 @@ fn outline(points: &[([i16; 2], u16)]) -> Vec<u8> {
 /// Every raster-family case on a plane carries this: the producer sends the flag for every bucket
 /// of those families and the table declares it, so the pipeline has an input for it whether the
 /// surface hangs anything from it or not. Zero because an unraised tile has no crack to cover --
-/// `curtain` on a plane returns nought regardless, which is what `raster_raised_skirt` and these
+/// `curtain` on a plane returns zero regardless, which is what `raster_raised_skirt` and these
 /// cases together say.
 const FLAT_SKIRT: [u8; 12] = [0; 12];
 
 /// A triangle covering the viewport, in tile units that the identity makes clip units.
 const COVERING: [i16; 6] = [-1, -1, 3, -1, -1, 3];
 
-/// A triangle covering the viewport in a coordinate space of nought to one.
+/// A triangle covering the viewport in a coordinate space of zero to one.
 ///
 /// `heatmap_texture`'s quad is the viewport rather than a tile, so its positions are a unit square
 /// and the matrix is what reaches clip space. See `UNIT_CLIP`.
 const UNIT: [i16; 6] = [0, 0, 2, 0, 0, 2];
 
-/// Nought to one onto clip space, with `y` negated as [`CLIP`] is.
+/// Zero to one onto clip space, with `y` negated as [`CLIP`] is.
 ///
 /// `clip = (2x - 1, 1 - 2y)`, so the unit square covers the viewport exactly and the center pixel
 /// comes from a position near a half in both axes -- which is what makes the texture coordinate
@@ -932,6 +932,56 @@ fn cases() -> Vec<Case> {
             instanced: None,
             expect: [138, 107, 46, 153],
         },
+        // The same fill with only its *color* constant, which leaves a gap in the bound locations.
+        //
+        // `fill_constant` drops both paint properties, so what it binds is location zero alone
+        // and the bindings stay dense. Drop the color and keep the opacity -- a style with
+        // `fill-color: "#e5b34d"` and an expression for `fill-opacity`, which is an ordinary pair
+        // of paint values -- and the bound locations are zero and two with one missing between
+        // them.
+        //
+        // `vkCmdBindVertexBuffers` is called once from binding zero, so the list it is given has
+        // to be indexed by binding number and not packed: packed, the opacity's buffer lands at
+        // binding one, binding two has nothing bound, and the attribute fetches zero. The opacity
+        // is then zero, and blended -- which every real pass is -- that is the layer gone.
+        //
+        //   clean                         ->  [184, 143, 61, 204]
+        //   the bind list packed          ->  [0, 0, 0, 0], a fragment of nothing at no alpha
+        //   the constant arm read anyway  ->  [138, 107, 46, 153], the block's own `opacity`
+        //
+        // Every case before this one bound a dense set, which is why the oracle never reached it:
+        // both of the constant cases drop *every* paint property their family has, which leaves
+        // location zero alone. A style constant in one property and not in another is the
+        // ordinary case, and the captured Berlin frame has no gap only because its patterned
+        // layer's `fill-opacity` is a plain 0.9 beside its plain `fill-pattern`.
+        Case {
+            name: "fill_past_a_gap",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillShader as i32,
+            wire: PLANE,
+            layout: Layout::PerAttribute,
+            streams: vec![shorts(&COVERING), Vec::new(), per_vertex(&[0.0, 0.8], 3)],
+            uniforms: vec![
+                block(
+                    &FILL_DRAWABLE_UBO,
+                    &[("matrix", At::F(&CLIP)), ("opacity_t", At::F(&[1.0]))],
+                ),
+                block(
+                    &FILL_EVALUATED_PROPS_UBO,
+                    &[
+                        ("color", At::F(&[0.9, 0.7, 0.3, 1.0])),
+                        ("opacity", At::F(&[0.6])),
+                    ],
+                ),
+            ],
+            images: Vec::new(),
+            vertices: 3,
+            ubo_index: 0,
+            pass: None,
+            absent: &[1],
+            instanced: None,
+            expect: [184, 143, 61, 204],
+        },
         // The second entry of a drawable buffer, which is where the entry *stride* becomes visible.
         //
         // Every other case draws entry zero, and entry zero sits at offset zero under any stride --
@@ -1260,7 +1310,7 @@ fn cases() -> Vec<Case> {
         // not subtracted.
         //
         // The first of those was unreachable before this case. Every other raised drawable hands
-        // `place` a height of nought, so a raise that ignored `position.z` entirely drew every one
+        // `place` a height of zero, so a raise that ignored `position.z` entirely drew every one
         // of them correctly; measured, `fill_raised` and `raster_raised_skirt` both still pass
         // under it. It sits 1.2 pixels inside the right triangle and 1.7 from the nearest
         // wrong one, which came out of the same search `fill_raised` describes: a building height
@@ -1394,7 +1444,7 @@ fn cases() -> Vec<Case> {
         // is the instance by then, and the *next* outline point read out of a group-one storage
         // buffer over the same eight bytes the first two attributes are fetched from.
         //
-        // That last one is what the case exists for. The wall runs from element nought to element
+        // That last one is what the case exists for. The wall runs from element zero to element
         // one, and only the first of those arrives as an attribute -- so a body that read the
         // lookahead wrongly, or a set that pointed at another buffer, puts the far end of the wall
         // somewhere else and the edge vector with it. The normal is derived from that vector, so
@@ -1404,8 +1454,8 @@ fn cases() -> Vec<Case> {
         //   normal      = (-edge.y, edge.x, 0)                     = (0, -1, 0)
         //   facing      = clamp(dot((0, -1, 0), (0, -2, 0)), 0, 1) = 1
         //
-        // A normal of (0, 0, 1) -- the roof's -- gives a facing of nought against this light and
-        // reads black, and a lookahead that returned element nought gives an edge of zero length,
+        // A normal of (0, 0, 1) -- the roof's -- gives a facing of zero against this light and
+        // reads black, and a lookahead that returned element zero gives an edge of zero length,
         // a normal of NaN and nothing drawn at all.
         //
         // The edge runs right to left so that the point read out of the *storage* buffer is the
@@ -1525,10 +1575,10 @@ fn cases() -> Vec<Case> {
         // to one.
         //
         // It also draws the *second* entry of the drawable buffer, which is the only way to tell
-        // where this family's `ubo_index` came from. `firstInstance` is nought on an instanced draw
+        // where this family's `ubo_index` came from. `firstInstance` is zero on an instanced draw
         // -- it has to be -- so a body that took the slot from `@builtin(instance_index)` instead
-        // of from the push constant reads nought and gets the right answer by accident on a case
-        // drawing entry nought. Entry nought here is a decoy whose `color_t` takes the other end
+        // of from the push constant reads zero and gets the right answer by accident on a case
+        // drawing entry zero. Entry zero here is a decoy whose `color_t` takes the other end
         // of the color pair, so a slot that fell back to the builtin draws red and says so.
         Case {
             name: "extrusion_wall_dim",
@@ -1868,7 +1918,7 @@ fn cases() -> Vec<Case> {
         //     (0.51563, 0.48438) and the pixel to (170, 128, 0).
         //   * **A ramp three rows tall, with only the middle one painted.** One row makes any
         //     second coordinate look right, and three is the smallest count where a half lands
-        //     inside a row rather than on a boundary -- so `0.5` is under test, and row nought
+        //     inside a row rather than on a boundary -- so `0.5` is under test, and row zero
         //     draws the magenta above it.
         //   * **A density above three quarters.** The ramp is four wide and three tall, so for a
         //     density near a half the lookup and its own transpose land on the same texel. At
@@ -1939,7 +1989,7 @@ fn cases() -> Vec<Case> {
         //
         // Not under test here: the half-texel offset in `(index + 0.5) / stops`. This probe
         // samples `NEAREST`, and with four stops every index lands on its own texel with or
-        // without the half -- 0.125 and 0.000 are both texel nought, 0.875 and 0.750 both texel
+        // without the half -- 0.125 and 0.000 are both texel zero, 0.875 and 0.750 both texel
         // three. The offset is load-bearing only under a `LINEAR` sampler, where dropping it would
         // blend each stop with its neighbor, so whether it matters is the producer's choice of
         // filter and not something a pixel here can say.
@@ -2057,7 +2107,7 @@ fn cases() -> Vec<Case> {
         //
         // Over a transparent clear the first two were the same pixel.
         //
-        // The texel is 153 rather than nought, which is 0.6 -- below the ramp at
+        // The texel is 153 rather than zero, which is 0.6 -- below the ramp at
         // [0.71719, 0.78281] and so still no coverage, but *above* the [0.46719, 0.53281] the ramp
         // would sit at if the field's zero level moved from 192 to 128. So this one pixel
         // separates two mutations: the channel and the edge.
@@ -2091,8 +2141,8 @@ fn cases() -> Vec<Case> {
         //   encoded as deriv / 8 + 0.5  ->  (194, 144, 255, 255)
         //
         // The DEM's two axes carry different weights on purpose. With a pure gradient in `x` the
-        // `y` derivative is nought, and reversing the kernel's rows -- the hillshade defect
-        // everybody ships once -- would read nought either way. Here it reads 111 instead of 144.
+        // `y` derivative is zero, and reversing the kernel's rows -- the hillshade defect
+        // everybody ships once -- would read zero either way. Here it reads 111 instead of 144.
         Case {
             name: "hillshade_prep",
             at: (SIDE / 2, SIDE / 2),
@@ -2110,7 +2160,7 @@ fn cases() -> Vec<Case> {
                     &[
                         ("unpack", At::F(&[1.0, 0.0, 0.0, 0.0])),
                         ("dimension", At::F(&[4.0, 4.0])),
-                        // At or above 15 the exaggeration term is nought, which keeps the
+                        // At or above 15 the exaggeration term is zero, which keeps the
                         // expectation to one power of two. A zoom of 21 is what scales the
                         // derivative into a readable part of the channel.
                         ("zoom", At::F(&[21.0])),
@@ -2133,7 +2183,7 @@ fn cases() -> Vec<Case> {
         // whose answer can be derived without a page of trigonometry.
         //
         //   a coordinate of 3072 is uv 0.375, and the body flips `v`  ->  texel (1, 2)
-        //   the latitude there is 0.625 of the way from nought to 60, so 37.5 degrees, whose
+        //   the latitude there is 0.625 of the way from zero to 60, so 37.5 degrees, whose
         //     cosine is 0.79335 -- the Mercator scale, because a pixel that far north covers less
         //     ground and the same rise over it is a steeper real slope
         //   that texel is (144, 128), so deriv = (0.51765, 0.00784) / 0.79335 and the slope the
@@ -2164,7 +2214,7 @@ fn cases() -> Vec<Case> {
                 block(
                     &HILLSHADE_TILE_PROPS_UBO,
                     &[
-                        // A real latitude, not nought. At nought the cosine is one and dividing
+                        // A real latitude, not zero. At zero the cosine is one and dividing
                         // by it is the identity, so a body that dropped the Mercator scale draws
                         // the same pixel -- that mutation survived until this was 60.
                         ("latrange", At::F(&[60.0, 0.0])),
@@ -2397,7 +2447,7 @@ fn cases() -> Vec<Case> {
                 shorts(&COVERING),
                 ushorts(&[0, 0, 8, 8, 0, 0, 8, 8, 0, 0, 8, 8]),
                 ushorts(&[8, 8, 16, 16, 8, 8, 16, 16, 8, 8, 16, 16]),
-                // Nought to a half over a factor of one, so the opacity is a half and both the
+                // Zero to a half over a factor of one, so the opacity is a half and both the
                 // endpoint order and the factor are under test.
                 per_vertex(&[0.0, 0.5], 3),
             ],
@@ -2438,6 +2488,213 @@ fn cases() -> Vec<Case> {
             ubo_index: 0,
             pass: None,
             absent: &[],
+            instanced: None,
+            expect: [48, 24, 64, 64],
+        },
+        // The same tiled fill drawn at the *second* entry of its blocks, which is where the
+        // fragment stage's own slot becomes visible.
+        //
+        // `ubo_index` is a private variable the vertex stage copies `firstInstance` into, and a
+        // fragment invocation has its own copy of a private -- zero, whatever the vertex stage
+        // wrote. So a fragment stage reading `fill_pattern_tile_props_ubo[ubo_index]` reads the
+        // *first* drawable's tile properties, and a patterned fill of more than one tile samples
+        // every tile against the first tile's atlas size. The tile block is per drawable:
+        // `ubo::pack_pattern_tile_props` is "one entry per drawable".
+        //
+        // Only the atlas size is decoyed, because only the atlas size is read there -- the
+        // rectangles reach the fragment through `Out` either way. Entry zero's is 32 against
+        // entry one's 16, which halves the texture coordinate:
+        //
+        //   clean, the atlas size at the draw's own slot  ->  texel 6, [48, 24, 64, 64]
+        //   the atlas size at entry zero                  ->  texel 3, [24, 12, 64, 64]
+        //
+        // `drawable_at_one` is the vertex stage's half of this and is a family whose fragment
+        // reads no block at all; `tests/shaders.rs`'s `a_fragment_stage_carries_the_slot_it_reads_by`
+        // is the same claim over the other seven bodies.
+        Case {
+            name: "fill_pattern_at_one",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillPatternShader as i32,
+            wire: PLANE,
+            layout: Layout::PerAttribute,
+            streams: vec![
+                shorts(&COVERING),
+                ushorts(&[0, 0, 8, 8, 0, 0, 8, 8, 0, 0, 8, 8]),
+                ushorts(&[8, 8, 16, 16, 8, 8, 16, 16, 8, 8, 16, 16]),
+                per_vertex(&[0.0, 0.5], 3),
+            ],
+            uniforms: vec![
+                // The same fields in both entries: the decoy is in the tile block below, so a
+                // wrong slot here draws rather than blanks.
+                [
+                    block(
+                        &FILL_PATTERN_DRAWABLE_UBO,
+                        &[
+                            ("matrix", At::F(&CLIP)),
+                            ("pixel_coord_upper", At::F(&[1001.0, 1001.0])),
+                            ("pixel_coord_lower", At::F(&[7.0, 7.0])),
+                            ("tile_ratio", At::F(&[500.0])),
+                            ("opacity_t", At::F(&[1.0])),
+                        ],
+                    ),
+                    block(
+                        &FILL_PATTERN_DRAWABLE_UBO,
+                        &[
+                            ("matrix", At::F(&CLIP)),
+                            ("pixel_coord_upper", At::F(&[1001.0, 1001.0])),
+                            ("pixel_coord_lower", At::F(&[7.0, 7.0])),
+                            ("tile_ratio", At::F(&[500.0])),
+                            ("opacity_t", At::F(&[1.0])),
+                        ],
+                    ),
+                ]
+                .concat(),
+                [
+                    block(
+                        &FILL_PATTERN_TILE_PROPS_UBO,
+                        &[("texsize", At::F(&[32.0, 32.0]))],
+                    ),
+                    block(
+                        &FILL_PATTERN_TILE_PROPS_UBO,
+                        &[("texsize", At::F(&[16.0, 16.0]))],
+                    ),
+                ]
+                .concat(),
+                block(
+                    &FILL_EVALUATED_PROPS_UBO,
+                    &[
+                        ("fade", At::F(&[0.0])),
+                        ("from_scale", At::F(&[2.5])),
+                        ("to_scale", At::F(&[2.5])),
+                    ],
+                ),
+                block(&GLOBAL_PAINT_PARAMS_UBO, &[("pixel_ratio", At::F(&[2.0]))]),
+            ],
+            images: vec![Image::new(16, |x, y| {
+                [
+                    u8::try_from(x * 16).unwrap_or(255),
+                    u8::try_from(y * 8).unwrap_or(255),
+                    128,
+                    128,
+                ]
+            })],
+            vertices: 3,
+            ubo_index: 1,
+            pass: None,
+            absent: &[],
+            instanced: None,
+            expect: [48, 24, 64, 64],
+        },
+        // The same tiled fill with its sprite *constant*, which is a different module and the one
+        // a plain `fill-pattern: grass_pattern` selects.
+        //
+        // A pattern given as a name rather than as an expression over a feature's field is one
+        // value for the layer, so mbgl sends no attribute -- `HAS_UNIFORM_u_pattern_from` -- and
+        // reads `FillPatternTilePropsUBO.pattern_from` instead. That block is per *drawable*,
+        // which makes this the only constant arm in the matrix that is not read at entry zero:
+        // the sprite is resolved against the frame's atlas per tile.
+        //
+        // The expectation is the case above's, deliberately. The two modules are one family and
+        // the rectangle is the same rectangle, so the arm that reads it out of the block has to
+        // land on the texel the arm that reads it off an attribute does -- and any other answer
+        // is a wrong rectangle rather than a rounding difference.
+        //
+        // Entry zero carries a decoy rectangle, and the three pixels are all distinct:
+        //
+        //   clean, the rectangle at the draw's own slot  ->  texel  6, [48, 24, 64, 64]
+        //   the rectangle read at entry zero             ->  texel 10, [80, 40, 64, 64]
+        //   `pattern_to` read in its place               ->  texel 14, [112, 56, 64, 64]
+        //
+        // The atlas size is the same in both entries here: `fill_pattern_at_one` is the case that
+        // decoys it, and it is the fragment stage's half rather than this arm's.
+        Case {
+            name: "fill_pattern_constant",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillPatternShader as i32,
+            wire: PLANE,
+            layout: Layout::PerAttribute,
+            // The two rectangles' streams keep their place and are empty; the opacity still
+            // arrives, so this case is the rectangles' arm alone.
+            // The two rectangles' streams keep their place and are empty; the opacity still
+            // arrives, which is what leaves a *hole* in the bound locations -- and that hole is
+            // the second thing this case is for.
+            streams: vec![
+                shorts(&COVERING),
+                Vec::new(),
+                Vec::new(),
+                per_vertex(&[0.0, 0.5], 3),
+            ],
+            uniforms: vec![
+                // Two entries whose fields are the same but for the slot: what this case is about
+                // is the *tile* block's slot, and `drawable_at_one` is where the drawable block's
+                // own is under test.
+                // Two entries whose fields are the same but for the slot: what this case is about
+                // is the *tile* block's slot, and `drawable_at_one` is where the drawable block's
+                // own is under test.
+                [
+                    block(
+                        &FILL_PATTERN_DRAWABLE_UBO,
+                        &[
+                            ("matrix", At::F(&CLIP)),
+                            ("pixel_coord_upper", At::F(&[1001.0, 1001.0])),
+                            ("pixel_coord_lower", At::F(&[7.0, 7.0])),
+                            ("tile_ratio", At::F(&[500.0])),
+                            ("opacity_t", At::F(&[1.0])),
+                        ],
+                    ),
+                    block(
+                        &FILL_PATTERN_DRAWABLE_UBO,
+                        &[
+                            ("matrix", At::F(&CLIP)),
+                            ("pixel_coord_upper", At::F(&[1001.0, 1001.0])),
+                            ("pixel_coord_lower", At::F(&[7.0, 7.0])),
+                            ("tile_ratio", At::F(&[500.0])),
+                            ("opacity_t", At::F(&[1.0])),
+                        ],
+                    ),
+                ]
+                .concat(),
+                [
+                    block(
+                        &FILL_PATTERN_TILE_PROPS_UBO,
+                        &[
+                            ("pattern_from", At::F(&[4.0, 4.0, 12.0, 12.0])),
+                            ("pattern_to", At::F(&[0.0, 0.0, 8.0, 8.0])),
+                            ("texsize", At::F(&[16.0, 16.0])),
+                        ],
+                    ),
+                    block(
+                        &FILL_PATTERN_TILE_PROPS_UBO,
+                        &[
+                            ("pattern_from", At::F(&[0.0, 0.0, 8.0, 8.0])),
+                            ("pattern_to", At::F(&[8.0, 8.0, 16.0, 16.0])),
+                            ("texsize", At::F(&[16.0, 16.0])),
+                        ],
+                    ),
+                ]
+                .concat(),
+                block(
+                    &FILL_EVALUATED_PROPS_UBO,
+                    &[
+                        ("fade", At::F(&[0.0])),
+                        ("from_scale", At::F(&[2.5])),
+                        ("to_scale", At::F(&[2.5])),
+                    ],
+                ),
+                block(&GLOBAL_PAINT_PARAMS_UBO, &[("pixel_ratio", At::F(&[2.0]))]),
+            ],
+            images: vec![Image::new(16, |x, y| {
+                [
+                    u8::try_from(x * 16).unwrap_or(255),
+                    u8::try_from(y * 8).unwrap_or(255),
+                    128,
+                    128,
+                ]
+            })],
+            vertices: 3,
+            ubo_index: 1,
+            pass: None,
+            absent: &[1, 2],
             instanced: None,
             expect: [48, 24, 64, 64],
         },
@@ -2664,7 +2921,7 @@ fn cases() -> Vec<Case> {
         //
         // # Why the patch is not at the middle of the world
         //
-        // At mercator (0.5, 0.5) the latitude and the longitude are both nought, and the bend is
+        // At mercator (0.5, 0.5) the latitude and the longitude are both zero, and the bend is
         // locally a scaled identity -- so a small patch there cannot be told from its own
         // linearization, and a large one covers the whole target whatever the bend does. Worse,
         // the point is a symmetry of three plausible mistakes at once: negating the sphere's `y`,
@@ -2730,7 +2987,7 @@ fn cases() -> Vec<Case> {
                     &GLOBE_CAMERA_UBO,
                     &[(
                         // Ten times the unit sphere, with the patch's own point brought to the
-                        // origin. The third column is nought: a sphere's `z` is depth this case
+                        // origin. The third column is zero: a sphere's `z` is depth this case
                         // does not test, and leaving it in would push the patch out of clip.
                         "globe_matrix",
                         At::F(&[
@@ -2772,7 +3029,7 @@ fn cases() -> Vec<Case> {
         // toss against the rasterizer's own fill rule.
         //
         // Not checked: `d_h`, the lift per meter above the surface. A fill hands `place` a third
-        // component of nought, so the term is multiplied away -- it is the extrusions' alone, and
+        // component of zero, so the term is multiplied away -- it is the extrusions' alone, and
         // this probe has no extrusion on a bent surface.
         Case {
             name: "fill_anchored",
@@ -2787,13 +3044,13 @@ fn cases() -> Vec<Case> {
                 per_vertex(&[1.0, 1.0], 3),
             ],
             uniforms: vec![
-                // The drawable's matrix is not read by this placement, so it is left at nought.
+                // The drawable's matrix is not read by this placement, so it is left at zero.
                 block(&FILL_DRAWABLE_UBO, &[("color_t", At::F(&[0.0]))]),
                 block(&FILL_EVALUATED_PROPS_UBO, &[]),
                 block(
                     &GLOBE_BEND_UBO,
                     &[
-                        // Not the origin: with the anchor at nought a body that dropped it entirely
+                        // Not the origin: with the anchor at zero a body that dropped it entirely
                         // draws the same picture, and that mutation survived until this moved.
                         ("anchor", At::F(&[0.1, -0.05, 0.0, 1.0])),
                         ("d_u", At::F(&[2.0e-4, 0.0, 0.0, 0.0])),
@@ -2916,7 +3173,7 @@ fn cases() -> Vec<Case> {
         // quad sits at cols 13 to 26 and rows 6 to 19; with the sign flipped it goes off the top
         // right; with the drop scaled by the exaggeration it moves a hundredth as far; and reading
         // `skirt.x` instead of `.z` -- 0.6 rather than 0.2, which is why it is not zero -- takes it
-        // off the screen to the left. `skirt.y` is nought here, so reading that draws the
+        // off the screen to the left. `skirt.y` is zero here, so reading that draws the
         // uncurtained triangle.
         Case {
             name: "raster_raised_skirt",
@@ -3054,7 +3311,7 @@ fn cases() -> Vec<Case> {
                     ("params", At::F(&[0.1, 0.3, 0.3, 0.01])),
                     // The ground's own skirt, the center the height is measured from, and the
                     // layer seam only a surface reads. The first is non-zero with every flag at
-                    // nought so that a drop applied unconditionally moves the triangle.
+                    // zero so that a drop applied unconditionally moves the triangle.
                     ("skirt", At::F(&[0.15, 20.0, 0.4, 0.0])),
                 ],
             )],
@@ -3076,7 +3333,7 @@ fn cases() -> Vec<Case> {
         // The ground's own curtain, which is a fifth of a tile rather than the two pixels a layer
         // on the ground hangs.
         //
-        // Isolated the way `raster_raised_skirt` isolates the layer's: `unpack` is nought, so the
+        // Isolated the way `raster_raised_skirt` isolates the layer's: `unpack` is zero, so the
         // DEM contributes no height and the only thing reaching `position.z` is the skirt. The
         // matrix is the case above's.
         //
@@ -3087,7 +3344,7 @@ fn cases() -> Vec<Case> {
         // Pixel (4, 26) is inside that and inside none of the wrong ones: with no drop the quad
         // sits at (11.2, 20.8), (30.4, 20.8), (11.2, 1.6); with the sign flipped it goes off the
         // bottom right; with the drop scaled by the exaggeration it moves a hundredth as far;
-        // reading `skirt.z` -- 0.4, which is why it is not nought -- takes it off the screen to the
+        // reading `skirt.z` -- 0.4, which is why it is not zero -- takes it off the screen to the
         // left; and reading `skirt.y`, or the padding short beside the flag, draws the uncurtained
         // triangle. It sits 5.3 px inside the right triangle and 8.6 from the nearest wrong one.
         //
@@ -3125,7 +3382,7 @@ fn cases() -> Vec<Case> {
                 ],
             )],
             // The DEM, which `unpack` weights at nothing. Bound because the body samples it and an
-            // unbound sampler is undefined rather than nought.
+            // unbound sampler is undefined rather than zero.
             images: vec![Image::new(4, |_, _| [128, 128, 128, 255])],
             vertices: 3,
             ubo_index: 0,
@@ -3814,7 +4071,7 @@ struct Bound<'a> {
     ///
     /// `None` for every case but the walls, where it carries both halves of what a draw of more
     /// than one instance needs: `ubo_index` cannot travel in `firstInstance` then, so it goes in a
-    /// push constant and the draw starts at instance nought.
+    /// push constant and the draw starts at instance zero.
     instanced: Option<(u32, vk::DescriptorSet)>,
 }
 
@@ -3857,7 +4114,7 @@ impl Probe<'_> {
                             None => record.draw(bound.vertices, 1, bound.ubo_index),
                             // And where it cannot be, because it also addresses the instance-rate
                             // attribute fetch: the slot goes in a push constant, the drawable's
-                            // own instance buffer in group one, and the draw starts at nought.
+                            // own instance buffer in group one, and the draw starts at zero.
                             Some((instances, set)) => {
                                 record.bind_descriptor_set_at(1, bound.layout, set);
                                 record.push_constants(bound.layout, &bound.ubo_index.to_le_bytes());

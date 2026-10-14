@@ -395,7 +395,7 @@ pub fn content(
 
             // Per drawable, for the family that cannot put its slot in `firstInstance`: the
             // instance buffer is this geometry's own, so its set is too, and `ubo_index` goes in
-            // a push constant. The draw then starts at instance nought, which is what makes the
+            // a push constant. The draw then starts at instance zero, which is what makes the
             // instance-rate attributes fetch from the start of that buffer.
             let slot = if found.per_drawable {
                 let instances = scene

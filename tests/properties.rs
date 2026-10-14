@@ -27,30 +27,60 @@ fn attributes(family: &Family) -> Vec<&ShaderAttribute> {
         .collect()
 }
 
-/// Whether an attribute's declared type is the shape a data-driven paint property arrives in.
+/// Whether an attribute's declared type is the shape a *zoom pair* arrives in.
 ///
-/// mbgl sends such a property as its value at *two* zoom levels, to be mixed by the `_t` in the
+/// mbgl sends such a property as its value at two zoom levels, to be mixed by the `_t` in the
 /// drawable block: a scalar becomes `Float2` and a color becomes `Float4`, four floats holding two
 /// colors with each color's channels folded in pairs. So the declared type is what says a property
-/// is data-driven, and it says it for every family without a list -- which is why this is the test
+/// interpolates, and it says it for every family without a list -- which is why this is the test
 /// and not a table.
 ///
 /// Nothing else in any of mbgl's thirty-six tables declares either type. Geometry is `Short2`,
 /// `Short4` or `UShort2`, a line's packed data is `UByte4`, a pattern's corners are `UShort4`, a
 /// symbol's projected position is `Float3` and its fade is a bare `Float`.
-fn is_paint(attribute: &ShaderAttribute) -> bool {
+fn is_pair(attribute: &ShaderAttribute) -> bool {
     matches!(
         attribute.declared,
         AttributeDataType::Float2 | AttributeDataType::Float4
     )
 }
 
+/// Whether the attribute is a sprite rectangle, which is a paint property and not a zoom pair.
+///
+/// The one exception to [`is_pair`], and it cannot be read off the declared type: a pattern's
+/// corners are `UShort4` and so is `idSymbolDataVertexAttribute`, which is geometry mbgl sends
+/// unconditionally. What separates them is the guard -- `#if !defined(HAS_UNIFORM_u_pattern_from)`
+/// -- so the name is what is matched here.
+///
+/// It is the *whole* exception, checked rather than assumed: every vertex input any of mbgl's
+/// Vulkan shaders declares behind a `HAS_UNIFORM_` guard is a `vec2` or a `vec4` but for
+/// `in_pattern_from` and `in_pattern_to`, which are `uvec4` wherever they appear. And a rectangle
+/// cannot be a pair for the reason the arm does not mix: halfway between two sprites' corners
+/// contains neither sprite.
+fn is_pattern(attribute: &ShaderAttribute) -> bool {
+    attribute.name.ends_with("PatternFromVertexAttribute")
+        || attribute.name.ends_with("PatternToVertexAttribute")
+}
+
+/// Whether the attribute carries a paint property at all, under either shape.
+fn is_paint(attribute: &ShaderAttribute) -> bool {
+    is_pair(attribute) || is_pattern(attribute)
+}
+
 /// The WGSL type the two arms of such an attribute return.
 fn returns(attribute: &ShaderAttribute) -> &'static str {
     match attribute.declared {
-        AttributeDataType::Float4 => "vec4<f32>",
+        AttributeDataType::Float4 | AttributeDataType::UShort4 => "vec4<f32>",
         _ => "f32",
     }
+}
+
+/// The attribute a property is the two arms of, by the location they share.
+fn attribute_at(family: &Family, location: u32) -> &ShaderAttribute {
+    attributes(family)
+        .into_iter()
+        .find(|attribute| u32::try_from(attribute.binding).is_ok_and(|at| at == location))
+        .unwrap_or_else(|| panic!("{}: no attribute at location {location}", family.name))
 }
 
 /// Every data-driven attribute has an entry, and nothing else does.
@@ -130,17 +160,7 @@ fn each_arm_names_its_own_attribute_and_its_own_block() {
             .filter_map(|tail| tail.split(':').next())
             .collect();
         for property in family.properties {
-            let attribute = attributes(family)
-                .into_iter()
-                .find(|attribute| {
-                    u32::try_from(attribute.binding).is_ok_and(|at| at == property.location)
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{}: no attribute at location {}",
-                        family.name, property.location
-                    )
-                });
+            let attribute = attribute_at(family, property.location);
             let named = format!("in.{}", attribute_name(attribute.name));
             assert!(
                 property.varies.contains(&named),
@@ -148,13 +168,26 @@ fn each_arm_names_its_own_attribute_and_its_own_block() {
                 family.name,
                 property.name
             );
+            // A zoom pair has to be mixed and a sprite rectangle must not be: the attribute's own
+            // shape decides which, and both directions are a defect that draws. A pair read
+            // without its `_t` is the lower endpoint at every zoom, and a rectangle mixed with
+            // one is a window into the sheet that contains neither sprite.
             let interpolation = format!(".{}_t", property.name);
-            assert!(
-                property.varies.contains(&interpolation),
-                "{} {}: the varying arm does not mix by {interpolation}",
-                family.name,
-                property.name
-            );
+            if is_pair(attribute) {
+                assert!(
+                    property.varies.contains(&interpolation),
+                    "{} {}: the varying arm does not mix by {interpolation}",
+                    family.name,
+                    property.name
+                );
+            } else {
+                assert!(
+                    !property.varies.contains(&interpolation) && !property.varies.contains("mix_"),
+                    "{} {}: the varying arm mixes a rectangle between two zoom endpoints",
+                    family.name,
+                    property.name
+                );
+            }
             assert_eq!(
                 property.returns,
                 returns(attribute),
@@ -234,6 +267,12 @@ fn each_arm_names_its_own_attribute_and_its_own_block() {
 fn every_interpolation_is_a_field_of_a_declared_block() {
     for family in ALL {
         for property in family.properties {
+            // The rectangles have none to check: `FillPatternDrawableUBO` carries
+            // `pattern_from_t` and mbgl reads it nowhere, so what this test asks of the others
+            // would pass here for a field that exists and is dead.
+            if !is_pair(attribute_at(family, property.location)) {
+                continue;
+            }
             let wanted = format!("{}_t", property.name);
             assert!(
                 family

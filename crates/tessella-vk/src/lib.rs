@@ -318,7 +318,7 @@ impl<'d> Gpu<'d> {
     /// which is what those modules declare. A family drawn with instance-rate attributes adds a
     /// second: its per-drawable resources cannot sit in a set shared by the layer.
     ///
-    /// `push_constant_bytes` is nought for every family but those, where it is the four bytes of
+    /// `push_constant_bytes` is zero for every family but those, where it is the four bytes of
     /// `ubo_index`. That number rides `firstInstance` everywhere else, which it cannot do on a
     /// draw of more than one instance -- `tessella_emblema::draws` says why, and
     /// `benches/instance_fetch.rs` measures it. Visible to the vertex stage alone, which is the

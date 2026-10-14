@@ -99,8 +99,8 @@ fn the_wire_resolves_a_drawn_shader_and_skips_the_rest() {
 ///
 /// Not checked here by calling `module`: that only concatenates text and returns `Ok` for a body
 /// naming a binding nothing declared, so an assembly check that stopped there would pass a table
-/// entry missing a block. `every_family_on_every_surface_compiles` takes all 61 pairs through
-/// naga, which is what actually catches it.
+/// entry missing a block. `every_family_on_every_surface_compiles` takes all sixty-six pairs
+/// through naga, which is what actually catches it.
 #[test]
 fn every_family_claims_a_surface() {
     for entry in ALL {
@@ -169,21 +169,23 @@ fn only_the_walls_are_drawn_per_instance() {
     assert_eq!(shared, vec!["idFillExtrusionInstanced"; 2]);
 }
 
-/// A family is found by the id the wire carries, and the table can hold one mbgl has no name for.
+/// A family is found by the id the wire carries, and the table holds one mbgl has no name for.
 ///
-/// `Family::shader` was a `BuiltIn` and is the `i32` the wire carries. For the twenty families here
-/// that is the same set of values -- every one of them is an mbgl shader and this checks it -- and
-/// what it buys is the one that is not: mbgl has no terrain, so the ground's id is tessella's own
-/// `BUILTIN_TERRAIN_SHADER`, which is 128 and past the enum's thirty-six. `BuiltIn::from_repr`
-/// answers `None` for it, so a lookup that decoded first could never find such a family however the
-/// table was written.
+/// `Family::shader` was a `BuiltIn` and is the `i32` the wire carries. For the twenty families mbgl
+/// declares that is the same set of values -- every one of them is an mbgl shader and this checks
+/// it -- and what it buys is the one that is not: mbgl has no terrain, so the ground's id is
+/// tessella's own `BUILTIN_TERRAIN_SHADER`, which is 128 and past the enum's thirty-six.
+/// `BuiltIn::from_repr` answers `None` for it, so a lookup that decoded first could never find it
+/// however the table was written.
 ///
-/// The ground is not in the table yet. What this pins is that the question can be *asked*: `for_wire`
-/// compares the id, so adding it is a table entry rather than a change to the lookup.
+/// Both directions: the ground is found by the wire's own id and is the only family mbgl has no
+/// shader for, and every other family is found by its id *and* by its own `BuiltIn`. An entry that
+/// quietly took an mbgl shader's id would be found twice and draw as that family.
 #[test]
 fn a_family_is_found_by_the_id_the_wire_carries() {
     use tessella_capture_abi::terrain_ubo::BUILTIN_TERRAIN_SHADER;
 
+    let mut not_mbgls = Vec::new();
     for entry in ALL {
         let found = for_wire(entry.shader).unwrap_or_else(|| {
             panic!(
@@ -192,8 +194,10 @@ fn a_family_is_found_by_the_id_the_wire_carries() {
             )
         });
         assert_eq!(found.name, entry.name, "two families share an id");
-        let decoded = BuiltIn::from_repr(entry.shader)
-            .unwrap_or_else(|| panic!("{} is not one of mbgl's shaders", entry.name));
+        let Some(decoded) = BuiltIn::from_repr(entry.shader) else {
+            not_mbgls.push(entry.name);
+            continue;
+        };
         assert_eq!(
             family(decoded).map(|found| found.name),
             Some(entry.name),
@@ -208,7 +212,12 @@ fn a_family_is_found_by_the_id_the_wire_carries() {
     );
     assert_eq!(
         for_wire(BUILTIN_TERRAIN_SHADER).map(|found| found.name),
-        None,
-        "the ground is not in the table yet"
+        Some("terrain"),
+        "the ground is in the table and the wire's own id does not find it"
+    );
+    assert_eq!(
+        not_mbgls,
+        vec!["terrain"],
+        "the ground is the one family mbgl has no shader for"
     );
 }

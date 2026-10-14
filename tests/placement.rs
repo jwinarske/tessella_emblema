@@ -4,7 +4,7 @@
 //! Two decisions, taken in two places because they rest on different things. [`Surface::of`] reads
 //! the wire -- the view's `ProjectionMode`, the drawable's `ON_TERRAIN` bit, and whether its layer
 //! was sent a bend block -- and names the surface the *producer* asked for. `Family::surface` then
-//! narrows that to one this crate has a module for, because only sixty-five of the eighty
+//! narrows that to one this crate has a module for, because only sixty-six of the eighty-four
 //! (family, surface) pairs exist.
 //!
 //! Neither decision is observable in a pixel on its own: a surface shows up as *where* geometry
@@ -122,7 +122,7 @@ fn only_the_terrain_bit_raises_a_drawable() {
 ///
 /// The producer marks a drawable raised wherever a ground covers its tile, whatever family draws
 /// it, and sends a bend block for every layer whose geometry is a tile's. So a family is asked for
-/// pairs that are not among the sixty-five, and what it must never do is be handed one: a module
+/// pairs that are not among the sixty-six, and what it must never do is be handed one: a module
 /// is assembled per pair, and a pair with no module is a pipeline built against bindings nothing
 /// wrote.
 #[test]
@@ -211,6 +211,8 @@ fn the_fallback_chain_ends_at_a_plane() {
 ///   whatever the camera does, which is not a loss: a target of one's own has no camera.
 /// * A background is drawn on a plane where its drawable is raised, because it covers the viewport
 ///   rather than a tile and is never raised in the first place.
+/// * The ground is drawn on a plane whatever is asked for, and nothing is lost there either: it is
+///   the surface, and its own body raises it from its own block.
 ///
 /// The extrusions used to be the fourth and are not any more: they had no raised module, so a
 /// terrain style drew its buildings on the Mercator plane while the ground under them lifted. That
@@ -245,6 +247,17 @@ fn a_missing_module_falls_where_the_producer_says() {
     // declare the direct bend, so a chain stepping from a terrain through the bend instead of
     // straight to the plane would draw one on a sphere in a Mercator frame.
     assert_eq!(named("background").surface(raised), Surface::Plane);
+    // And the ground, which is a plane for neither of those reasons: it is the surface. The
+    // producer leaves its own drawables unflagged, so a plane is what it is asked for -- and asked
+    // for anything else it must still answer a plane, because `Surface::Terrain` would read the
+    // elevation at a slot this family does not declare and add the height a second time.
+    for asked in Surface::ALL {
+        assert_eq!(
+            named("terrain").surface(asked),
+            Surface::Plane,
+            "the ground asked for {asked:?} is drawn somewhere else"
+        );
+    }
     assert_eq!(named("heatmap_texture").surface(raised), Surface::Plane);
     assert_eq!(
         named("heatmap_texture").surface(bent),

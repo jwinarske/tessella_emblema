@@ -101,12 +101,31 @@
 //! `surface::TERRAIN_ELEVATION_SLOT`, and 12.8% of the frame's pixels differ from the flat one --
 //! the relief, which is what a raise is.
 //!
-//! **Sixteen of its seventeen batches draw.** The seventeenth is the ground itself, which arrives
-//! as `terrain_ubo::BUILTIN_TERRAIN_SHADER` and which `families::ALL` has no entry for: the layers
-//! standing on the surface draw and the surface under them does not. That is why the recording's
-//! count is checked against the batches that *resolved to a program* rather than against all of
-//! them -- `record::content`'s own note names the case, "a batch this consumer does not draw, which
-//! is a real case".
+//! **All seventeen of its batches draw**, in 8 families and 15 pipelines, 55 drawables and 55
+//! draws with none undrawn. The seventeenth used to be the ground itself -- it arrives as
+//! `terrain_ubo::BUILTIN_TERRAIN_SHADER`, which `families::ALL` had no entry for, so the layers
+//! standing on the surface drew and the surface under them did not. The recording's count is still
+//! checked against the batches that *resolved to a program* rather than against all of them,
+//! because that is a real case whether or not this capture has one: `record::content`'s own note
+//! names it, "a batch this consumer does not draw, which is a real case".
+//!
+//! # The ground drew and this frame is byte-identical, which is the right answer
+//!
+//! Bare ground is painted the style's `background-color` -- the spec gives terrain no paint of its
+//! own -- and the background layer covers the viewport with that same color under it. So the ground
+//! of *this* capture changes no pixel, and the frame before the family existed and the frame after
+//! it compare equal byte for byte.
+//!
+//! Measured against a control rather than argued: the same tile and DEM through the same style with
+//! its background layer removed, where the ground's color falls back to the spec default black and
+//! nothing else covers the view. That capture is 11 batches, ten of them raised, and the clear
+//! shows through 614,532 of its 786,432 pixels with the ground drawn against 703,062 with the
+//! family taken back out of the table. The 88,530 between them are the bare ground, which is what
+//! this capture paints the background's color over.
+//!
+//! Where a pixel does say the ground's own arithmetic is right is `benches/first_pixel.rs`:
+//! `terrain` reads a pixel that only the right elevation covers, and `terrain_skirt` one that only
+//! the right curtain does.
 //!
 //! The tile is the parity harness's own, off `serve.sh` on 8080, and has to be decompressed: the
 //! server sends it gzipped and the decoder refuses that with "wire type 7 at byte 0 is a group".
@@ -508,7 +527,11 @@ fn run(path: &str) -> Result<(), String> {
                 continue;
             };
             let add = &drawable.geometry.add;
-            let Some(family) = add.builtin_shader().and_then(families::family) else {
+            // By the id the wire carries, not by decoding it: the ground's is tessella's own 128
+            // and `BuiltIn::from_repr` answers `None` for it, so a lookup that decoded first
+            // refused the one family mbgl has no shader for -- which is what this said when it
+            // reported "geometry 1 names shader 128, which has no family here".
+            let Some(family) = families::for_wire(*shader) else {
                 refused.push(format!(
                     "geometry {} names shader {shader}, which has no family here",
                     geometry.0

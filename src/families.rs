@@ -10,9 +10,11 @@
 //! layer's own source, not a style and not the wire -- and because it is the kind of fact this
 //! table exists to hold, transcribed once and pinned.
 //!
-//! Keyed by [`BuiltIn`] rather than by a name, because the wire names a shader and nothing on the
-//! wire carries a name. A consumer that had to map a discriminant to a family itself would be
-//! holding the half of this crate's knowledge that is hardest to check.
+//! Keyed by the shader id rather than by a name, because the wire names a shader and nothing on
+//! the wire carries a name. A consumer that had to map a discriminant to a family itself would be
+//! holding the half of this crate's knowledge that is hardest to check. Twenty of the ids are
+//! mbgl's [`BuiltIn`] discriminants and the twenty-first is tessella's own: mbgl has no terrain,
+//! so the ground is a family here with no counterpart there -- see [`Family::shader`].
 //!
 //! # What is not here
 //!
@@ -50,6 +52,9 @@ use tessella_capture_abi::generated::ubo_layouts::{
     RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO,
     SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
+use tessella_capture_abi::terrain_ubo::{
+    BUILTIN_TERRAIN_SHADER, TERRAIN_MESH_ATTRIBUTES, TERRAIN_MESH_ELEVATION_SLOT,
+};
 
 use crate::pipelines::Blend;
 use crate::shaders::{
@@ -57,9 +62,9 @@ use crate::shaders::{
     FILL_EXTRUSION_BODY, FILL_EXTRUSION_INSTANCED_BODY, FILL_OUTLINE_BODY,
     FILL_OUTLINE_TRIANGULATED_BODY, FILL_PATTERN_BODY, HEATMAP_BODY, HEATMAP_TEXTURE_BODY,
     HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_BODY, LINE_PATTERN_BODY, Paint, Property,
-    RASTER_BODY, SYMBOL_ICON_BODY, SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY,
+    RASTER_BODY, SYMBOL_ICON_BODY, SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY, TERRAIN_BODY,
 };
-use crate::surface::Surface;
+use crate::surface::{Surface, TERRAIN_DRAWABLE_UBO};
 
 /// How a family's draws composite over the target, which is mbgl's `setColorMode`.
 ///
@@ -69,7 +74,7 @@ use crate::surface::Surface;
 /// the family and belongs here beside the blocks and the tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Composite {
-    /// One mode, whatever the pass. Thirteen of the twenty.
+    /// One mode, whatever the pass. Fourteen of the twenty-one.
     Fixed(Blend),
     /// [`Blend::Alpha`] where the pass is translucent and [`Blend::Unblended`] where it is not.
     ///
@@ -119,6 +124,35 @@ const FLAT: &[Surface] = &[Surface::Plane];
 /// anchored bend -- and `tests/shaders.rs` holds that rule from both sides.
 const LIFTS_A_HEIGHT: &[Surface] = &[Surface::Plane, Surface::GlobeAnchored, Surface::Terrain];
 
+/// A plane alone, for the family that *is* a surface.
+///
+/// The ground, and not [`FLAT`]'s reason: nothing offscreen here. A ground is drawn in a Mercator
+/// frame and only there -- `Map::surface` takes the globe where a style asks for both, so the
+/// producer sends no ground at all on a sphere and there is no pair to have. And it is not
+/// [`Surface::Terrain`] either, which is what a drawable *standing* on the ground is placed on: the
+/// ground raises itself out of its own block, from an elevation that arrives at its own slot.
+const THE_GROUND: &[Surface] = &[Surface::Plane];
+
+/// The ground's one texture: its own DEM, at the slot the ABI publishes for this family.
+///
+/// Written here because nothing generates it -- the generator mirrors mbgl's shaders and mbgl has
+/// no terrain -- and in the shape the generated tables take, so the module, the set layout and the
+/// placement of an arriving `TextureRef` all read it the way they read every other family's.
+///
+/// The slot is [`TERRAIN_MESH_ELEVATION_SLOT`] rather than
+/// [`crate::surface::TERRAIN_ELEVATION_SLOT`], and the two are different numbers for the same
+/// picture: a raised mbgl family's elevation has to clear the slots its own generated table uses,
+/// and this family declares one texture and has nothing to clear. The ABI holds both constants
+/// beside each other and a test there pins the order.
+///
+/// `texture_id` is mbgl's shader-side id and this family has none, so it is nought. Nothing here
+/// reads it -- the slot is `binding`, and the name is what the module declares.
+static TERRAIN_MESH_TEXTURES: [ShaderTexture; 1] = [ShaderTexture {
+    binding: TERRAIN_MESH_ELEVATION_SLOT,
+    texture_id: 0,
+    name: "idElevationTexture",
+}];
+
 /// One family's module parts.
 #[derive(Debug, Clone, Copy)]
 pub struct Family {
@@ -150,7 +184,7 @@ pub struct Family {
     /// The data-driven paint properties, each of which the module declares as a `paint_<name>`
     /// function reading whichever of its two arms the drawable's descriptors leave.
     ///
-    /// Empty for a family whose every attribute is geometry, which is nine of the twenty. See
+    /// Empty for a family whose every attribute is geometry, which is ten of the twenty-one. See
     /// [`Property`] for why both arms are written out rather than derived from the names.
     pub properties: &'static [Property],
     /// The hand-written body.
@@ -158,6 +192,14 @@ pub struct Family {
     /// Which surfaces a module exists for.
     pub surfaces: &'static [Surface],
     /// Whether the body hands `place` a height above the surface rather than zero.
+    ///
+    /// The extrusions, and only them -- `tests/families.rs` pins that. It decides two things: a
+    /// family with a height skips [`Surface::Globe`], whose placement reads no `z` at all, and a
+    /// frame drawing one needs a depth attachment rather than a stencil-only one.
+    ///
+    /// The ground is the entry that reads false and still hands `place` a third component. What
+    /// it hands is where the surface *is*, read from its own DEM, rather than how far a feature
+    /// stands off one -- so neither of the two things above applies to it.
     pub height: bool,
     /// How a draw of this family composites, transcribed from mbgl's own `setColorMode`.
     pub composite: Composite,
@@ -217,7 +259,7 @@ impl Family {
     /// that knows whether this family has a module for it. Not every pair exists -- an extrusion
     /// has no direct bend, and the two offscreen families have only a plane -- while the producer
     /// marks a drawable raised whatever family draws it, so what is asked for is sometimes not one
-    /// of the sixty-five. Where it is not, [`Surface::fallback`]'s chain is walked until it is,
+    /// of the sixty-six. Where it is not, [`Surface::fallback`]'s chain is walked until it is,
     /// which is the picture `DrawFlags::ON_TERRAIN`'s own note promises.
     #[must_use]
     pub fn surface(&self, asked: Surface) -> Surface {
@@ -911,6 +953,30 @@ pub static ALL: &[Family] = &[
         height: false,
         composite: Composite::ByPass,
     },
+    // The ground, which mbgl has no shader for at all. Every field of it is tessella's: the id
+    // past the enum's thirty-six, the attribute table published beside it in the ABI, and the
+    // block the raised families read -- which this one reads as its own, because it is the
+    // surface they are placed on rather than something placed on a surface.
+    Family {
+        shader: BUILTIN_TERRAIN_SHADER,
+        name: "terrain",
+        // The same block a raised drawable's placement reads, declared here as the family's own:
+        // the matrix, the DEM's unpack vector, what bare ground is painted, the sampling pair and
+        // the skirt. One block and no evaluated properties -- the spec gives terrain no paint, so
+        // there is no layer-wide set for a second block to carry.
+        blocks: &[&TERRAIN_DRAWABLE_UBO],
+        attributes: &TERRAIN_MESH_ATTRIBUTES,
+        instance_attributes: &[],
+        textures: &TERRAIN_MESH_TEXTURES,
+        // Nothing data-driven: the ground has no features for a property to vary over, which is
+        // what `encode_terrain` sends a `permutation_key` of nought for.
+        properties: &[],
+        body: TERRAIN_BODY,
+        surfaces: THE_GROUND,
+        // Not a height above the surface, though the body does hand `place` a z: see the field.
+        height: false,
+        composite: Composite::Fixed(Blend::Alpha),
+    },
 ];
 
 /// The three symbol families declare the same blocks.
@@ -1015,7 +1081,7 @@ pub fn family(shader: BuiltIn) -> Option<&'static Family> {
 ///
 /// The id is compared rather than decoded. It was `BuiltIn::from_repr(..).and_then(family)`, which
 /// is the same answer for the twenty mbgl families and `None` for every id that is not mbgl's --
-/// including the ground's, which is the one this crate will have to find here.
+/// including the ground's, which is the one this finds here and that could not.
 #[must_use]
 pub fn for_wire(builtin_shader: i32) -> Option<&'static Family> {
     ALL.iter().find(|family| family.shader == builtin_shader)

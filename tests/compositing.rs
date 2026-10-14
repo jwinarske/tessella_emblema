@@ -4,15 +4,16 @@
 //! Nothing on the wire says this. `grep -i color_mode crates/tessella-capture-abi/src` is empty,
 //! and it is empty correctly: mbgl does not take a color mode from a style either, it writes one
 //! per render layer in `src/mbgl/renderer/layers/`. So the consumer owns the fact, and owning it
-//! means transcribing twenty entries by hand.
+//! means transcribing twenty entries by hand -- and deciding a twenty-first, the ground, which has
+//! no render layer to read because mbgl has no terrain.
 //!
 //! Which is why the first test here is a second copy of the table. That is a weak check on its
 //! own -- it catches an edit rather than a mistranscription -- and it is paired with one that is
-//! not a copy: eighteen of the twenty are derivable from whether the family draws onto the map or
-//! into a target of its own, and that derivation agrees with the transcription. The two that are
+//! not a copy: nineteen of the twenty-one are derivable from whether the family draws onto the map
+//! or into a target of its own, and that derivation agrees with the transcription. The two that are
 //! left are the two the derivation names.
 //!
-//! What no test here can reach is whether the twenty were read off mbgl correctly in the first
+//! What no test here can reach is whether the twenty mbgl rows were read off correctly in the first
 //! place. The pixels are what settles that, and `benches/first_pixel.rs` draws the background's
 //! two arms over an opaque clear: the same four bytes at an opacity of one, two different ones
 //! faded.
@@ -20,6 +21,7 @@
 use std::collections::BTreeSet;
 
 use tessella_capture_abi::RenderPass;
+use tessella_capture_abi::terrain_ubo::BUILTIN_TERRAIN_SHADER;
 use tessella_emblema::families::{ALL, Composite, Family};
 use tessella_emblema::pipelines::Blend;
 use tessella_emblema::surface::Surface;
@@ -29,6 +31,10 @@ use tessella_emblema::surface::Surface;
 /// One entry per family in [`ALL`], by name. The line numbers are from the oracle checkout at
 /// `ad5e73527f3a`, and are a reading aid rather than part of the check -- a name is what this
 /// agrees with the table on.
+///
+/// One row cites no layer, because mbgl has none to cite: the ground is tessella's own family. Its
+/// mode is the sibling consumer's, `tessella_fluorite`'s `terrain.mat`, which declares
+/// `blending: transparent` -- alpha over a premultiplied source, which is what `Blend::Alpha` is.
 ///
 /// Four of mbgl's calls have no family here and so no row: the collision box's and the collision
 /// circle's, which `families::UNDRAWN` lists, and the location indicator's two, which is a layer
@@ -66,6 +72,8 @@ const MBGL: &[(&str, Composite)] = &[
     ("symbol_icon", Composite::ByPass),
     ("symbol_sdf", Composite::ByPass),
     ("symbol_text_and_icon", Composite::ByPass),
+    // No render layer: the ground is tessella's. `terrain.mat`'s `blending: transparent`.
+    ("terrain", Composite::Fixed(Blend::Alpha)),
 ];
 
 /// Every family's mode is the one mbgl's layer sets, and every row names a family.
@@ -95,18 +103,26 @@ fn every_family_composites_the_way_its_render_layer_does() {
     }
 }
 
-/// Whether a family draws onto the map, which is what every surface but a bare plane means.
+/// Whether a family draws onto the map, which is what every surface but a bare plane means --
+/// except for the family that *is* the map's surface.
 ///
-/// Two families are drawn on a plane alone, and both for the same reason: they render into a
-/// target of their own, at their own size, which is then sampled by a second family. That is the
-/// `surfaces: FLAT` the table gives them.
+/// Two families are drawn on a plane alone because they render into a target of their own, at
+/// their own size, which is then sampled by a second family. That is the `surfaces: FLAT` the
+/// table gives them.
+///
+/// The ground is a plane alone for the opposite reason, which is the third case this cannot
+/// derive. It draws onto the map -- it is the backmost thing in it -- and it has one placement
+/// because a ground is only ever drawn in a Mercator frame: `Map::surface` takes the globe where a
+/// style asks for both, so the producer sends no ground at all on a sphere. Named by its shader
+/// rather than by its name, because the id is the thing mbgl has no counterpart for.
 fn onto_the_map(family: &Family) -> bool {
-    family.surfaces != [Surface::Plane]
+    family.surfaces != [Surface::Plane] || family.shader == BUILTIN_TERRAIN_SHADER
 }
 
 /// A family that draws onto the map alpha-blends, always or by pass. Nothing else can be right.
 ///
-/// This is the half of the transcription that is derivable, and it covers eighteen of the twenty.
+/// This is the half of the transcription that is derivable, and it covers nineteen of the
+/// twenty-one.
 /// A draw onto the map lands on pixels some other layer has already written -- that is what a
 /// painter order is -- so replacing them loses the layer underneath and adding to them brightens
 /// it. Either is a mode that still draws, which is the whole reason to pin this at all.

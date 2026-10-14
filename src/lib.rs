@@ -54,7 +54,7 @@
 //!
 //! Two ways, because reading a shader cannot catch what reading cannot see.
 //!
-//! `tests/shaders.rs` assembles every (family, surface) pair — 65 of them — compiles each to
+//! `tests/shaders.rs` assembles every (family, surface) pair — 66 of them — compiles each to
 //! SPIR-V, and pins the decisions that are silent when wrong. A wrong one of those still draws,
 //! which is why they are pinned at all. It also assembles each pair with each paint property
 //! constant and with all of them constant, because every fixture here sends every attribute and
@@ -83,7 +83,8 @@
 //! surfaces one family's module is assembled from, keyed by the shader rather than by a name
 //! because nothing on the wire carries a name. It also states the coverage -- twenty of mbgl's
 //! thirty-six shader entries are drawn here and the other sixteen are listed with the reason,
-//! pinned against the enum so neither list can drift. And one fact that is not part of a module:
+//! pinned against the enum so neither list can drift -- and the twenty-first family, the ground,
+//! which mbgl has no shader for at all. And one fact that is not part of a module:
 //! [`families::Composite`], how a draw of the family composites over the target, which mbgl keeps
 //! in the same place -- its render layer's own source, not a style and not the wire.
 //!

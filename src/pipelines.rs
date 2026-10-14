@@ -79,7 +79,8 @@ pub struct Key {
     /// family, permutation and layout can want two of these, and a cache keyed without it would
     /// hand the second draw the first's pipeline and composite it wrongly. Which draws.
     ///
-    /// Not hypothetical. Seven of the twenty families are [`crate::families::Composite::ByPass`],
+    /// Not hypothetical. Seven of the twenty-one families are
+    /// [`crate::families::Composite::ByPass`],
     /// and the captured Berlin frame batches its background twice -- once in each pass -- which is
     /// the same family, permutation and layout under two blends.
     pub blend: Blend,
@@ -375,7 +376,7 @@ pub fn bindings(family: &Family, surface: Surface) -> Vec<Binding> {
     // Then two bindings for every texture, the family's own first and the surface's after -- a
     // family's samplers are a property of the shader rather than of what it is drawn on.
     // The slots rather than the two counts: they are the one thing both halves have, a family's
-    // from its generated table and a surface's hand-agreed beside its names. The binding number is
+    // from its generated table and a surface's named beside its placement. The binding number is
     // still `out.len()`, which is the part that must not become a formula.
     let slots = family
         .textures
@@ -1133,13 +1134,14 @@ pub fn build_mask<'d>(
 /// # Why a cache at all
 ///
 /// `vkCreateGraphicsPipelines` compiles the shader. On the gating target that is tens of
-/// milliseconds for the 61 modules together, and a frame that rebuilt a pipeline per batch would
+/// milliseconds for a crate's worth of them -- measured over the 61 modules there were then --
+/// and a frame that rebuilt a pipeline per batch would
 /// pay it per batch -- a styled view has thousands. So a pipeline is built once per key and bound
 /// many times, which is what the key exists for.
 ///
 /// # Two levels, because the module is not per key
 ///
-/// A module is per `(family, surface)`: one text, two entry points, 65 of them. A *pipeline* is per
+/// A module is per `(family, surface)`: one text, two entry points, 66 of them. A *pipeline* is per
 /// [`Key`], which adds the permutation and the vertex input -- so one module serves every pipeline
 /// of its family, and the two are cached separately. Holding the module beside each pipeline would
 /// compile the same text once per stride.

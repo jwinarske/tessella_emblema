@@ -192,19 +192,12 @@ fn every_set_is_written(device: &Open) -> Result<(), String> {
                 .map_err(|why| format!("{who}: {why}"))?;
 
             let set = sets
-                .write(
-                    &layout,
-                    &bindings,
-                    at,
-                    family.shader as i32,
-                    &blocks,
-                    &bound,
-                )
+                .write(&layout, &bindings, at, family.shader, &blocks, &bound)
                 .map_err(|why| format!("{who}: {why}"))?;
             if set == vk::DescriptorSet::null() {
                 return Err(format!("{who}: a null set"));
             }
-            if sets.get(at, family.shader as i32) != Some(set) {
+            if sets.get(at, family.shader) != Some(set) {
                 return Err(format!("{who}: the set was not remembered"));
             }
             written += 1;
@@ -275,9 +268,9 @@ fn two_families_at_one_layer(device: &Open) -> Result<(), String> {
             pipelines::layout(gpu, bindings).map_err(|why| format!("{}: {why}", family.name))?;
         let blocks = blocks_for(device, at, bindings)?;
         let set = sets
-            .write(&layout, bindings, at, family.shader as i32, &blocks, &[])
+            .write(&layout, bindings, at, family.shader, &blocks, &[])
             .map_err(|why| format!("{}: {why}", family.name))?;
-        written.push((family.shader as i32, set));
+        written.push((family.shader, set));
     }
 
     if written[0].1 == written[1].1 {

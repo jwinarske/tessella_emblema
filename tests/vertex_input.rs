@@ -37,7 +37,7 @@ const fn slot(slot: u32, format: vk::Format, offset: u32, stride: u32) -> Slot {
 
 fn key(layout: Vec<Slot>) -> Key {
     Key {
-        shader: BuiltIn::FillShader,
+        shader: BuiltIn::FillShader as i32,
         surface: Surface::Plane,
         permutation: 0,
         layout,

@@ -122,8 +122,14 @@ const LIFTS_A_HEIGHT: &[Surface] = &[Surface::Plane, Surface::GlobeAnchored, Sur
 /// One family's module parts.
 #[derive(Debug, Clone, Copy)]
 pub struct Family {
-    /// The shader the producer names on the wire.
-    pub shader: BuiltIn,
+    /// The shader the producer names on the wire, as `GeometryAdd::builtin_shader` carries it.
+    ///
+    /// An `i32` rather than a [`BuiltIn`] because not every family is mbgl's. Twenty of these are
+    /// -- the enum's own discriminants -- and the ground is not: mbgl has no terrain, so
+    /// `terrain_ubo::BUILTIN_TERRAIN_SHADER` is tessella's own 128, past the enum's thirty-six and
+    /// not representable in it. The wire has always been an `i32` for this reason, and the ABI
+    /// publishes that constant as one.
+    pub shader: i32,
     /// Short name, for diagnostics and for matching an oracle case.
     pub name: &'static str,
     /// The uniform blocks the body reads, in binding order.
@@ -599,7 +605,7 @@ const SYMBOL_TEXT_AND_ICON_PAINT: &[Property] = &[
 /// Every family this crate draws, in no particular order.
 pub static ALL: &[Family] = &[
     Family {
-        shader: BuiltIn::BackgroundShader,
+        shader: BuiltIn::BackgroundShader as i32,
         name: "background",
         blocks: &[&BACKGROUND_DRAWABLE_UBO, &BACKGROUND_PROPS_UBO],
         attributes: &BACKGROUND_SHADER,
@@ -612,7 +618,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::ByPass,
     },
     Family {
-        shader: BuiltIn::BackgroundPatternShader,
+        shader: BuiltIn::BackgroundPatternShader as i32,
         name: "background_pattern",
         blocks: &[
             &BACKGROUND_PATTERN_DRAWABLE_UBO,
@@ -629,7 +635,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::ByPass,
     },
     Family {
-        shader: BuiltIn::FillShader,
+        shader: BuiltIn::FillShader as i32,
         name: "fill",
         blocks: &[&FILL_DRAWABLE_UBO, &FILL_EVALUATED_PROPS_UBO],
         attributes: &FILL_SHADER,
@@ -642,7 +648,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
-        shader: BuiltIn::FillOutlineShader,
+        shader: BuiltIn::FillOutlineShader as i32,
         name: "fill_outline",
         blocks: &[
             &FILL_OUTLINE_DRAWABLE_UBO,
@@ -659,7 +665,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
-        shader: BuiltIn::FillOutlineTriangulatedShader,
+        shader: BuiltIn::FillOutlineTriangulatedShader as i32,
         name: "fill_outline_triangulated",
         // The same three `fill_outline` reads, which is what the GL source declares and what
         // fluorite's material takes: the matrix and ratio from the drawable, the outline color
@@ -680,7 +686,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
-        shader: BuiltIn::FillPatternShader,
+        shader: BuiltIn::FillPatternShader as i32,
         name: "fill_pattern",
         blocks: &[
             &FILL_PATTERN_DRAWABLE_UBO,
@@ -698,7 +704,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
-        shader: BuiltIn::FillExtrusionShader,
+        shader: BuiltIn::FillExtrusionShader as i32,
         name: "fill_extrusion",
         blocks: &[&FILL_EXTRUSION_DRAWABLE_UBO, &FILL_EXTRUSION_PROPS_UBO],
         attributes: &FILL_EXTRUSION_SHADER,
@@ -711,7 +717,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
-        shader: BuiltIn::FillExtrusionInstancedShader,
+        shader: BuiltIn::FillExtrusionInstancedShader as i32,
         name: "fill_extrusion_instanced",
         blocks: &[&FILL_EXTRUSION_DRAWABLE_UBO, &FILL_EXTRUSION_PROPS_UBO],
         attributes: &FILL_EXTRUSION_INSTANCED_SHADER,
@@ -724,7 +730,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
-        shader: BuiltIn::LineShader,
+        shader: BuiltIn::LineShader as i32,
         name: "line",
         blocks: &[
             &LINE_DRAWABLE_UBO,
@@ -741,7 +747,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::ByPass,
     },
     Family {
-        shader: BuiltIn::LinePatternShader,
+        shader: BuiltIn::LinePatternShader as i32,
         name: "line_pattern",
         blocks: &[
             &LINE_PATTERN_DRAWABLE_UBO,
@@ -759,7 +765,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::ByPass,
     },
     Family {
-        shader: BuiltIn::CircleShader,
+        shader: BuiltIn::CircleShader as i32,
         name: "circle",
         blocks: &[
             &CIRCLE_DRAWABLE_UBO,
@@ -776,7 +782,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
-        shader: BuiltIn::RasterShader,
+        shader: BuiltIn::RasterShader as i32,
         name: "raster",
         blocks: &[&RASTER_DRAWABLE_UBO, &RASTER_EVALUATED_PROPS_UBO],
         attributes: &RASTER_SHADER,
@@ -789,7 +795,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
-        shader: BuiltIn::HillshadePrepareShader,
+        shader: BuiltIn::HillshadePrepareShader as i32,
         name: "hillshade_prepare",
         blocks: &[
             &HILLSHADE_PREPARE_DRAWABLE_UBO,
@@ -806,7 +812,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::Fixed(Blend::Unblended),
     },
     Family {
-        shader: BuiltIn::HillshadeShader,
+        shader: BuiltIn::HillshadeShader as i32,
         name: "hillshade",
         blocks: &[
             &HILLSHADE_DRAWABLE_UBO,
@@ -823,7 +829,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
-        shader: BuiltIn::ColorReliefShader,
+        shader: BuiltIn::ColorReliefShader as i32,
         name: "color_relief",
         blocks: &[
             &COLOR_RELIEF_DRAWABLE_UBO,
@@ -840,7 +846,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
-        shader: BuiltIn::HeatmapShader,
+        shader: BuiltIn::HeatmapShader as i32,
         name: "heatmap",
         blocks: &[&HEATMAP_DRAWABLE_UBO, &HEATMAP_EVALUATED_PROPS_UBO],
         attributes: &HEATMAP_SHADER,
@@ -854,7 +860,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::Fixed(Blend::Additive),
     },
     Family {
-        shader: BuiltIn::HeatmapTextureShader,
+        shader: BuiltIn::HeatmapTextureShader as i32,
         name: "heatmap_texture",
         blocks: &[&HEATMAP_TEXTURE_PROPS_UBO, &GLOBAL_PAINT_PARAMS_UBO],
         attributes: &HEATMAP_TEXTURE_SHADER,
@@ -867,7 +873,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
-        shader: BuiltIn::SymbolIconShader,
+        shader: BuiltIn::SymbolIconShader as i32,
         name: "symbol_icon",
         blocks: SYMBOL_BLOCKS,
         attributes: &SYMBOL_ICON_SHADER,
@@ -880,7 +886,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::ByPass,
     },
     Family {
-        shader: BuiltIn::SymbolSDFShader,
+        shader: BuiltIn::SymbolSDFShader as i32,
         name: "symbol_sdf",
         blocks: SYMBOL_BLOCKS,
         attributes: &SYMBOL_SDFSHADER,
@@ -893,7 +899,7 @@ pub static ALL: &[Family] = &[
         composite: Composite::ByPass,
     },
     Family {
-        shader: BuiltIn::SymbolTextAndIconShader,
+        shader: BuiltIn::SymbolTextAndIconShader as i32,
         name: "symbol_text_and_icon",
         blocks: SYMBOL_BLOCKS,
         attributes: &SYMBOL_TEXT_AND_ICON_SHADER,
@@ -993,19 +999,24 @@ pub static UNDRAWN: &[(BuiltIn, &str)] = &[
     ),
 ];
 
-/// The family for a shader, or `None` if this crate does not draw it.
+/// The family for one of mbgl's shaders, or `None` if this crate does not draw it.
+///
+/// [`for_wire`] is the other half and the one a stream reaches for: a `builtin_shader` is an `i32`
+/// and not every family has a `BuiltIn` to name it by.
 #[must_use]
 pub fn family(shader: BuiltIn) -> Option<&'static Family> {
-    ALL.iter().find(|family| family.shader == shader)
+    for_wire(shader as i32)
 }
 
 /// The family for a `builtin_shader` as it arrives on the wire.
 ///
-/// `None` both for a discriminant that is not a `BuiltIn` and for one this crate does not draw.
-/// The caller skips the drawable either way, which is why the two are not distinguished: an order
-/// may name a family a build does not have, and that is a drawable to leave out rather than an
-/// error to raise.
+/// `None` for an id this crate does not draw, which an order may name: a build without a family is
+/// a drawable to leave out rather than an error to raise.
+///
+/// The id is compared rather than decoded. It was `BuiltIn::from_repr(..).and_then(family)`, which
+/// is the same answer for the twenty mbgl families and `None` for every id that is not mbgl's --
+/// including the ground's, which is the one this crate will have to find here.
 #[must_use]
 pub fn for_wire(builtin_shader: i32) -> Option<&'static Family> {
-    BuiltIn::from_repr(builtin_shader).and_then(family)
+    ALL.iter().find(|family| family.shader == builtin_shader)
 }

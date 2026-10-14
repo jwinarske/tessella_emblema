@@ -24,7 +24,6 @@ use std::collections::HashMap;
 
 use ash::vk;
 use tessella_capture_abi::envelope::DrawFlags;
-use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 
 use tessella_vk::{DescriptorSetLayout, Gpu, PipelineLayout};
 
@@ -55,8 +54,10 @@ pub struct Slot {
 /// What a pipeline is cached by.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Key {
-    /// The shader family.
-    pub shader: BuiltIn,
+    /// The shader family, as the wire names it -- `families::Family::shader`.
+    ///
+    /// An `i32` for the reason that field is: the ground is a family mbgl has no `BuiltIn` for.
+    pub shader: i32,
     /// Which surface its module was assembled against.
     pub surface: Surface,
     /// Which of the family's attributes the drawable did not send, as a bitmask over locations.
@@ -254,7 +255,7 @@ impl Depth {
 /// is a different pipeline -- and, through [`Key::permutation`], a different module.
 #[must_use]
 pub fn key(
-    shader: BuiltIn,
+    shader: i32,
     surface: Surface,
     plan: &Plan,
     blend: Blend,
@@ -1152,8 +1153,8 @@ pub fn build_mask<'d>(
 /// the style's own size and stops, and [`Cache::len`] is what a caller watches to find out it was
 /// wrong about that.
 pub struct Cache<'d> {
-    modules: HashMap<(BuiltIn, Surface, u64), tessella_vk::ShaderModule<'d>>,
-    layouts: HashMap<(BuiltIn, Surface), Layout<'d>>,
+    modules: HashMap<(i32, Surface, u64), tessella_vk::ShaderModule<'d>>,
+    layouts: HashMap<(i32, Surface), Layout<'d>>,
     pipelines: HashMap<Key, tessella_vk::Pipeline<'d>>,
     built: usize,
     bound: usize,
@@ -1231,7 +1232,7 @@ impl<'d> Cache<'d> {
     pub fn layout(
         &mut self,
         gpu: Gpu<'d>,
-        shader: BuiltIn,
+        shader: i32,
         surface: Surface,
         bindings: &[Binding],
     ) -> Result<&Layout<'d>, Error> {
@@ -1309,7 +1310,7 @@ impl<'d> Cache<'d> {
     /// drawable that sent fewer attributes needs its own text, so a cache asked without it would
     /// report a hit and then be handed the wrong module's words to ignore.
     #[must_use]
-    pub fn has_module(&self, shader: BuiltIn, surface: Surface, permutation: u64) -> bool {
+    pub fn has_module(&self, shader: i32, surface: Surface, permutation: u64) -> bool {
         self.modules.contains_key(&(shader, surface, permutation))
     }
 }

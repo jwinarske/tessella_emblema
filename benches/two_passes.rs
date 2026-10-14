@@ -232,7 +232,7 @@ fn draw(
     let child_program = {
         let words = compile_family(fill)?;
         let key = pipelines::key(
-            BuiltIn::FillShader,
+            BuiltIn::FillShader as i32,
             Surface::Plane,
             plans.get(&passes::DRAWN).ok_or("the child has no plan")?,
             // Both views draw in the translucent pass, so neither writes depth and both take
@@ -249,7 +249,12 @@ fn draw(
             .pipeline(gpu, &key, &fill_bindings, &words, screen.targets)
             .map_err(|why| format!("the child's pipeline: {why}"))?;
         let layout = cache
-            .layout(gpu, BuiltIn::FillShader, Surface::Plane, &fill_bindings)
+            .layout(
+                gpu,
+                BuiltIn::FillShader as i32,
+                Surface::Plane,
+                &fill_bindings,
+            )
             .map_err(|why| format!("the child's layout: {why}"))?;
         let at = blocks::Which {
             view: passes::CHILD,
@@ -276,7 +281,7 @@ fn draw(
     let parent_program = {
         let words = compile_family(raster)?;
         let key = pipelines::key(
-            BuiltIn::RasterShader,
+            BuiltIn::RasterShader as i32,
             Surface::Plane,
             plans.get(&passes::SAMPLES).ok_or("no parent plan")?,
             raster.blend(RenderPass::TRANSLUCENT.bits()),
@@ -287,7 +292,12 @@ fn draw(
             .pipeline(gpu, &key, &raster_bindings, &words, screen.targets)
             .map_err(|why| format!("the parent's pipeline: {why}"))?;
         let layout = cache
-            .layout(gpu, BuiltIn::RasterShader, Surface::Plane, &raster_bindings)
+            .layout(
+                gpu,
+                BuiltIn::RasterShader as i32,
+                Surface::Plane,
+                &raster_bindings,
+            )
             .map_err(|why| format!("the parent's layout: {why}"))?;
 
         let refs = &host

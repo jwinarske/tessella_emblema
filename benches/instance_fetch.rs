@@ -414,7 +414,7 @@ fn pipeline<'d>(
     // own binding could be wrong instead.
     let layout = pipelines::layout(gpu, &[]).map_err(|why| format!("layout: {why}"))?;
     let key = Key {
-        shader: BuiltIn::FillExtrusionInstancedShader,
+        shader: BuiltIn::FillExtrusionInstancedShader as i32,
         surface: Surface::Plane,
         permutation: 0,
         layout: layout_slots(rate),

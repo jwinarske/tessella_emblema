@@ -3796,7 +3796,7 @@ fn draw_case<'d>(
     // `Depth::Write` because a case is one draw with nothing behind it: the arm that writes is
     // the one a single draw exercises, and no case here has a second layer to be rejected by.
     let key = pipelines::key(
-        case.family,
+        case.family as i32,
         surface,
         &plan,
         case.pass.map_or(Blend::Unblended, |pass| found.blend(pass)),
@@ -3942,7 +3942,7 @@ fn draw_case<'d>(
         .pipeline(gpu, &key, &bindings, &words, probe.targets)
         .map_err(|why| format!("{}: pipeline: {why}", case.name))?;
     let layout = cache
-        .layout(gpu, case.family, surface, &bindings)
+        .layout(gpu, case.family as i32, surface, &bindings)
         .map_err(|why| format!("{}: layout: {why}", case.name))?;
     // Two sets where a case is instanced: the layer's, and the one over this geometry's own
     // instance buffer. Sized for two always, which costs a pool entry and keeps the call the same.

@@ -934,6 +934,9 @@ fn run(path: &str) -> Result<(), String> {
     // one bit of the stencil byte is left over when the clip fields do not need it, and the first
     // run in paint order takes it. Computed once and read twice -- here for the keys and below for
     // the dynamic state -- because the two have to agree about which batch is drawing with it.
+    // `true` because this bench always draws with depth bands -- `Scene::depth` below is
+    // `Some(bands)` or the run fails -- and the two have to agree: the order the batches are
+    // painted in is what decides which run is first.
     let draw_once = record::DrawOnce::of(frame.batches, partition, true);
 
     // One program per batch key: the pipeline that batch's own state asks for, and the layout its

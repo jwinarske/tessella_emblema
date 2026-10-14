@@ -564,6 +564,19 @@ fn fragment_main() -> @location(0) vec4<f32> {
 /// field of the draw call that is already being made, so it costs nothing on any of the three.
 /// See `tests/bench-baselines/`.
 ///
+/// # A fragment stage has none
+///
+/// `instance_index` is a vertex builtin and a private variable is per invocation, so a fragment
+/// stage's copy of this is zero whatever the vertex stage wrote. A body whose fragment stage
+/// reads a per-drawable block therefore carries the slot through its own `Out` as a flat `u32`
+/// and assigns it back -- seven of them do, every `*TilePropsUBO` being one entry per drawable.
+/// Left out, such a body draws the *first* drawable's tile properties over every tile of its
+/// layer: the second tile of a patterned fill is sampled against the first tile's atlas size,
+/// which is a plausible wrong texel rather than nothing at all.
+///
+/// `benches/first_pixel.rs`'s `fill_pattern_at_one` is the case, and the complement is a
+/// layer-wide block: those are one entry and are read at `[0]` in both stages.
+///
 /// # Except for one family, where it cannot be
 ///
 /// The instanced extrusion. `firstInstance` is part of the address an instance-rate vertex
@@ -781,6 +794,7 @@ struct Out {
     @location(6) along: f32,
     @location(7) pattern_from: vec4<f32>,
     @location(8) pattern_to: vec4<f32>,
+    @location(9) @interpolate(flat) ubo: u32,
 }
 
 @vertex
@@ -836,13 +850,16 @@ fn vertex_main(in: In) -> Out {
     out.blur = paint_blur(in);
     out.opacity = paint_opacity(in);
     // Straight through: a sprite name is not a number. See `FILL_PATTERN_BODY`.
-    out.pattern_from = vec4<f32>(in.line_pattern_from);
-    out.pattern_to = vec4<f32>(in.line_pattern_to);
+    out.pattern_from = paint_pattern_from(in);
+    out.pattern_to = paint_pattern_to(in);
+    out.ubo = ubo_index;
     return out;
 }
 
 @fragment
 fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    // The slot, carried: a fragment invocation's own copy of a private is zero.
+    ubo_index = in.ubo;
     let tile = line_pattern_tile_props_ubo[ubo_index];
     let global = global_paint_params_ubo[0];
 
@@ -1108,6 +1125,7 @@ pub const COLOR_RELIEF_BODY: &str = r"
 struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) ubo: u32,
 }
 
 @vertex
@@ -1149,6 +1167,7 @@ fn vertex_main(in: In) -> Out {
     // The curtain, as the raster has one.
     let drop = curtain(f32(in.tessella_skirt.x));
     out.clip = place(vec3<f32>(vec2<f32>(in.color_relief_pos), drop), drawable.matrix);
+    out.ubo = ubo_index;
     return out;
 }
 
@@ -1173,6 +1192,8 @@ fn color_stop(index: i32, stops: i32) -> vec4<f32> {
 
 @fragment
 fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    // The slot, carried: a fragment invocation's own copy of a private is zero.
+    ubo_index = in.ubo;
     let tile = color_relief_tile_props_ubo[ubo_index];
     let props = color_relief_evaluated_props_ubo[0];
     let stops = tile.color_ramp_size;
@@ -1455,6 +1476,7 @@ struct Out {
     @location(5) opacity: f32,
     @location(6) halo_width: f32,
     @location(7) halo_blur: f32,
+    @location(8) @interpolate(flat) ubo: u32,
 }
 
 @vertex
@@ -1534,11 +1556,14 @@ fn vertex_main(in: In) -> Out {
     out.opacity = paint_opacity(in);
     out.halo_width = paint_halo_width(in);
     out.halo_blur = paint_halo_blur(in);
+    out.ubo = ubo_index;
     return out;
 }
 
 @fragment
 fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    // The slot, carried: a fragment invocation's own copy of a private is zero.
+    ubo_index = in.ubo;
     let tile = symbol_tile_props_ubo[ubo_index];
     let global = global_paint_params_ubo[0];
 
@@ -1601,6 +1626,7 @@ struct Out {
     @location(7) opacity: f32,
     @location(8) halo_width: f32,
     @location(9) halo_blur: f32,
+    @location(10) @interpolate(flat) ubo: u32,
 }
 
 @vertex
@@ -1678,11 +1704,14 @@ fn vertex_main(in: In) -> Out {
     out.opacity = paint_opacity(in);
     out.halo_width = paint_halo_width(in);
     out.halo_blur = paint_halo_blur(in);
+    out.ubo = ubo_index;
     return out;
 }
 
 @fragment
 fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    // The slot, carried: a fragment invocation's own copy of a private is zero.
+    ubo_index = in.ubo;
     let tile = symbol_tile_props_ubo[ubo_index];
     let global = global_paint_params_ubo[0];
 
@@ -1737,6 +1766,7 @@ pub const HILLSHADE_PREPARE_BODY: &str = r"
 struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) ubo: u32,
 }
 
 @vertex
@@ -1753,6 +1783,7 @@ fn vertex_main(in: In) -> Out {
     let epsilon = vec2<f32>(1.0, 1.0) / tile.dimension;
     let scale = (tile.dimension.x - 2.0) / tile.dimension.x;
     out.uv = vec2<f32>(in.hillshade_texture_pos) / 8192.0 * scale + epsilon;
+    out.ubo = ubo_index;
     return out;
 }
 
@@ -1765,6 +1796,8 @@ fn elevation(uv: vec2<f32>, unpack: vec4<f32>) -> f32 {
 
 @fragment
 fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    // The slot, carried: a fragment invocation's own copy of a private is zero.
+    ubo_index = in.ubo;
     let tile = hillshade_prepare_tile_props_ubo[ubo_index];
     let epsilon = vec2<f32>(1.0, 1.0) / tile.dimension;
     let tile_size = tile.dimension.x - 2.0;
@@ -1831,6 +1864,7 @@ pub const HILLSHADE_BODY: &str = r"
 struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) ubo: u32,
 }
 
 @vertex
@@ -1845,6 +1879,7 @@ fn vertex_main(in: In) -> Out {
     // Flipped, because the slope field was rendered into a texture whose rows run the other way.
     let uv = vec2<f32>(in.hillshade_texture_pos) / 8192.0;
     out.uv = vec2<f32>(uv.x, 1.0 - uv.y);
+    out.ubo = ubo_index;
     return out;
 }
 
@@ -1869,6 +1904,8 @@ fn lambert(deriv: vec2<f32>, altitude: f32, cos_az: f32, sin_az: f32) -> f32 {
 
 @fragment
 fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    // The slot, carried: a fragment invocation's own copy of a private is zero.
+    ubo_index = in.ubo;
     let tile = hillshade_tile_props_ubo[ubo_index];
     let props = hillshade_evaluated_props_ubo[0];
     let pi = 3.141592653589793;
@@ -2049,9 +2086,11 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
 
 /// The fill-pattern family's body: a fill, tiled with a sprite.
 ///
-/// The two sprites arrive as attributes rather than uniforms -- `pattern-from` and `pattern-to`
-/// are per feature, since one layer's features can carry different sprite names -- each packed as
-/// four shorts: the sprite's top left and bottom right in the atlas.
+/// The two sprites are a paint property like any other: a `fill-pattern` given as an expression
+/// over a feature's own field arrives as an attribute, four shorts holding the sprite's top left
+/// and bottom right in the atlas, and one given as a plain name arrives in the tile's block
+/// instead. Both arms are read through `paint_pattern_from`, which is this family's entry in
+/// [`crate::families::ALL`].
 ///
 /// # The sprite names are not interpolated
 ///
@@ -2075,6 +2114,7 @@ struct Out {
     @location(2) pattern_from: vec4<f32>,
     @location(3) pattern_to: vec4<f32>,
     @location(4) opacity: f32,
+    @location(5) @interpolate(flat) ubo: u32,
 }
 
 @vertex
@@ -2086,8 +2126,8 @@ fn vertex_main(in: In) -> Out {
     var out: Out;
 
     // Straight through, not mixed: see this body's own note.
-    let pattern_from = vec4<f32>(in.fill_pattern_from);
-    let pattern_to = vec4<f32>(in.fill_pattern_to);
+    let pattern_from = paint_pattern_from(in);
+    let pattern_to = paint_pattern_to(in);
     out.pattern_from = pattern_from;
     out.pattern_to = pattern_to;
 
@@ -2113,11 +2153,14 @@ fn vertex_main(in: In) -> Out {
 
     out.opacity = paint_opacity(in);
     out.clip = place(vec3<f32>(position, 0.0), drawable.matrix);
+    out.ubo = ubo_index;
     return out;
 }
 
 @fragment
 fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    // The slot, carried: a fragment invocation's own copy of a private is zero.
+    ubo_index = in.ubo;
     let tile = fill_pattern_tile_props_ubo[ubo_index];
     let props = fill_evaluated_props_ubo[0];
 
@@ -2224,6 +2267,13 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
 ///
 /// The quad is the viewport in pixels -- `position` is a unit square scaled by the world size --
 /// which is why this family needs no tile geometry and reads the density by its own position.
+///
+/// # Nothing here is per drawable
+///
+/// One quad over the viewport, and `HeatmapTexturePropsUBO` is one entry for the layer rather than
+/// one per tile -- mbgl declares it a plain `uniform` block and the producer writes it once. So
+/// both stages read it at `[0]`, and the slot the vertex stage takes from `firstInstance` goes
+/// unread. `tests/shaders.rs` checks that distinction from both sides.
 pub const HEATMAP_TEXTURE_BODY: &str = r"
 struct Out {
     @builtin(position) clip: vec4<f32>,
@@ -2233,7 +2283,7 @@ struct Out {
 @vertex
 fn vertex_main(in: In) -> Out {
     ubo_index = in.instance_index;
-    let props = heatmap_texture_props_ubo[ubo_index];
+    let props = heatmap_texture_props_ubo[0];
     let global = global_paint_params_ubo[0];
     var out: Out;
 
@@ -2245,7 +2295,7 @@ fn vertex_main(in: In) -> Out {
 
 @fragment
 fn fragment_main(in: Out) -> @location(0) vec4<f32> {
-    let props = heatmap_texture_props_ubo[ubo_index];
+    let props = heatmap_texture_props_ubo[0];
 
     // Red, which is the channel the first pass accumulated into.
     let density = textureSample(heatmap_image, heatmap_image_sampler, in.uv).r;

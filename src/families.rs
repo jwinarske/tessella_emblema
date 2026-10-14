@@ -145,7 +145,7 @@ const THE_GROUND: &[Surface] = &[Surface::Plane];
 /// and this family declares one texture and has nothing to clear. The ABI holds both constants
 /// beside each other and a test there pins the order.
 ///
-/// `texture_id` is mbgl's shader-side id and this family has none, so it is nought. Nothing here
+/// `texture_id` is mbgl's shader-side id and this family has none, so it is zero. Nothing here
 /// reads it -- the slot is `binding`, and the name is what the module declares.
 static TERRAIN_MESH_TEXTURES: [ShaderTexture; 1] = [ShaderTexture {
     binding: TERRAIN_MESH_ELEVATION_SLOT,
@@ -335,15 +335,42 @@ const FILL_OUTLINE_PAINT: &[Property] = &[
     },
 ];
 
-/// `fill_pattern`'s one. The pattern corners are attributes mbgl never makes uniform -- a
-/// sprite's place on the sheet is per tile, not per layer -- so the opacity is the whole set.
-const FILL_PATTERN_PAINT: &[Property] = &[Property {
-    location: 3,
-    name: "opacity",
-    returns: "f32",
-    varies: "mix_value(in.fill_opacity, fill_pattern_drawable_ubo[ubo_index].opacity_t)",
-    constant: "fill_evaluated_props_ubo[0].opacity",
-}];
+/// `fill_pattern`'s three: the two sprite rectangles and the opacity.
+///
+/// The rectangles are the one paint property in mbgl that is not a pair of zoom endpoints, and
+/// the one whose constant arm is not the layer's evaluated block. A `fill-pattern` given as a
+/// plain name is one value for the layer, so mbgl sends no attribute -- `fill.hpp`'s
+/// `HAS_UNIFORM_u_pattern_from` -- and reads the tile's own `pattern_from` instead: the sprite is
+/// resolved against the frame's atlas per tile, which is where `FillPatternTilePropsUBO` already
+/// carries it for the fragment stage.
+///
+/// So this family's uniform arm is per drawable where every other family's is per layer, and the
+/// varying arm mixes nothing. Halfway between two sprites' corners is a rectangle containing
+/// neither, which is why `pattern_from_t` and `pattern_to_t` are in `tests/shaders.rs`'s
+/// `UNUSED_FACTORS` -- see [`crate::shaders::FILL_PATTERN_BODY`].
+const FILL_PATTERN_PAINT: &[Property] = &[
+    Property {
+        location: 1,
+        name: "pattern_from",
+        returns: "vec4<f32>",
+        varies: "vec4<f32>(in.fill_pattern_from)",
+        constant: "fill_pattern_tile_props_ubo[ubo_index].pattern_from",
+    },
+    Property {
+        location: 2,
+        name: "pattern_to",
+        returns: "vec4<f32>",
+        varies: "vec4<f32>(in.fill_pattern_to)",
+        constant: "fill_pattern_tile_props_ubo[ubo_index].pattern_to",
+    },
+    Property {
+        location: 3,
+        name: "opacity",
+        returns: "f32",
+        varies: "mix_value(in.fill_opacity, fill_pattern_drawable_ubo[ubo_index].opacity_t)",
+        constant: "fill_evaluated_props_ubo[0].opacity",
+    },
+];
 
 /// `fill_extrusion`'s three: the color, and the two heights a wall is extruded between.
 const FILL_EXTRUSION_PAINT: &[Property] = &[
@@ -444,8 +471,12 @@ const LINE_PAINT: &[Property] = &[
     },
 ];
 
-/// `line_pattern`'s five: [`LINE_PAINT`] without the color, which a patterned line has no block
-/// field for -- the sprite is the color.
+/// `line_pattern`'s seven: [`LINE_PAINT`] without the color, which a patterned line has no block
+/// field for -- the sprite is the color -- and the two sprite rectangles.
+///
+/// The rectangles are [`FILL_PATTERN_PAINT`]'s, at this family's own locations and out of this
+/// family's own tile block. `line.hpp` guards them the same way and reads
+/// `tileProps.pattern_from` where the attribute is absent.
 const LINE_PATTERN_PAINT: &[Property] = &[
     Property {
         location: 2,
@@ -481,6 +512,20 @@ const LINE_PATTERN_PAINT: &[Property] = &[
         returns: "f32",
         varies: "mix_value(in.line_width, line_pattern_drawable_ubo[ubo_index].width_t)",
         constant: "line_evaluated_props_ubo[0].width",
+    },
+    Property {
+        location: 7,
+        name: "pattern_from",
+        returns: "vec4<f32>",
+        varies: "vec4<f32>(in.line_pattern_from)",
+        constant: "line_pattern_tile_props_ubo[ubo_index].pattern_from",
+    },
+    Property {
+        location: 8,
+        name: "pattern_to",
+        returns: "vec4<f32>",
+        varies: "vec4<f32>(in.line_pattern_to)",
+        constant: "line_pattern_tile_props_ubo[ubo_index].pattern_to",
     },
 ];
 
@@ -969,7 +1014,7 @@ pub static ALL: &[Family] = &[
         instance_attributes: &[],
         textures: &TERRAIN_MESH_TEXTURES,
         // Nothing data-driven: the ground has no features for a property to vary over, which is
-        // what `encode_terrain` sends a `permutation_key` of nought for.
+        // what `encode_terrain` sends a `permutation_key` of zero for.
         properties: &[],
         body: TERRAIN_BODY,
         surfaces: THE_GROUND,

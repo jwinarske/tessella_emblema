@@ -234,8 +234,9 @@ impl<'d> Store<'d> {
 
     /// The vertex buffers to bind, and their offsets, in binding order.
     ///
-    /// Ready for `vkCmdBindVertexBuffers` from binding zero: one entry per binding the plan
-    /// declares, with a buffer repeated where several bindings read one interleaved vertex.
+    /// Ready for `vkCmdBindVertexBuffers` from binding zero: indexed by binding number, with a
+    /// buffer repeated where several bindings read one interleaved vertex and where a binding the
+    /// plan leaves unbound is filled. See `upload` for why the list is not packed.
     #[must_use]
     pub fn bindings(&self, geometry: GeometryId) -> Option<(&[vk::Buffer], &[u64])> {
         let held = self.held.get(&geometry)?;
@@ -403,14 +404,31 @@ impl<'d> Store<'d> {
             }
         }
 
-        // The bind list, in binding order. `reads` is ordered by the plan, which is ordered by the
-        // `@location` each attribute declares -- so this is already the order
-        // `vkCmdBindVertexBuffers` wants from binding zero.
-        let bound: Vec<vk::Buffer> = needs
-            .reads
-            .iter()
-            .map(|read| vertices[read.buffer].raw())
-            .collect();
+        // The bind list, indexed by binding number. `reads` is in the plan's slot order, which is
+        // the order `vkCmdBindVertexBuffers` wants from binding zero -- but it is not necessarily
+        // *dense*: a drawable whose earlier paint property is constant and whose later one is not
+        // leaves a hole, which a packed list would close by binding every attribute after it one
+        // binding too low. A constant `fill-pattern` beside a data-driven `fill-opacity` is that
+        // shape: locations 1 and 2 absent and 3 bound, and the opacity then fetches from binding 1
+        // -- where nothing is bound, so it reads zero and the layer draws nothing at all.
+        //
+        // The holes are filled with the first handle rather than left null: a binding the pipeline
+        // declares no `VkVertexInputBindingDescription` for is never fetched from, and
+        // `VK_NULL_HANDLE` here needs `nullDescriptor`, which nothing asks for.
+        // The length is one past the highest binding, which the wire cannot inflate: a slot is a
+        // location some entry of the family's own table declares -- `vertices::planned` drops the
+        // rest as `undeclared` -- and the widest table mbgl has is ten attributes.
+        let mut bound: Vec<vk::Buffer> = Vec::new();
+        if let Some(first) = needs.reads.first() {
+            let width = needs
+                .reads
+                .iter()
+                .fold(0, |wide: usize, read| wide.max(read.slot as usize + 1));
+            bound = vec![vertices[first.buffer].raw(); width];
+            for read in &needs.reads {
+                bound[read.slot as usize] = vertices[read.buffer].raw();
+            }
+        }
         let offsets_in_buffer = vec![0; bound.len()];
 
         self.held.insert(

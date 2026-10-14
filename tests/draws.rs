@@ -66,7 +66,7 @@ fn no_instances_is_no_draws() {
     assert_eq!(got, [] as [Draw; 0]);
 }
 
-/// An instanced draw repeats every segment, and its slot has to be nought.
+/// An instanced draw repeats every segment, and its slot has to be zero.
 ///
 /// Both halves of one rule. `firstInstance` addresses the instance-rate attribute fetch as well as
 /// the builtin a body reads as `ubo_index`, so a slot there and more than one instance cannot both

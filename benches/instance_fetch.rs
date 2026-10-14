@@ -25,7 +25,7 @@
 //! `src/lib.rs` states the slot's travel as settled fact. So it is drawn here instead, from a
 //! device, twice over and two different ways:
 //!
-//! * `by_color` draws one instance at `firstInstance` nought through three and reports which
+//! * `by_color` draws one instance at `firstInstance` zero through three and reports which
 //!   element of the instance buffer the attribute read, beside what the builtin held.
 //! * `by_column` draws three instances at `firstInstance` one, each placing a one-pixel column at
 //!   the column its *fetched* element names. Which columns light says which elements were read,
@@ -45,7 +45,7 @@
 //! | RADV `RAPHAEL_MENDOCINO` | element k, builtin k | elements 1, 2, 3 |
 //! | V3D 7.1.7.0 (Mesa 26.2.2) | element k, builtin k | elements 1, 2, 3 |
 //!
-//! And the control held on both: the same buffer read per vertex stayed on element nought through
+//! And the control held on both: the same buffer read per vertex stayed on element zero through
 //! all four draws while the builtin moved under it. So the shift belongs to the instance rate and
 //! not to the draw call.
 //!
@@ -59,7 +59,7 @@
 //!
 //! [`tessella_emblema::draws::indexed`] refuses a non-zero slot on a draw of more than one
 //! instance, rather than recording a draw that is wrong in two ways at once. The instanced wall
-//! family will pass a slot of nought and carry `ubo_index` some other way.
+//! family will pass a slot of zero and carry `ubo_index` some other way.
 //!
 //! Run with `cargo bench --bench instance_fetch`.
 
@@ -483,7 +483,7 @@ fn by_column(open: &Open) -> Result<(), String> {
     // any other value.
     let wanted: Vec<u32> = unshifted.iter().map(|at| FIRST + at).collect();
     // The inputs have to make the two answers different columns, or the comparison below passes
-    // whichever is true. A first instance of nought is exactly that case, and it is the one a
+    // whichever is true. A first instance of zero is exactly that case, and it is the one a
     // later edit would reach for as a simplification.
     if wanted == unshifted {
         return Err(format!(

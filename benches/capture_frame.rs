@@ -60,7 +60,7 @@
 //! are the scene's: the water is `#9ec6dd`, the roads `#cfc7b6`, the buildings `#c9b9a8` through
 //! the light the producer sent (`light_intensity` 0.5, `light_position` 0.2875, -0.498, 0.9959).
 //!
-//! The parks layer is **black**, and that is the capture rather than this crate. Its paint is
+//! The parks layer is **black** in *this* capture, and that is the capture rather than this crate. Its paint is
 //! `fill-pattern: grass_pattern` and the capture carries no sprite, so the producer resolved no
 //! pattern, emitted a plain `FillShader` drawable, and sent the style spec's default `fill-color`
 //! with it -- `#000000`, which is what `FillEvaluatedPropsUBO` holds for that layer. mbgl does not
@@ -70,6 +70,29 @@
 //!
 //! The capture also has no raster tile, so the style's imagery layer is absent, and no symbols,
 //! because the capture was taken without glyphs.
+//!
+//! # And one with the sheet, where the parks are grass
+//!
+//! `--sprite` (tessella#385) hands the tool a sprite sheet, which is what resolves that pattern.
+//! The same tile and style with `tests/sprite-fixtures/emerald`:
+//!
+//! ```text
+//! capture-render --style tools/parity/scenes/families_p.json --tile berlin-z14.mvt \
+//!     --tile-at 14/8801/5374 --source berlin --sprite tests/sprite-fixtures/emerald \
+//!     --lon 13.4 --lat 52.5 --zoom 14 --capture sprited.tslcap
+//! ```
+//!
+//! Replayed, the parks layer arrives as `FillPatternShader` at a *constant* pattern -- the style
+//! names the sprite outright, so the producer sends no rectangle attributes and the rectangles are
+//! in the tile's own block -- and it draws: 83,185 pixels of the frame are greenish and none is
+//! black. Drawn alone with `TSE_ONLY_LAYER=3` over the magenta clear, its commonest pixel is
+//! `[216, 199, 200]`, which is nine tenths of the sheet's own `grass_pattern` (212, 221, 194) over
+//! one tenth of that clear -- the layer's `fill-opacity` is 0.9.
+//!
+//! What it does *not* draw is a second geometry of that layer: a patterned fill with
+//! `fill-antialias` emits a patterned outline beside it, `FillOutlinePatternShader` has no family
+//! here, and this is the frame that settled one of #111's three `UNDRAWN` claims. So the counts
+//! come back one short -- 11 of 12 batches, 1 undrawable -- and #129 is where that is tracked.
 //!
 //! # Taking one with walls in it
 //!
@@ -152,6 +175,12 @@
 //!
 //! No oracle here says which is right; mbgl's own scheme does, and the sibling consumer measured
 //! the clip against it -- 8 gross pixels unclipped against 161 clipped.
+//!
+//! Those three numbers were taken with every building at the wrong height. `Store::upload` packed
+//! its bind list, and this style's extrusion has a constant color between two data-driven
+//! heights, so the base read the height's bytes and the height read nothing bound at all -- see
+//! `benches/first_pixel.rs`'s `fill_past_a_gap`. The scheme is the same either way; a
+//! remeasurement would not be.
 //!
 //! The tile is the parity harness's own, off `serve.sh` on 8080, and has to be decompressed: the
 //! server sends it gzipped and the decoder refuses that with "wire type 7 at byte 0 is a group".

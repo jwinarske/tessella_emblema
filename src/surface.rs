@@ -55,7 +55,7 @@ static GLOBE_CAMERA_FIELDS: [UboField; 1] = [UboField {
 /// `CameraUpdate::globe_matrix`, so no producer can name it and there is nothing to agree with.
 ///
 /// It still needs a key, because the buffer sits beside the ones that do arrive. Chosen past
-/// mbgl's nought-to-ten, past the globe bend's eleven and past tessella's own 128, for the reason
+/// mbgl's zero-to-ten, past the globe bend's eleven and past tessella's own 128, for the reason
 /// `terrain_ubo` gives for those: a number in a dump is then obviously not the producer's.
 pub const GLOBE_CAMERA_SLOT: u32 = 1 << 16;
 
@@ -183,7 +183,7 @@ static TERRAIN_TEXTURE_SLOTS: [u32; 1] = [TERRAIN_ELEVATION_SLOT];
 /// now a read. The reason for the value is the ABI's: past every slot mbgl's own families use, so
 /// a terrain variant's extra texture cannot land on one the flat variant already reads.
 ///
-/// Not to be confused with `terrain_ubo::TERRAIN_MESH_ELEVATION_SLOT`, which is nought: that is
+/// Not to be confused with `terrain_ubo::TERRAIN_MESH_ELEVATION_SLOT`, which is zero: that is
 /// the ground's *own* family, whose table declares one texture and so has nothing to clear. See
 /// [`crate::families`].
 pub const TERRAIN_ELEVATION_SLOT: u32 = tessella_capture_abi::terrain_ubo::TERRAIN_ELEVATION_SLOT;

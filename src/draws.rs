@@ -29,7 +29,7 @@
 //! for the divisor of one every binding here has is the builtin itself.
 //!
 //! So the two uses are exclusive, and [`indexed`] refuses the combination rather than recording a
-//! draw that is wrong in two ways at once. Twenty-two of the twenty-four families draw one
+//! draw that is wrong in two ways at once. Twenty-four of the twenty-six families draw one
 //! instance, where the slot and the instance index agree. The other two are the instanced
 //! extrusions -- the plain walls and the patterned ones -- and both are built around this: each
 //! passes a slot of zero and takes `ubo_index` from a push constant that `shaders::module`

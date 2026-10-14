@@ -18,8 +18,8 @@
 //!
 //! # What is not here
 //!
-//! Twenty-three of mbgl's thirty-six shader entries. [`UNDRAWN`] lists the other thirteen with
-//! the reason, and
+//! Twenty-five of mbgl's thirty-six shader entries. [`UNDRAWN`] lists the other eleven with the
+//! reason, and
 //! [`for_wire`] returns `None` for each, so a producer naming one is a drawable this crate skips
 //! rather than a panic. The list is pinned by a test: adding a family here without removing it
 //! there fails, and so does the reverse.
@@ -32,16 +32,17 @@ use tessella_capture_abi::generated::shader_attributes::{
     FILL_EXTRUSION_PATTERN_SHADER, FILL_EXTRUSION_SHADER, FILL_OUTLINE_PATTERN_SHADER,
     FILL_OUTLINE_SHADER, FILL_OUTLINE_TRIANGULATED_SHADER, FILL_PATTERN_SHADER, FILL_SHADER,
     HEATMAP_SHADER, HEATMAP_TEXTURE_SHADER, HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER,
-    LINE_PATTERN_SHADER, LINE_SHADER, RASTER_SHADER, SYMBOL_ICON_SHADER, SYMBOL_SDFSHADER,
-    SYMBOL_TEXT_AND_ICON_SHADER, ShaderAttribute,
+    LINE_GRADIENT_SHADER, LINE_PATTERN_SHADER, LINE_SDFSHADER, LINE_SHADER, RASTER_SHADER,
+    SYMBOL_ICON_SHADER, SYMBOL_SDFSHADER, SYMBOL_TEXT_AND_ICON_SHADER, ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
     BACKGROUND_PATTERN_SHADER_TEXTURES, COLOR_RELIEF_SHADER_TEXTURES,
     FILL_EXTRUSION_PATTERN_INSTANCED_SHADER_TEXTURES, FILL_EXTRUSION_PATTERN_SHADER_TEXTURES,
     FILL_OUTLINE_PATTERN_SHADER_TEXTURES, FILL_PATTERN_SHADER_TEXTURES,
     HEATMAP_TEXTURE_SHADER_TEXTURES, HILLSHADE_PREPARE_SHADER_TEXTURES, HILLSHADE_SHADER_TEXTURES,
-    LINE_PATTERN_SHADER_TEXTURES, RASTER_SHADER_TEXTURES, SYMBOL_ICON_SHADER_TEXTURES,
-    SYMBOL_SDFSHADER_TEXTURES, SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES, ShaderTexture,
+    LINE_GRADIENT_SHADER_TEXTURES, LINE_PATTERN_SHADER_TEXTURES, LINE_SDFSHADER_TEXTURES,
+    RASTER_SHADER_TEXTURES, SYMBOL_ICON_SHADER_TEXTURES, SYMBOL_SDFSHADER_TEXTURES,
+    SYMBOL_TEXT_AND_ICON_SHADER_TEXTURES, ShaderTexture,
 };
 use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_DRAWABLE_UBO, BACKGROUND_PATTERN_DRAWABLE_UBO, BACKGROUND_PATTERN_PROPS_UBO,
@@ -54,9 +55,10 @@ use tessella_capture_abi::generated::ubo_layouts::{
     GLOBAL_PAINT_PARAMS_UBO, HEATMAP_DRAWABLE_UBO, HEATMAP_EVALUATED_PROPS_UBO,
     HEATMAP_TEXTURE_PROPS_UBO, HILLSHADE_DRAWABLE_UBO, HILLSHADE_EVALUATED_PROPS_UBO,
     HILLSHADE_PREPARE_DRAWABLE_UBO, HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO,
-    LINE_DRAWABLE_UBO, LINE_EVALUATED_PROPS_UBO, LINE_PATTERN_DRAWABLE_UBO,
-    LINE_PATTERN_TILE_PROPS_UBO, RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO,
-    SYMBOL_DRAWABLE_UBO, SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
+    LINE_DRAWABLE_UBO, LINE_EVALUATED_PROPS_UBO, LINE_GRADIENT_DRAWABLE_UBO,
+    LINE_PATTERN_DRAWABLE_UBO, LINE_PATTERN_TILE_PROPS_UBO, LINE_SDF_DRAWABLE_UBO,
+    LINE_SDF_TILE_PROPS_UBO, RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO,
+    SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
 use tessella_capture_abi::terrain_ubo::{
     BUILTIN_TERRAIN_SHADER, TERRAIN_MESH_ATTRIBUTES, TERRAIN_MESH_ELEVATION_SLOT,
@@ -68,8 +70,9 @@ use crate::shaders::{
     FILL_EXTRUSION_BODY, FILL_EXTRUSION_INSTANCED_BODY, FILL_EXTRUSION_PATTERN_BODY,
     FILL_EXTRUSION_PATTERN_INSTANCED_BODY, FILL_OUTLINE_BODY, FILL_OUTLINE_PATTERN_BODY,
     FILL_OUTLINE_TRIANGULATED_BODY, FILL_PATTERN_BODY, HEATMAP_BODY, HEATMAP_TEXTURE_BODY,
-    HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_BODY, LINE_PATTERN_BODY, Paint, Property,
-    RASTER_BODY, SYMBOL_ICON_BODY, SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY, TERRAIN_BODY,
+    HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_BODY, LINE_GRADIENT_BODY, LINE_PATTERN_BODY,
+    LINE_SDF_BODY, Paint, Property, RASTER_BODY, SYMBOL_ICON_BODY, SYMBOL_SDF_BODY,
+    SYMBOL_TEXT_AND_ICON_BODY, TERRAIN_BODY,
 };
 use crate::surface::{Surface, TERRAIN_DRAWABLE_UBO};
 
@@ -640,6 +643,107 @@ const LINE_PATTERN_PAINT: &[Property] = &[
     },
 ];
 
+/// `line_sdf`'s eight: [`LINE_PAINT`] and the width the dash was rasterized at.
+///
+/// `floorwidth` is the only paint property no other line family declares, and it is not a style
+/// property either -- mbgl derives it from `line-width` and passes it as its own attribute, because
+/// the fragment stage needs the *rasterized* width where the vertex stage needs the drawn one. The
+/// factors come out of this family's own drawable block, which carries a `floorwidth_t` beside the
+/// rest.
+const LINE_SDF_PAINT: &[Property] = &[
+    Property {
+        location: 2,
+        name: "color",
+        returns: "vec4<f32>",
+        varies: "mix_color(in.line_color, line_sdf_drawable_ubo[ubo_index].color_t)",
+        constant: "line_evaluated_props_ubo[0].color",
+    },
+    Property {
+        location: 3,
+        name: "blur",
+        returns: "f32",
+        varies: "mix_value(in.line_blur, line_sdf_drawable_ubo[ubo_index].blur_t)",
+        constant: "line_evaluated_props_ubo[0].blur",
+    },
+    Property {
+        location: 4,
+        name: "opacity",
+        returns: "f32",
+        varies: "mix_value(in.line_opacity, line_sdf_drawable_ubo[ubo_index].opacity_t)",
+        constant: "line_evaluated_props_ubo[0].opacity",
+    },
+    Property {
+        location: 5,
+        name: "gapwidth",
+        returns: "f32",
+        varies: "mix_value(in.line_gap_width, line_sdf_drawable_ubo[ubo_index].gapwidth_t)",
+        constant: "line_evaluated_props_ubo[0].gapwidth",
+    },
+    Property {
+        location: 6,
+        name: "offset",
+        returns: "f32",
+        varies: "mix_value(in.line_offset, line_sdf_drawable_ubo[ubo_index].offset_t)",
+        constant: "line_evaluated_props_ubo[0].offset",
+    },
+    Property {
+        location: 7,
+        name: "width",
+        returns: "f32",
+        varies: "mix_value(in.line_width, line_sdf_drawable_ubo[ubo_index].width_t)",
+        constant: "line_evaluated_props_ubo[0].width",
+    },
+    Property {
+        location: 8,
+        name: "floorwidth",
+        returns: "f32",
+        varies: "mix_value(in.line_floor_width, line_sdf_drawable_ubo[ubo_index].floorwidth_t)",
+        constant: "line_evaluated_props_ubo[0].floorwidth",
+    },
+];
+
+/// `line_gradient`'s five: [`LINE_PAINT`] without the color, which the ramp replaces.
+///
+/// Every location is one lower than the plain family's for that reason, and the drawable block has
+/// no `color_t` at all -- `LineGradientDrawableUBO` is the one line block that leaves it out.
+const LINE_GRADIENT_PAINT: &[Property] = &[
+    Property {
+        location: 2,
+        name: "blur",
+        returns: "f32",
+        varies: "mix_value(in.line_blur, line_gradient_drawable_ubo[ubo_index].blur_t)",
+        constant: "line_evaluated_props_ubo[0].blur",
+    },
+    Property {
+        location: 3,
+        name: "opacity",
+        returns: "f32",
+        varies: "mix_value(in.line_opacity, line_gradient_drawable_ubo[ubo_index].opacity_t)",
+        constant: "line_evaluated_props_ubo[0].opacity",
+    },
+    Property {
+        location: 4,
+        name: "gapwidth",
+        returns: "f32",
+        varies: "mix_value(in.line_gap_width, line_gradient_drawable_ubo[ubo_index].gapwidth_t)",
+        constant: "line_evaluated_props_ubo[0].gapwidth",
+    },
+    Property {
+        location: 5,
+        name: "offset",
+        returns: "f32",
+        varies: "mix_value(in.line_offset, line_gradient_drawable_ubo[ubo_index].offset_t)",
+        constant: "line_evaluated_props_ubo[0].offset",
+    },
+    Property {
+        location: 6,
+        name: "width",
+        returns: "f32",
+        varies: "mix_value(in.line_width, line_gradient_drawable_ubo[ubo_index].width_t)",
+        constant: "line_evaluated_props_ubo[0].width",
+    },
+];
+
 /// `circle`'s seven, which is every attribute it declares but the position.
 const CIRCLE_PAINT: &[Property] = &[
     Property {
@@ -1017,6 +1121,41 @@ pub static ALL: &[Family] = &[
         composite: Composite::ByPass,
     },
     Family {
+        shader: BuiltIn::LineSDFShader as i32,
+        name: "line_sdf",
+        blocks: &[
+            &LINE_SDF_DRAWABLE_UBO,
+            &LINE_SDF_TILE_PROPS_UBO,
+            &LINE_EVALUATED_PROPS_UBO,
+            &GLOBAL_PAINT_PARAMS_UBO,
+        ],
+        attributes: &LINE_SDFSHADER,
+        instance_attributes: &[],
+        textures: &LINE_SDFSHADER_TEXTURES,
+        properties: LINE_SDF_PAINT,
+        body: LINE_SDF_BODY,
+        surfaces: EVERY,
+        height: false,
+        composite: Composite::ByPass,
+    },
+    Family {
+        shader: BuiltIn::LineGradientShader as i32,
+        name: "line_gradient",
+        blocks: &[
+            &LINE_GRADIENT_DRAWABLE_UBO,
+            &LINE_EVALUATED_PROPS_UBO,
+            &GLOBAL_PAINT_PARAMS_UBO,
+        ],
+        attributes: &LINE_GRADIENT_SHADER,
+        instance_attributes: &[],
+        textures: &LINE_GRADIENT_SHADER_TEXTURES,
+        properties: LINE_GRADIENT_PAINT,
+        body: LINE_GRADIENT_BODY,
+        surfaces: EVERY,
+        height: false,
+        composite: Composite::ByPass,
+    },
+    Family {
         shader: BuiltIn::CircleShader as i32,
         name: "circle",
         blocks: &[
@@ -1220,9 +1359,16 @@ const SYMBOL_BLOCKS: &[&UboLayout] = &[
 /// carried was a style that sets it. `tools/parity/scenes/extrusion_pattern_p.json` is one, and the
 /// frame it captures plans all seventeen of its geometries across ten families.
 ///
-/// What is left here is claims again, and they are narrower ones: `LineGradientShader` and
-/// `LineSDFShader` are the two the producer has no drawable for at all, and the rest are not map
-/// layers. A capture of a style that uses one is still what would settle the first two.
+/// And so were `LineSDFShader` and `LineGradientShader`, which makes six. That sentence was wrong
+/// about them in the most direct way available: the producer has pinned both against the oracle's
+/// own dumps since they were written -- `gradient_ramps.rs`, `dash_atlases.rs` -- and the styles
+/// that set them are `GeoJSON`, which `capture-render` could not read. tessella#389 taught it to,
+/// and the two captures plan every geometry they carry.
+///
+/// What is left here is not that claim at all. Nothing in this table now says the producer emits no
+/// drawable yet: the eleven are the debug overlays, an embedder's own geometry and symbols, the
+/// puck -- which this consumer draws from its own mesh -- the clipping mask, the prelude, a shader
+/// that is not a maplibre-native layer type, and `None`. Each is a reason no capture can change.
 pub static UNDRAWN: &[(BuiltIn, &str)] = &[
     (
         BuiltIn::None,
@@ -1252,14 +1398,6 @@ pub static UNDRAWN: &[(BuiltIn, &str)] = &[
     (
         BuiltIn::CustomSymbolIconShader,
         "an embedder's own symbols, which this crate has no producer for",
-    ),
-    (
-        BuiltIn::LineGradientShader,
-        "the producer emits no drawable for it yet",
-    ),
-    (
-        BuiltIn::LineSDFShader,
-        "the producer emits no drawable for it yet",
     ),
     (
         BuiltIn::LocationIndicatorShader,

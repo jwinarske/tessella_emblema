@@ -61,9 +61,13 @@ const MBGL: &[(&str, Composite)] = &[
         "fill_extrusion_pattern_instanced",
         Composite::Fixed(Blend::Alpha),
     ),
-    // render_line_layer.cpp:276, on the passes with the opaque bit masked out.
+    // render_line_layer.cpp:276, on the passes with the opaque bit masked out. One builder serves
+    // every line shader -- the lambda at :270 takes the shader as an argument and sets the same
+    // mode whichever it is -- so a dash and a gradient composite like the plain line.
     ("line", Composite::ByPass),
     ("line_pattern", Composite::ByPass),
+    ("line_sdf", Composite::ByPass),
+    ("line_gradient", Composite::ByPass),
     // render_circle_layer.cpp:272.
     ("circle", Composite::Fixed(Blend::Alpha)),
     // render_raster_layer.cpp:154.

@@ -121,8 +121,8 @@ fn every_module_declares_what_the_layout_describes() {
         }
     }
     assert_eq!(
-        checked, 76,
-        "the crate assembles 76 modules; a different number here means the sweep drifted from \
+        checked, 84,
+        "the crate assembles 84 modules; a different number here means the sweep drifted from \
          what tests/shaders.rs compiles"
     );
 }

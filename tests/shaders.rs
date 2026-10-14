@@ -376,6 +376,64 @@ fn the_patterns_keep_their_tiling_decisions() {
     );
 }
 
+/// The two line variants keep what their pixels cannot say.
+///
+/// `benches/first_pixel.rs`'s `line_sdf` and `line_gradient` read everything one pixel can: the
+/// texel each samples, the crossfade between the dash atlas's two rows, the gamma divided by the
+/// rasterized width, and the ramp's coordinate. Three things are not reachable that way.
+///
+/// * **The dash runs across the line as well as along it.** `tex.y` is the normal times the
+///   pattern's own scale plus the row -- so a fragment at the line's edge reads the edge of the
+///   dash. A pixel at the center reads a normal of 0.009, which moves the sample by a thousandth
+///   of a texel; one at the edge is where the line's own coverage stops being exactly one and the
+///   expectation becomes a statement about rounding. The same bind `line_pattern` makes.
+/// * **The ramp is sampled at the middle of its only row.** mbgl bakes `line-gradient` into a
+///   256x1 image, so the `0.5` is the row's center. A body reading the progress as the `y`
+///   coordinate draws a map whose every gradient line is one color.
+/// * **Neither family carries a color the other way.** The gradient has no color attribute at all
+///   -- `LineGradientDrawableUBO` is the one line block with no `color_t` -- and the SDF has the
+///   plain family's. A gradient that read `line_evaluated_props_ubo[0].color` would draw lines
+///   that are not the ramp's colors at all, and would compile.
+#[test]
+fn the_line_variants_keep_their_decisions() {
+    let assembled = |name: &str| {
+        ALL.iter()
+            .find(|family| family.name == name)
+            .unwrap_or_else(|| panic!("{name} is in the matrix"))
+            .module(Surface::Plane, &[])
+            .expect("assembles")
+    };
+    let sdf = assembled("line_sdf");
+    let gradient = assembled("line_gradient");
+
+    assert!(
+        sdf.contains("normal.y * drawable.patternscale_a.y + drawable.tex_y_a")
+            && sdf.contains("normal.y * drawable.patternscale_b.y + drawable.tex_y_b"),
+        "the dash does not run across the line, or reads one row for the other:\n{sdf}"
+    );
+    assert!(
+        sdf.contains("let gamma = tile.sdfgamma / max(in.floorwidth, 1e-6);"),
+        "the dash's gamma is not divided by the width it was rasterized at"
+    );
+    assert!(
+        gradient.contains("vec2<f32>(in.progress, 0.5)"),
+        "the ramp is not sampled along the line at the middle of its row:\n{gradient}"
+    );
+    assert!(
+        gradient.contains("/ 32767.0;"),
+        "the gradient's progress is not a fraction of MAX_LINE_DISTANCE"
+    );
+    // The color, from both sides: the gradient has none and the dash has the plain family's.
+    assert!(
+        !gradient.contains("paint_color") && !gradient.contains("line_color"),
+        "the gradient reads a color, which its shader does not declare"
+    );
+    assert!(
+        sdf.contains("out.color = paint_color(in);"),
+        "the dashed line lost its color"
+    );
+}
+
 /// The patterned extrusion keeps the three decisions a pixel cannot reach.
 ///
 /// `benches/first_pixel.rs`'s two cases read everything about these families that a pixel can say:
@@ -1361,7 +1419,7 @@ fn every_family_on_every_surface_compiles() {
         }
     }
     assert_eq!(
-        pairs, 76,
+        pairs, 84,
         "the matrix grew or shrank; look at the new pairs"
     );
 }
@@ -1425,7 +1483,7 @@ fn every_permutation_of_every_family_compiles() {
     // Not a round number and not worth deriving: it is the shape of the table, and a change to it
     // is a change worth looking at.
     assert_eq!(
-        modules, 261,
+        modules, 317,
         "the permutations grew or shrank; look at the new ones"
     );
 }

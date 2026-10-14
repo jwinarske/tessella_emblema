@@ -91,7 +91,7 @@ pub struct Key {
     /// family, permutation and layout can want two of these, and a cache keyed without it would
     /// hand the second draw the first's pipeline and composite it wrongly. Which draws.
     ///
-    /// Not hypothetical. Seven of the twenty-four families are
+    /// Not hypothetical. Nine of the twenty-six families are
     /// [`crate::families::Composite::ByPass`],
     /// and the captured Berlin frame batches its background twice -- once in each pass -- which is
     /// the same family, permutation and layout under two blends.

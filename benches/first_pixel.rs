@@ -109,7 +109,8 @@ use tessella_capture_abi::generated::ubo_layouts::{
     HEATMAP_DRAWABLE_UBO, HEATMAP_EVALUATED_PROPS_UBO, HEATMAP_TEXTURE_PROPS_UBO,
     HILLSHADE_DRAWABLE_UBO, HILLSHADE_EVALUATED_PROPS_UBO, HILLSHADE_PREPARE_DRAWABLE_UBO,
     HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO, LINE_EVALUATED_PROPS_UBO,
-    LINE_PATTERN_DRAWABLE_UBO, LINE_PATTERN_TILE_PROPS_UBO, RASTER_DRAWABLE_UBO,
+    LINE_GRADIENT_DRAWABLE_UBO, LINE_PATTERN_DRAWABLE_UBO, LINE_PATTERN_TILE_PROPS_UBO,
+    LINE_SDF_DRAWABLE_UBO, LINE_SDF_TILE_PROPS_UBO, RASTER_DRAWABLE_UBO,
     RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO, SYMBOL_EVALUATED_PROPS_UBO,
     SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
@@ -3344,6 +3345,180 @@ fn cases() -> Vec<Case> {
             instanced: None,
             expect: [32, 16, 64, 64],
         },
+        // A dashed line, which is the family the dash atlas and `floorwidth` exist for.
+        //
+        // The geometry is `line_pattern`'s, and so is the coverage: width 5 with no gap gives an
+        // outset of 3 against a blur of 1, so the fade at the center pixel is exactly one and
+        // every number below is about the dash rather than about the line's edge.
+        //
+        // A dash is a *distance field* in the atlas's alpha, not a picture of a dash, and it is
+        // read twice: a pattern is rasterized per zoom, so a layer between two of them samples
+        // both rows and crossfades. The two coordinates:
+        //
+        //   linesofar = (floor(9 / 4) + 2 * 64) * 2                  = 260
+        //   tex_a.x   = 260 * 0.0025 / a floorwidth of 2             = 0.325   -> texel 5
+        //   tex_b.x   = 260 * 0.0050 / 2                             = 0.650   -> texel 10
+        //   tex_a.y   = 0.009069 * 0.1 + 0.15625                     -> texel 2
+        //   tex_b.y   = 0.009069 * 0.1 + 0.40625                     -> texel 6
+        //
+        // The two scales differ by a factor of two so that reading one row for the other moves
+        // the texel, and the `y` offsets differ for the same reason. The normal's contribution is
+        // the 0.0009 either side of the row, which is what the atlas's `y` axis is *for* -- across
+        // the dash rather than along it -- and no single pixel can say more about it than that it
+        // is small.
+        //
+        // Then the field itself:
+        //
+        //   sdfdist = mix(128 / 255, 230 / 255, a mix of 0.25)       = 0.60196
+        //   gamma   = an sdfgamma of 0.5 / a floorwidth of 2         = 0.25
+        //   dash    = smoothstep(0.25, 0.75, 0.60196)                = 0.78893
+        //   out     = (255, 128, 0) * (1 * 0.78893 * an opacity of 0.75)  ->  (151, 76, 0, 151)
+        //
+        // Every term separates. Dropping the dash reads 191; reading row a alone reads 97;
+        // dividing the gamma by nothing -- which is the one a reader of the plain line body would
+        // leave out -- reads 124, because `smoothstep` is symmetric only at its own midpoint and
+        // 0.60196 is not it. That is why the field is not a half.
+        Case {
+            name: "line_sdf",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::LineSDFShader as i32,
+            wire: PLANE,
+            layout: Layout::PerAttribute,
+            streams: vec![
+                shorts(&[-8, 0, 8, 0, 8, 1, -8, 0, 8, 1, -8, 1]),
+                // The extrusion biased by 128, then the distance along the line: the third byte's
+                // low two bits are the cap direction and the rest of it with the fourth is the
+                // distance, which is why the fourth is multiplied by 64.
+                vec![
+                    128, 0, 9, 2, 128, 0, 9, 2, 128, 255, 9, 2, //
+                    128, 0, 9, 2, 128, 255, 9, 2, 128, 255, 9, 2,
+                ],
+                per_vertex(&packed_color([255, 128, 0, 255]), 6),
+                per_vertex(&[0.0, 0.0], 6),
+                per_vertex(&[0.0, 0.75], 6),
+                per_vertex(&[0.0, 0.0], 6),
+                per_vertex(&[0.0, 0.0], 6),
+                per_vertex(&[5.0, 5.0], 6),
+                per_vertex(&[2.0, 2.0], 6),
+            ],
+            uniforms: vec![
+                block(
+                    &LINE_SDF_DRAWABLE_UBO,
+                    &[
+                        ("matrix", At::F(&CLIP)),
+                        ("patternscale_a", At::F(&[0.0025, 0.1])),
+                        ("patternscale_b", At::F(&[0.005, 0.1])),
+                        ("tex_y_a", At::F(&[0.15625])),
+                        ("tex_y_b", At::F(&[0.40625])),
+                        ("ratio", At::F(&[1.0])),
+                        ("opacity_t", At::F(&[1.0])),
+                    ],
+                ),
+                block(
+                    &LINE_SDF_TILE_PROPS_UBO,
+                    &[("sdfgamma", At::F(&[0.5])), ("mix", At::F(&[0.25]))],
+                ),
+                block(&LINE_EVALUATED_PROPS_UBO, &[]),
+                block(
+                    &GLOBAL_PAINT_PARAMS_UBO,
+                    &[
+                        ("units_to_pixels", At::F(&[1.0, 1.0])),
+                        ("pixel_ratio", At::F(&[1.0])),
+                    ],
+                ),
+            ],
+            // One channel, because that is what the producer uploads: `tessella_glyph::dash`
+            // builds "one single-channel image, one byte a pixel". The format is `R8_UNORM` here,
+            // so the field comes back in `.r` and alpha reads 1.0 -- and a probe that handed this
+            // family an RGBA image would agree with a body sampling `.a`, which draws every dash
+            // solid. The capture of `dash_style.json` is what found that; this is what keeps it
+            // found.
+            images: vec![Image::red(16, 16, |x, y| match (x, y) {
+                (5, 2) => 128,
+                (10, 6) => 230,
+                _ => 0,
+            })],
+            vertices: 6,
+            topology: Topology::Triangles,
+            ubo_index: 0,
+            pass: None,
+            absent: &[],
+            instanced: None,
+            expect: [151, 76, 0, 151],
+        },
+        // And a gradient, which is the one line family with no color at all.
+        //
+        // `line-gradient` is a ramp along the line, baked into one image per layer, so the color
+        // comes out of a texture at a coordinate the vertex stage computes. The same fourteen bits
+        // the dash above reads as a distance, divided rather than scaled:
+        //
+        //   progress = (floor(1 / 4) + 200 * 64) * 2 / 32767           = 0.78127
+        //   texel    = 0.78127 * 16                                   = 12.5 of a 16x1 ramp
+        //   out      = (192, 48, 255) * (1 * an opacity of 0.75)  ->  (144, 36, 191, 191)
+        //
+        // The ramp is one row, as mbgl bakes it, so the `0.5` the sampler is given for `y` lands
+        // in the middle of the only row there is rather than on a boundary.
+        //
+        // 200 is chosen so the progress lands on a texel's center and so that each way of getting
+        // it wrong lands on a different one: without the division by `MAX_LINE_DISTANCE` the
+        // coordinate is 25,600 and wraps to texel 15, reading (180, 45); without the factor of two
+        // it is texel 6, reading (72, 18); and with the two axes swapped it is texel 8, reading
+        // (96, 24). That last one is why the progress is not a half: at 0.5 the swap reads the
+        // same texel either way and says nothing.
+        Case {
+            name: "line_gradient",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::LineGradientShader as i32,
+            wire: PLANE,
+            layout: Layout::PerAttribute,
+            streams: vec![
+                shorts(&[-8, 0, 8, 0, 8, 1, -8, 0, 8, 1, -8, 1]),
+                vec![
+                    128, 0, 1, 200, 128, 0, 1, 200, 128, 255, 1, 200, //
+                    128, 0, 1, 200, 128, 255, 1, 200, 128, 255, 1, 200,
+                ],
+                per_vertex(&[0.0, 0.0], 6),
+                per_vertex(&[0.0, 0.75], 6),
+                per_vertex(&[0.0, 0.0], 6),
+                per_vertex(&[0.0, 0.0], 6),
+                per_vertex(&[5.0, 5.0], 6),
+            ],
+            uniforms: vec![
+                block(
+                    &LINE_GRADIENT_DRAWABLE_UBO,
+                    &[
+                        ("matrix", At::F(&CLIP)),
+                        ("ratio", At::F(&[1.0])),
+                        ("opacity_t", At::F(&[1.0])),
+                    ],
+                ),
+                block(&LINE_EVALUATED_PROPS_UBO, &[]),
+                block(
+                    &GLOBAL_PAINT_PARAMS_UBO,
+                    &[
+                        ("units_to_pixels", At::F(&[1.0, 1.0])),
+                        ("pixel_ratio", At::F(&[1.0])),
+                    ],
+                ),
+            ],
+            // One row, like the ramp mbgl bakes, and every texel a different color so the pixel
+            // says which was read.
+            images: vec![Image::sized(16, 1, |x, _| {
+                [
+                    u8::try_from(x * 16).unwrap_or(255),
+                    u8::try_from(x * 4).unwrap_or(255),
+                    255,
+                    255,
+                ]
+            })],
+            vertices: 6,
+            topology: Topology::Triangles,
+            ubo_index: 0,
+            pass: None,
+            absent: &[],
+            instanced: None,
+            expect: [144, 36, 191, 191],
+        },
         // A symbol's icon: a sprite from a sheet, with no color of its own and no halo.
         //
         // The placement is the one the two SDF cases above already check, so what is new is the
@@ -4243,7 +4418,8 @@ const WHICH: blocks::Which = blocks::Which {
 
 /// The one slot a case declares that is the frame's rather than a layer's.
 ///
-/// `GlobalPaintParamsUBO`, which nineteen of the twenty-four families' modules declare on a plane.
+/// `GlobalPaintParamsUBO`, which twenty-one of the twenty-six families' modules declare on a
+/// plane.
 /// Named here rather than
 /// asked of `slots::scope`, because that is what this probe is checking: an oracle derived from
 /// the code under test moves with it.
@@ -4832,7 +5008,7 @@ fn draw_case<'d>(
         }
         let entries = bytes.len() / stride;
         // Where the producer would have put it: a frame-wide block arrives under `layer_index:
-        // -1` rather than under the layer drawing, and nineteen of the twenty-four families declare
+        // -1` rather than under the layer drawing, and twenty-one of the twenty-six families declare
         // one.
         //
         // Decided here from the slot rather than asked of `slots::held_at`, which is the thing

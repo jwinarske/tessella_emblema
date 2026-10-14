@@ -4,17 +4,17 @@
 //! Nothing on the wire says this. `grep -i color_mode crates/tessella-capture-abi/src` is empty,
 //! and it is empty correctly: mbgl does not take a color mode from a style either, it writes one
 //! per render layer in `src/mbgl/renderer/layers/`. So the consumer owns the fact, and owning it
-//! means transcribing twenty entries by hand -- and deciding a twenty-first, the ground, which has
-//! no render layer to read because mbgl has no terrain.
+//! means transcribing twenty-one entries by hand -- and deciding a twenty-second, the ground,
+//! which has no render layer to read because mbgl has no terrain.
 //!
 //! Which is why the first test here is a second copy of the table. That is a weak check on its
 //! own -- it catches an edit rather than a mistranscription -- and it is paired with one that is
-//! not a copy: nineteen of the twenty-one are derivable from whether the family draws onto the map
+//! not a copy: twenty of the twenty-two are derivable from whether the family draws onto the map
 //! or into a target of its own, and that derivation agrees with the transcription. The two that are
 //! left are the two the derivation names.
 //!
-//! What no test here can reach is whether the twenty mbgl rows were read off correctly in the first
-//! place. The pixels are what settles that, and `benches/first_pixel.rs` draws the background's
+//! What no test here can reach is whether the twenty-one mbgl rows were read off correctly in the
+//! first place. The pixels are what settles that, and `benches/first_pixel.rs` draws the background's
 //! two arms over an opaque clear: the same four bytes at an opacity of one, two different ones
 //! faded.
 
@@ -43,13 +43,14 @@ const MBGL: &[(&str, Composite)] = &[
     // render_background_layer.cpp:217, `drawPasses == RenderPass::Translucent`.
     ("background", Composite::ByPass),
     ("background_pattern", Composite::ByPass),
-    // render_fill_layer.cpp:391 for the fill, 403 for both outlines, 480 and 492 for the
-    // patterned pair. The triangulated outline reuses the outline's own builder, so its mode is
+    // render_fill_layer.cpp:391 for the fill, 403 for both outlines, 480 for the pattern and 492
+    // for its outline. The triangulated outline reuses the outline's own builder, so its mode is
     // the one set at 403.
     ("fill", Composite::Fixed(Blend::Alpha)),
     ("fill_outline", Composite::Fixed(Blend::Alpha)),
     ("fill_outline_triangulated", Composite::Fixed(Blend::Alpha)),
     ("fill_pattern", Composite::Fixed(Blend::Alpha)),
+    ("fill_outline_pattern", Composite::Fixed(Blend::Alpha)),
     // render_fill_extrusion_layer.cpp:304 and :425, the second being the instanced path.
     ("fill_extrusion", Composite::Fixed(Blend::Alpha)),
     ("fill_extrusion_instanced", Composite::Fixed(Blend::Alpha)),
@@ -121,8 +122,8 @@ fn onto_the_map(family: &Family) -> bool {
 
 /// A family that draws onto the map alpha-blends, always or by pass. Nothing else can be right.
 ///
-/// This is the half of the transcription that is derivable, and it covers nineteen of the
-/// twenty-one.
+/// This is the half of the transcription that is derivable, and it covers twenty of the
+/// twenty-two.
 /// A draw onto the map lands on pixels some other layer has already written -- that is what a
 /// painter order is -- so replacing them loses the layer underneath and adding to them brightens
 /// it. Either is a mode that still draws, which is the whole reason to pin this at all.

@@ -66,6 +66,7 @@
 mod common;
 
 use ash::vk;
+use tessella_capture_abi::envelope::Topology;
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_emblema::device::{self, Attachment};
 use tessella_emblema::pipelines::{self, Blend, Key, Slot, Targets};
@@ -418,6 +419,7 @@ fn pipeline<'d>(
     let key = Key {
         shader: BuiltIn::FillExtrusionInstancedShader as i32,
         surface: Surface::Plane,
+        topology: Topology::Triangles,
         permutation: 0,
         layout: layout_slots(rate),
         blend: Blend::Unblended,

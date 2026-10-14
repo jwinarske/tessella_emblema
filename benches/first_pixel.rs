@@ -94,7 +94,7 @@
 use ash::vk;
 use tessella_capture_abi::envelope::{
     AttributeDesc, DrawFlags, Extent, GeometryId, Rect16, SlabRef, TextureFilter, TextureId,
-    TextureRef, ViewId,
+    TextureRef, Topology, ViewId,
 };
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_capture_abi::generated::shader_attributes::ShaderAttribute;
@@ -103,14 +103,14 @@ use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
     COLOR_RELIEF_DRAWABLE_UBO, COLOR_RELIEF_EVALUATED_PROPS_UBO, COLOR_RELIEF_TILE_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
-    FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, FILL_PATTERN_DRAWABLE_UBO,
-    FILL_PATTERN_TILE_PROPS_UBO, GLOBAL_PAINT_PARAMS_UBO, HEATMAP_DRAWABLE_UBO,
-    HEATMAP_EVALUATED_PROPS_UBO, HEATMAP_TEXTURE_PROPS_UBO, HILLSHADE_DRAWABLE_UBO,
-    HILLSHADE_EVALUATED_PROPS_UBO, HILLSHADE_PREPARE_DRAWABLE_UBO,
-    HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO, LINE_EVALUATED_PROPS_UBO,
-    LINE_PATTERN_DRAWABLE_UBO, LINE_PATTERN_TILE_PROPS_UBO, RASTER_DRAWABLE_UBO,
-    RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO, SYMBOL_EVALUATED_PROPS_UBO,
-    SYMBOL_TILE_PROPS_UBO, UboLayout,
+    FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, FILL_OUTLINE_PATTERN_DRAWABLE_UBO,
+    FILL_OUTLINE_PATTERN_TILE_PROPS_UBO, FILL_PATTERN_DRAWABLE_UBO, FILL_PATTERN_TILE_PROPS_UBO,
+    GLOBAL_PAINT_PARAMS_UBO, HEATMAP_DRAWABLE_UBO, HEATMAP_EVALUATED_PROPS_UBO,
+    HEATMAP_TEXTURE_PROPS_UBO, HILLSHADE_DRAWABLE_UBO, HILLSHADE_EVALUATED_PROPS_UBO,
+    HILLSHADE_PREPARE_DRAWABLE_UBO, HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO,
+    LINE_EVALUATED_PROPS_UBO, LINE_PATTERN_DRAWABLE_UBO, LINE_PATTERN_TILE_PROPS_UBO,
+    RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO,
+    SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
 use tessella_capture_abi::terrain_ubo::BUILTIN_TERRAIN_SHADER;
 use tessella_capture_abi::{ProjectionMode, RenderPass, TextureChannelDataType, TexturePixelType};
@@ -288,6 +288,19 @@ struct Case {
     /// under test. The background is the family worth testing it on: it is `Composite::ByPass`, so
     /// its two pass bits give two different pipelines out of one family.
     pass: Option<u8>,
+    /// What the case's own indices mean, which is pipeline state.
+    ///
+    /// [`Topology::Triangles`] for every case but the patterned outline, which mbgl draws with
+    /// `gfx::Lines` and the producer marks as such -- so the case that reads a pixel off one has
+    /// to be drawn as one. A line case's `vertices` is two, which a triangle list draws nothing
+    /// from at all: that is the mutation, and it reads the clear.
+    ///
+    /// `fill_outline` is a deliberate exception and keeps its covering triangle. `Topology::of`
+    /// marks that family lines too, and what that case is for is the body rather than the
+    /// primitive -- the `y` flip and the feather, which need a fragment at distance zero from its
+    /// own vertex. A triangle is the shortest way to one, and the primitive is under test in the
+    /// case below and in `tests/pipelines.rs`.
+    topology: Topology,
     /// Which entry of the blocks the draw reads, which the body receives as `ubo_index`.
     ///
     /// Zero for every case but one. `drawable_at_one` is the exception and the reason this is a
@@ -795,6 +808,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -833,6 +847,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -874,6 +889,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -926,6 +942,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[1, 2],
@@ -976,6 +993,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[1],
@@ -1038,6 +1056,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 1,
             pass: None,
             absent: &[],
@@ -1070,6 +1089,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: Some(RenderPass::OPAQUE.bits()),
             absent: &[],
@@ -1109,6 +1129,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: Some(RenderPass::TRANSLUCENT.bits()),
             absent: &[],
@@ -1139,6 +1160,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: Some(RenderPass::OPAQUE.bits()),
             absent: &[],
@@ -1171,6 +1193,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: Some(RenderPass::TRANSLUCENT.bits()),
             absent: &[],
@@ -1221,6 +1244,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -1283,6 +1307,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -1377,6 +1402,7 @@ fn cases() -> Vec<Case> {
                 ]
             })],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -1431,6 +1457,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -1552,6 +1579,7 @@ fn cases() -> Vec<Case> {
                 ],
                 count: 1,
             }),
+            topology: Topology::Triangles,
             ubo_index: 0,
             expect: [12, 213, 255, 255],
         },
@@ -1664,6 +1692,7 @@ fn cases() -> Vec<Case> {
                 ],
                 count: 1,
             }),
+            topology: Topology::Triangles,
             ubo_index: 1,
             expect: [8, 149, 255, 255],
         },
@@ -1749,6 +1778,7 @@ fn cases() -> Vec<Case> {
                 Image::new(4, |_, _| [255, 0, 255, 255]),
             ],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -1833,6 +1863,7 @@ fn cases() -> Vec<Case> {
                 Image::new(4, |_, _| [255, 0, 255, 255]),
             ],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -1896,6 +1927,7 @@ fn cases() -> Vec<Case> {
                 Image::new(4, |_, _| [255, 0, 255, 255]),
             ],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -1961,6 +1993,7 @@ fn cases() -> Vec<Case> {
                 }),
             ],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -2046,6 +2079,7 @@ fn cases() -> Vec<Case> {
                 }),
             ],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -2083,6 +2117,7 @@ fn cases() -> Vec<Case> {
             uniforms: symbol_blocks(symbol_drawable()),
             images: vec![glyph_atlas()],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -2121,6 +2156,7 @@ fn cases() -> Vec<Case> {
             uniforms: symbol_blocks(symbol_drawable()),
             images: vec![glyph_atlas()],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -2171,6 +2207,7 @@ fn cases() -> Vec<Case> {
                 [u8::try_from(x * 20 + y * 5).unwrap_or(255), 0, 0, 255]
             })],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -2244,6 +2281,7 @@ fn cases() -> Vec<Case> {
                 _ => [128, 128, 0, 255],
             })],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -2318,6 +2356,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 6,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -2409,6 +2448,7 @@ fn cases() -> Vec<Case> {
                 ]
             })],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -2485,6 +2525,7 @@ fn cases() -> Vec<Case> {
                 ]
             })],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -2579,6 +2620,7 @@ fn cases() -> Vec<Case> {
                 ]
             })],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 1,
             pass: None,
             absent: &[],
@@ -2692,11 +2734,108 @@ fn cases() -> Vec<Case> {
                 ]
             })],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 1,
             pass: None,
             absent: &[1, 2],
             instanced: None,
             expect: [48, 24, 64, 64],
+        },
+        // The patterned fill's *outline*, which is the one family here drawn as lines.
+        //
+        // `Topology::of` gives `FillOutlinePatternShader` lines, because mbgl draws it with
+        // `gfx::Lines` -- two indices a primitive over the fill bucket's ring edges. So the case
+        // sends two vertices and the key carries the topology, and the pipeline's input assembly
+        // is what turns them into a primitive at all: a triangle list draws nothing from two
+        // vertices, which is the mutation and reads the clear.
+        //
+        // The geometry is the main diagonal, from (-1, -1) to (3, 3), and that is what makes the
+        // feather readable. `FILL_OUTLINE_BODY`'s note explains the fade: the vertex stage divides
+        // by `w` and the result is interpolated, so a fragment whose center lies *on* the line is
+        // at distance zero from its own interpolated position and the fade is one. The center
+        // pixel's framebuffer coordinate is (16.5, 16.5), which is the point (0.03125, 0.03125) in
+        // clip space -- on `y == x` exactly.
+        //
+        // The sprite is `fill_pattern`'s, at the same two divisions and the same anchor, and the
+        // position at that pixel is the same 0.03125 a covering triangle interpolates to:
+        //
+        //   pattern size = (8 - 0) / a pixel ratio of 2 * a from-scale of 2.5   = 10
+        //   offset       = wrap(wrap(wrap(1001, 10) * 256, 10) * 256 + 7, 10)   = 3
+        //   pos          = (500 * 0.03125 + 3) / 10 = 1.8625, wrapped           = 0.8625
+        //   uv           = mix((0, 0) / 16, (8, 8) / 16, 0.8625)  ->  texel (6, 6)
+        //
+        // At an opacity of one, so the pixel is the texel itself and anything the feather or the
+        // opacity takes off it is visible rather than rounded away:
+        //
+        //   clean                 ->  [96, 48, 128, 128]
+        //   drawn as triangles    ->  the clear, from two vertices
+        //   the sprite's corners read from `pattern_to`  ->  texel 14, [224, 112, 128, 128]
+        //
+        // The feather is *not* under test here and cannot be: at distance zero the fade is one,
+        // so a body that dropped it reads the same pixel. That is true of `fill_outline`'s case
+        // for the same reason, and `tests/shaders.rs` is where the two lines that compute it are
+        // pinned as text.
+        Case {
+            name: "fill_outline_pattern",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillOutlinePatternShader as i32,
+            wire: PLANE,
+            layout: Layout::PerAttribute,
+            streams: vec![
+                shorts(&[-1, -1, 3, 3]),
+                ushorts(&[0, 0, 8, 8, 0, 0, 8, 8]),
+                ushorts(&[8, 8, 16, 16, 8, 8, 16, 16]),
+                per_vertex(&[0.0, 1.0], 2),
+            ],
+            uniforms: vec![
+                block(
+                    &FILL_OUTLINE_PATTERN_DRAWABLE_UBO,
+                    &[
+                        ("matrix", At::F(&CLIP)),
+                        ("pixel_coord_upper", At::F(&[1001.0, 1001.0])),
+                        ("pixel_coord_lower", At::F(&[7.0, 7.0])),
+                        ("tile_ratio", At::F(&[500.0])),
+                        ("opacity_t", At::F(&[1.0])),
+                    ],
+                ),
+                block(
+                    &FILL_OUTLINE_PATTERN_TILE_PROPS_UBO,
+                    &[("texsize", At::F(&[16.0, 16.0]))],
+                ),
+                block(
+                    &FILL_EVALUATED_PROPS_UBO,
+                    &[
+                        ("fade", At::F(&[0.0])),
+                        ("from_scale", At::F(&[2.5])),
+                        ("to_scale", At::F(&[2.5])),
+                    ],
+                ),
+                block(
+                    &GLOBAL_PAINT_PARAMS_UBO,
+                    &[
+                        ("pixel_ratio", At::F(&[2.0])),
+                        (
+                            "world_size",
+                            At::F(&[f64::from(SIDE) as f32, f64::from(SIDE) as f32]),
+                        ),
+                    ],
+                ),
+            ],
+            images: vec![Image::new(16, |x, y| {
+                [
+                    u8::try_from(x * 16).unwrap_or(255),
+                    u8::try_from(y * 8).unwrap_or(255),
+                    128,
+                    128,
+                ]
+            })],
+            vertices: 2,
+            topology: Topology::Lines,
+            ubo_index: 0,
+            pass: None,
+            absent: &[],
+            instanced: None,
+            expect: [96, 48, 128, 128],
         },
         // A sprite running along a line, which is the last family a pixel can reach.
         //
@@ -2807,6 +2946,7 @@ fn cases() -> Vec<Case> {
                 ]
             })],
             vertices: 6,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -2844,6 +2984,7 @@ fn cases() -> Vec<Case> {
             uniforms: symbol_blocks(symbol_drawable()),
             images: vec![sprite_sheet(16)],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -2876,6 +3017,7 @@ fn cases() -> Vec<Case> {
                 sprite_sheet(16),
             ],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -2907,6 +3049,7 @@ fn cases() -> Vec<Case> {
                 sprite_sheet(16),
             ],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -3001,6 +3144,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -3064,6 +3208,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -3149,6 +3294,7 @@ fn cases() -> Vec<Case> {
                 ]
             })],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -3243,6 +3389,7 @@ fn cases() -> Vec<Case> {
                 Image::new(4, |_, _| [128, 128, 128, 255]),
             ],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -3324,6 +3471,7 @@ fn cases() -> Vec<Case> {
                 ]
             })],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -3385,6 +3533,7 @@ fn cases() -> Vec<Case> {
             // unbound sampler is undefined rather than zero.
             images: vec![Image::new(4, |_, _| [128, 128, 128, 255])],
             vertices: 3,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -3438,6 +3587,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 6,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[],
@@ -3513,6 +3663,7 @@ fn cases() -> Vec<Case> {
             ],
             images: Vec::new(),
             vertices: 6,
+            topology: Topology::Triangles,
             ubo_index: 0,
             pass: None,
             absent: &[1, 2, 3, 4, 5, 6, 7],
@@ -3701,7 +3852,7 @@ const WHICH: blocks::Which = blocks::Which {
 
 /// The one slot a case declares that is the frame's rather than a layer's.
 ///
-/// `GlobalPaintParamsUBO`, which eight of the twenty-one families declare. Named here rather than
+/// `GlobalPaintParamsUBO`, which twelve of the twenty-two families declare. Named here rather than
 /// asked of `slots::scope`, because that is what this probe is checking: an oracle derived from
 /// the code under test moves with it.
 const FRAME_WIDE_SLOT: u32 = tessella_capture_abi::generated::ubo_slots::ID_GLOBAL_PAINT_PARAMS_UBO;
@@ -4212,6 +4363,7 @@ fn draw_case<'d>(
     let key = pipelines::key(
         case.family,
         surface,
+        case.topology,
         &plan,
         case.pass.map_or(Blend::Unblended, |pass| found.blend(pass)),
         pipelines::Depth::Write,
@@ -4276,7 +4428,7 @@ fn draw_case<'d>(
         }
         let entries = bytes.len() / stride;
         // Where the producer would have put it: a frame-wide block arrives under `layer_index:
-        // -1` rather than under the layer drawing, and eight of the twenty-one families declare
+        // -1` rather than under the layer drawing, and twelve of the twenty-two families declare
         // one.
         //
         // Decided here from the slot rather than asked of `slots::held_at`, which is the thing

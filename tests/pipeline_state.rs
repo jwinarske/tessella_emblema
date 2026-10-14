@@ -19,6 +19,7 @@
 //! a pipeline with all four wrong builds perfectly well.
 
 use ash::vk;
+use tessella_capture_abi::envelope::Topology;
 use tessella_emblema::device::Attachment;
 use tessella_emblema::pipelines;
 
@@ -290,6 +291,7 @@ fn the_blend_mode_is_part_of_the_key() {
         stencil: pipelines::Stencil::Clip,
         shader: BuiltIn::FillShader as i32,
         surface: Surface::Plane,
+        topology: Topology::Triangles,
         permutation: 0,
         layout: Vec::new(),
         blend,
@@ -484,6 +486,7 @@ fn the_asked_for_state_is_part_of_the_key() {
     let of = |enabled, stencil| pipelines::Key {
         shader: BuiltIn::FillShader as i32,
         surface: Surface::Plane,
+        topology: Topology::Triangles,
         permutation: 0,
         layout: Vec::new(),
         blend: pipelines::Blend::Alpha,

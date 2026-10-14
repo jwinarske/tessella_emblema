@@ -349,6 +349,31 @@ fn the_patterns_keep_their_tiling_decisions() {
             && !fill.contains("drawable.pattern_to_t"),
         "the fill pattern interpolates a sprite name"
     );
+
+    // And the outline's, which is the same sprite arithmetic under the outline's own feather. The
+    // feather is textual here because no pixel can reach it: a fragment whose center is on the
+    // line is at distance zero and the fade is one either way -- see `benches/first_pixel.rs`'s
+    // `fill_outline_pattern`. What a dropped feather would cost is a whole-width outline where
+    // mbgl fades over the last pixel.
+    let outline = assembled("fill_outline_pattern");
+    assert!(
+        outline.contains("let distance = length(in.screen - in.clip.xy);")
+            && outline.contains("let alpha = 1.0 - smoothstep(0.0, 1.0, distance);"),
+        "the patterned outline has no feather:\n{outline}"
+    );
+    assert!(
+        outline.contains("return mix(color_a, color_b, props.fade) * alpha * in.opacity;"),
+        "the patterned outline drops the feather or the opacity from what it returns"
+    );
+    assert!(
+        outline.contains("out.screen = (vec2<f32>(clip.x, -clip.y) / clip.w + 1.0) / 2.0"),
+        "the patterned outline reads its screen position without the flip naga applies after it"
+    );
+    assert_eq!(
+        outline.matches("drawable.tile_ratio,").count(),
+        2,
+        "the patterned outline's two sprites do not both convert to tile units"
+    );
 }
 
 /// The line pattern keeps the four decisions that run a sprite along a line wrongly.
@@ -1270,7 +1295,7 @@ fn every_family_on_every_surface_compiles() {
         }
     }
     assert_eq!(
-        pairs, 66,
+        pairs, 70,
         "the matrix grew or shrank; look at the new pairs"
     );
 }
@@ -1334,7 +1359,7 @@ fn every_permutation_of_every_family_compiles() {
     // Not a round number and not worth deriving: it is the shape of the table, and a change to it
     // is a change worth looking at.
     assert_eq!(
-        modules, 215,
+        modules, 231,
         "the permutations grew or shrank; look at the new ones"
     );
 }
@@ -1668,6 +1693,8 @@ const UNUSED_FACTORS: &[(&str, &str)] = &[
     // the two sampled colors through `fade` instead.
     ("fill_pattern", "pattern_from_t"),
     ("fill_pattern", "pattern_to_t"),
+    ("fill_outline_pattern", "pattern_from_t"),
+    ("fill_outline_pattern", "pattern_to_t"),
     ("line_pattern", "pattern_from_t"),
     ("line_pattern", "pattern_to_t"),
 ];

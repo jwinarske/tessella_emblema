@@ -89,10 +89,15 @@
 //! `[216, 199, 200]`, which is nine tenths of the sheet's own `grass_pattern` (212, 221, 194) over
 //! one tenth of that clear -- the layer's `fill-opacity` is 0.9.
 //!
-//! What it does *not* draw is a second geometry of that layer: a patterned fill with
-//! `fill-antialias` emits a patterned outline beside it, `FillOutlinePatternShader` has no family
-//! here, and this is the frame that settled one of #111's three `UNDRAWN` claims. So the counts
-//! come back one short -- 11 of 12 batches, 1 undrawable -- and #129 is where that is tracked.
+//! The second geometry of that layer is its outline: a patterned fill with `fill-antialias` emits
+//! a patterned one beside it, and this is the frame that settled one of #111's three `UNDRAWN`
+//! claims -- `FillOutlinePatternShader` had no family here until it was named twice by a real
+//! capture. With it, this frame draws **all twelve of its batches** in nine families with nothing
+//! undrawable.
+//!
+//! That outline is also the one drawable here the wire marks `Topology::Lines`, which is the whole
+//! reason the topology is in the pipeline key. Drawn as triangles, its ring indices paint a band:
+//! 47,612 pixels of this frame against the 11,379 the line covers.
 //!
 //! # Taking one with walls in it
 //!
@@ -575,6 +580,7 @@ fn run(path: &str) -> Result<(), String> {
         vertices::Plan,
         buffers::Needs,
         Vec<tessella_capture_abi::envelope::Segment>,
+        tessella_capture_abi::envelope::Topology,
     )> = {
         let mut out = Vec::new();
         let mut families_seen = BTreeSet::new();
@@ -619,7 +625,23 @@ fn run(path: &str) -> Result<(), String> {
             // and the module both come off it, and this is the only place it is built.
             let needs = buffers::needs(&plan, add.indexes);
             refs.insert(*geometry, drawable.geometry.texture_refs.clone());
-            out.push((*geometry, plan, needs, drawable.geometry.segments.clone()));
+            // What the indices mean, which the pipeline key carries: the patterned outline's are
+            // pairs, and drawn as triangles they paint a band along every ring rather than a line.
+            // A byte the ABI says is unreadable is this crate's own refusal rather than the wire's.
+            let Some(topology) = add.topology() else {
+                refused.push(format!(
+                    "geometry {} on {}: topology {} is not one the ABI names",
+                    geometry.0, family.name, add.topology
+                ));
+                continue;
+            };
+            out.push((
+                *geometry,
+                plan,
+                needs,
+                drawable.geometry.segments.clone(),
+                topology,
+            ));
         }
         println!(
             "  the plans             {}   {} of {} geometries planned, {} famil{}: {}",
@@ -648,7 +670,7 @@ fn run(path: &str) -> Result<(), String> {
     let gpu = device.gpu();
     let mut store = Store::new();
     let mut failed = Vec::new();
-    for (geometry, _, needs, segments) in &plans {
+    for (geometry, _, needs, segments, _) in &plans {
         if let Err(why) = store.upload(gpu, *geometry, needs, segments, &|reference| {
             slab::resolve(region, &slabs, reference)
         }) {
@@ -1007,13 +1029,14 @@ fn run(path: &str) -> Result<(), String> {
             undrawable.push(format!("{} on layer {layer} has no geometry", family.name));
             continue;
         };
-        let Some((_, plan, _, _)) = plans.iter().find(|(id, ..)| id == geometry) else {
+        let Some((_, plan, _, _, topology)) = plans.iter().find(|(id, ..)| id == geometry) else {
             undrawable.push(format!("geometry {} has no plan", geometry.0));
             continue;
         };
         let key = pipelines::key(
             family.shader,
             *surface,
+            *topology,
             plan,
             family.blend(batch.key.pass),
             pipelines::Depth::of(batch.key.pass, batch.key.draw_flags),
@@ -1041,7 +1064,7 @@ fn run(path: &str) -> Result<(), String> {
         let per_drawable = !family.instance_attributes.is_empty();
         if per_drawable {
             for geometry in batch.geometries {
-                let Some((_, _, needs, _)) = plans.iter().find(|(id, ..)| id == geometry) else {
+                let Some((_, _, needs, _, _)) = plans.iter().find(|(id, ..)| id == geometry) else {
                     continue;
                 };
                 let shared = *needs.storage.first().ok_or_else(|| {

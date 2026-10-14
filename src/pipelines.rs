@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 
 use ash::vk;
-use tessella_capture_abi::envelope::DrawFlags;
+use tessella_capture_abi::envelope::{DrawFlags, Topology};
 
 use tessella_vk::{DescriptorSetLayout, Gpu, PipelineLayout};
 
@@ -60,6 +60,18 @@ pub struct Key {
     pub shader: i32,
     /// Which surface its module was assembled against.
     pub surface: Surface,
+    /// What the drawable's indices mean, which is `GeometryAdd::topology`.
+    ///
+    /// In the key because the primitive is pipeline state: `VkPipelineInputAssemblyStateCreateInfo`
+    /// is baked in, so one family's two topologies are two pipelines. The location indicator is the
+    /// case the wire carries this for at all -- its accuracy circle is one family drawing a
+    /// triangle fan and a line strip over one buffer -- and the fill outlines are the case that
+    /// reaches this crate: `Topology::of` gives `FillOutlineShader` and
+    /// `FillOutlinePatternShader` lines, because mbgl draws both with `gfx::Lines`.
+    ///
+    /// Taken as the wire's answer rather than derived from the shader, which is what rev 1 of the
+    /// ABI did and what `Topology`'s own doc says stopped working.
+    pub topology: Topology,
     /// Which of the family's attributes the drawable did not send, as a bitmask over locations.
     ///
     /// mbgl's `propertiesAsUniforms`, by another route. A data-driven paint property that is
@@ -79,7 +91,7 @@ pub struct Key {
     /// family, permutation and layout can want two of these, and a cache keyed without it would
     /// hand the second draw the first's pipeline and composite it wrongly. Which draws.
     ///
-    /// Not hypothetical. Seven of the twenty-one families are
+    /// Not hypothetical. Seven of the twenty-two families are
     /// [`crate::families::Composite::ByPass`],
     /// and the captured Berlin frame batches its background twice -- once in each pass -- which is
     /// the same family, permutation and layout under two blends.
@@ -326,10 +338,17 @@ impl Depth {
 /// *declares* and the plan says what this drawable *binds*. They differ whenever a data-driven
 /// attribute is constant for this permutation and no descriptor arrived for it, and that difference
 /// is a different pipeline -- and, through [`Key::permutation`], a different module.
+///
+/// Eight arguments, which is one over clippy's threshold and is the shape of [`Key`] itself: every
+/// one of them is a field of what this returns, and the plan is the one that is not. Grouping four
+/// of them into a state struct would put a second shape beside `Key` carrying the same four
+/// values, which is a name to keep in step rather than a simplification.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn key(
     shader: i32,
     surface: Surface,
+    topology: Topology,
     plan: &Plan,
     blend: Blend,
     depth: Depth,
@@ -339,6 +358,7 @@ pub fn key(
     Key {
         shader,
         surface,
+        topology,
         permutation: crate::shaders::permutation(&plan.absent),
         blend,
         depth,
@@ -355,6 +375,24 @@ pub fn key(
                 rate: bound.rate,
             })
             .collect(),
+    }
+}
+
+/// The Vulkan primitive one of the wire's topologies is.
+///
+/// Three for three, and the names line up with mbgl's `gfx::DrawMode`: `Triangles` is
+/// `gfx::Triangles`, `Lines` is `gfx::Lines` -- two indices a primitive, which is what a fill
+/// outline's index buffer holds -- and `LineStrip` is `gfx::LineStrip`, each index continuing from
+/// the last.
+///
+/// Written out rather than cast, because the two enums are independent: `Topology` numbers
+/// triangles zero where `VkPrimitiveTopology` numbers `POINT_LIST` zero, so a cast would draw
+/// every fill in the frame as points -- and, by the same offset, a line strip as a triangle list.
+const fn topology(wire: Topology) -> vk::PrimitiveTopology {
+    match wire {
+        Topology::Triangles => vk::PrimitiveTopology::TRIANGLE_LIST,
+        Topology::Lines => vk::PrimitiveTopology::LINE_LIST,
+        Topology::LineStrip => vk::PrimitiveTopology::LINE_STRIP,
     }
 }
 
@@ -991,9 +1029,21 @@ const FRAGMENT_ENTRY: &core::ffi::CStr = c"fragment_main";
 /// points. The same handle is named twice rather than compiled twice.
 ///
 /// Everything not derived from the key is a decision with a reason beside it --
-/// [`depth_stencil`], [`Blend::attachment`], [`rasterization`], and the dynamic viewport and scissor. The
-/// topology is a triangle list because every bucket this crate draws is indexed triangles; a line is
-/// a stroked quad pair and a circle is a quad, both tessellated by the producer.
+/// [`depth_stencil`], [`Blend::attachment`], [`rasterization`], and the dynamic viewport and
+/// scissor. The topology is [`Key::topology`]'s, which is the wire's: almost every bucket is
+/// indexed triangles -- a line is a stroked quad pair and a circle is a quad, both tessellated by
+/// the producer -- and the two fill outlines are pairs of indices, because mbgl draws them with
+/// `gfx::Lines`.
+///
+/// # The line is one pixel wide and mbgl's is two
+///
+/// `render_fill_layer.cpp:177` is `constexpr auto lineWidth = 2.0f`, and every `gfx::Lines` in that
+/// file takes it. This leaves the width at Vulkan's default of one, which is the only width a
+/// pipeline may name without the `wideLines` feature enabled at device creation -- and nothing here
+/// enables it. Both gate devices report the feature (`lineWidthRange` 1 to 32 on V3D 7.1.7.0 and on
+/// RADV), so the gap is a decision and not a limit. A one-pixel outline under a feather that fades
+/// over one pixel is thinner than mbgl's, which is a parity difference worth its own measurement
+/// rather than a guess folded in here.
 ///
 /// # Errors
 ///
@@ -1021,8 +1071,8 @@ pub fn build<'d>(
             .module(module.raw())
             .name(FRAGMENT_ENTRY),
     ];
-    let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let assembly =
+        vk::PipelineInputAssemblyStateCreateInfo::default().topology(topology(key.topology));
     // Counts without pointers: the values are set per draw, so only the counts are baked.
     let viewport = vk::PipelineViewportStateCreateInfo::default()
         .viewport_count(1)

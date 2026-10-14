@@ -489,6 +489,28 @@ const CLIP: [f32; 16] = [
 /// thousandths, for the quad that covers the frame. Half is not a nudge: it is well inside
 /// OpenGL's `-w..w` and well outside Vulkan's `0..w`, so the case below reads the clear if a
 /// placement stops handing its clip position to `vulkan_depth`.
+/// [`CLIP`] with the drawable three quarters of a pixel down the target.
+///
+/// For the pair of cases that read a line's *width*. A horizontal line under [`CLIP`] lands on
+/// clip `y` of zero, which is the boundary between rows 15 and 16 of a 32-pixel target -- and a
+/// line centered on a boundary covers the same rows at width one and width two, each row's center
+/// exactly half a pixel away. There is no pixel to read.
+///
+/// Three quarters of a pixel is `0.75 * 2.0 / SIDE` of clip space, and it puts the line at row
+/// 16.75. A one-pixel line then covers row 16 alone -- its center a quarter of a pixel away --
+/// and a two-pixel line covers row 17 as well, three quarters away, where the feather has nearly
+/// faded. Those are the two cases: the quarter reads the feather and the three quarters reads the
+/// width.
+///
+/// Off a boundary in the other direction too: nothing lands on a pixel center either, so no
+/// coverage question here is decided by a tie.
+const CLIP_THREE_QUARTERS_DOWN: [f32; 16] = [
+    1.0, 0.0, 0.0, 0.0, //
+    0.0, -1.0, 0.0, 0.0, //
+    0.0, 0.0, 1.0, 0.0, //
+    0.0, -0.046_875, 0.0, 1.0,
+];
+
 const CLIP_NEAR_HALF: [f32; 16] = [
     1.0, 0.0, 0.0, 0.0, //
     0.0, -1.0, 0.0, 0.0, //
@@ -1250,6 +1272,112 @@ fn cases() -> Vec<Case> {
             absent: &[],
             instanced: None,
             expect: [255, 255, 255, 255],
+        },
+        // The same family drawn as the line it is, which is what puts two things under test that
+        // the case above cannot reach: the feather, and the width.
+        //
+        // One horizontal line across the target, three quarters of a pixel below the row boundary
+        // it would otherwise sit on -- see [`CLIP_THREE_QUARTERS_DOWN`]. Unblended, so each pixel
+        // is exactly what the fragment stage returned: white at full opacity, so the value read
+        // *is* the feather's alpha times 255 and nothing else.
+        //
+        // Row 16's center is a quarter of a pixel from the line, so its alpha is
+        // `1 - smoothstep(0, 1, 0.25)` = 0.84375 and the pixel is 215. That is the feather itself,
+        // which `fill_outline` above says is "*not* under test here and cannot be" -- at distance
+        // zero the fade is one, so a body that dropped it reads the same pixel. Here a body that
+        // dropped it reads 255.
+        Case {
+            name: "fill_outline_feathered",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillOutlineShader as i32,
+            wire: PLANE,
+            layout: Layout::PerAttribute,
+            streams: vec![
+                // Two vertices, off both sides of the target: what is being read is a pixel in the
+                // middle, and a line that ended inside the viewport would put its own end cap
+                // there.
+                shorts(&[-2, 0, 2, 0]),
+                per_vertex(&packed_color([255, 255, 255, 255]), 2),
+                per_vertex(&[1.0, 1.0], 2),
+            ],
+            uniforms: vec![
+                block(
+                    &FILL_OUTLINE_DRAWABLE_UBO,
+                    &[
+                        ("matrix", At::F(&CLIP_THREE_QUARTERS_DOWN)),
+                        ("outline_color_t", At::F(&[0.0])),
+                        ("opacity_t", At::F(&[0.0])),
+                    ],
+                ),
+                block(&FILL_EVALUATED_PROPS_UBO, &[]),
+                block(
+                    &GLOBAL_PAINT_PARAMS_UBO,
+                    &[(
+                        "world_size",
+                        At::F(&[f64::from(SIDE) as f32, f64::from(SIDE) as f32]),
+                    )],
+                ),
+            ],
+            images: Vec::new(),
+            vertices: 2,
+            topology: Topology::Lines,
+            ubo_index: 0,
+            pass: None,
+            absent: &[],
+            instanced: None,
+            expect: [215, 215, 215, 215],
+        },
+        // And the row only a two-pixel line reaches, which is the one case here whose answer is a
+        // piece of *device* state rather than of the drawing.
+        //
+        // mbgl draws a fill's outline at `lineWidth = 2.0f` and Vulkan's default is one, so this
+        // reads the second pixel: row 17's center is three quarters of a pixel from the line, so a
+        // one-wide line -- whose rectangle reaches half a pixel -- does not cover it at all and the
+        // pixel is the clear. Measured both ways on this device: at width one row 17 is
+        // `[51, 102, 153, 255]` and at width two it is the value below, while row 16 above reads
+        // 215 either way. The width adds the second pixel and does not change the first.
+        //
+        // `1 - smoothstep(0, 1, 0.75)` is 0.15625, which is 39.84 of 255 -- so the second pixel of
+        // mbgl's outline is drawn at a sixth of the first's strength. That is what #132 means by
+        // the fallback on a device without `wideLines` costing less than half the coverage, and
+        // `device::line_width` is the one place that decides which of the two widths this is.
+        Case {
+            name: "fill_outline_at_two",
+            at: (SIDE / 2, SIDE / 2 + 1),
+            family: BuiltIn::FillOutlineShader as i32,
+            wire: PLANE,
+            layout: Layout::PerAttribute,
+            streams: vec![
+                shorts(&[-2, 0, 2, 0]),
+                per_vertex(&packed_color([255, 255, 255, 255]), 2),
+                per_vertex(&[1.0, 1.0], 2),
+            ],
+            uniforms: vec![
+                block(
+                    &FILL_OUTLINE_DRAWABLE_UBO,
+                    &[
+                        ("matrix", At::F(&CLIP_THREE_QUARTERS_DOWN)),
+                        ("outline_color_t", At::F(&[0.0])),
+                        ("opacity_t", At::F(&[0.0])),
+                    ],
+                ),
+                block(&FILL_EVALUATED_PROPS_UBO, &[]),
+                block(
+                    &GLOBAL_PAINT_PARAMS_UBO,
+                    &[(
+                        "world_size",
+                        At::F(&[f64::from(SIDE) as f32, f64::from(SIDE) as f32]),
+                    )],
+                ),
+            ],
+            images: Vec::new(),
+            vertices: 2,
+            topology: Topology::Lines,
+            ubo_index: 0,
+            pass: None,
+            absent: &[],
+            instanced: None,
+            expect: [40, 40, 40, 40],
         },
         // An extrusion's roof, which is the one family that computes a color rather than
         // carrying one. Every number is derived from `fill_extrusion.hpp` by hand, so a
@@ -4218,6 +4346,13 @@ struct Bound<'a> {
     offsets: &'a [u64],
     vertices: u32,
     ubo_index: u32,
+    /// The width a line case is drawn at, or `None` for a triangle case.
+    ///
+    /// `Some` exactly when the pipeline declared it dynamic, which `pipelines::sets_line_width`
+    /// answers off the list the pipeline was built with -- and the number is the device's, through
+    /// `Open::line_width`. A declared state that is never set is undefined, which is the same
+    /// reason the stencil write mask below is set to zero rather than left alone.
+    line_width: Option<f32>,
     /// Instances to draw, and the group-one set they are read ahead in.
     ///
     /// `None` for every case but the walls, where it carries both halves of what a draw of more
@@ -4258,6 +4393,11 @@ impl Probe<'_> {
                         // declared dynamic for the draw-once's sake, and a declared state that is
                         // never set is undefined rather than defaulted.
                         record.stencil_write_mask(0);
+                        // And the width, for the same reason, where the case's pipeline declared
+                        // it: a line case drawn at an undefined width reads an undefined pixel.
+                        if let Some(width) = bound.line_width {
+                            record.line_width(width);
+                        }
                         record.bind_vertex_buffers(0, bound.streams, bound.offsets);
                         match bound.instanced {
                             // `firstInstance` is the drawable's entry, which the body reads as
@@ -4558,6 +4698,7 @@ fn draw_case<'d>(
             offsets,
             vertices: case.vertices,
             ubo_index: case.ubo_index,
+            line_width: pipelines::sets_line_width(case.topology).then(|| open.line_width()),
             instanced,
         }),
     )?;

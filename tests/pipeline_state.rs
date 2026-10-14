@@ -317,7 +317,9 @@ fn nothing_is_culled() {
     assert_eq!(state.polygon_mode, vk::PolygonMode::FILL);
     assert!(
         (state.line_width - 1.0).abs() < f32::EPSILON,
-        "a line width other than one needs the wideLines feature"
+        "a baked line width other than one needs the wideLines feature, which this crate cannot \
+         enable -- the wide one is set per draw instead, and \
+         `a_line_takes_its_width_from_the_device` is where that is checked"
     );
 }
 
@@ -618,5 +620,73 @@ fn the_stencil_scheme_is_the_two_bits_and_the_frames_value() {
                 "{other:?} changed the scheme of {byte:#010b}"
             );
         }
+    }
+}
+
+/// A line's width is the device's answer, and only a line pipeline asks for it.
+///
+/// mbgl draws a fill's outline at `lineWidth = 2.0f` and Vulkan's default is one, so an outline
+/// drawn without this is a pixel narrower than the oracle's everywhere. What makes it a test rather
+/// than a constant is that the number is not always two: a width above one needs `wideLines`
+/// enabled at device creation, and a device without it rasterizes one pixel whatever is asked.
+///
+/// Both halves have to agree, which is the part a pixel cannot check. A `vkCmdSetLineWidth` for a
+/// state the pipeline did not declare is *ignored* -- the baked one is used, which `first_pixel`'s
+/// `fill_outline_at_two` reads as the clear -- and a declared state that is never set is undefined.
+/// So the list and the recorder read one answer, and this is it.
+#[test]
+fn a_line_takes_its_width_from_the_device() {
+    use tessella_emblema::device;
+    use tessella_emblema::pipelines::{
+        CONTENT_DYNAMIC, LINE_DYNAMIC, dynamic_for, sets_line_width,
+    };
+
+    // Compared the way `nothing_is_culled` compares the baked one: both answers are an input
+    // returned unchanged, so an exact comparison would be right and `clippy::float_cmp` is not
+    // worth an exemption for.
+    #[track_caller]
+    fn width(wide_lines: bool, range: [f32; 2], want: f32) {
+        let got = device::line_width(wide_lines, range);
+        assert!(
+            (got - want).abs() < f32::EPSILON,
+            "wide_lines {wide_lines}, range {range:?}: {got} is not {want}"
+        );
+    }
+
+    // The gate devices: 1 to 32 on V3D 7.1.7.0, 1 to 255 on RADV. Both give mbgl's two.
+    width(true, [1.0, 32.0], 2.0);
+    width(true, [1.0, 255.0], 2.0);
+    // Without the feature, one -- and not because the device would decline a wider line, but
+    // because asking for one is invalid usage.
+    width(false, [1.0, 32.0], 1.0);
+    // A device whose widest line is one pixel, which is the limit saying what the feature says.
+    // Clamped rather than passed through, because a width outside `lineWidthRange` is undefined
+    // behavior.
+    width(true, [1.0, 1.0], 1.0);
+    // And a range that is not one. `f32::clamp` panics on an inverted or `NaN` bound, and what a
+    // driver reported is not a reason for a library to panic.
+    width(true, [32.0, 1.0], 1.0);
+    width(true, [f32::NAN, 32.0], 1.0);
+    width(true, [1.0, f32::NAN], 1.0);
+
+    // Only the line topologies ask. A triangle pipeline that declared the state would need a call
+    // before every fill in the frame, and a call before a triangle draw that did not declare it is
+    // ignored rather than wrong -- so the two lists have to differ by exactly this.
+    assert!(!sets_line_width(Topology::Triangles));
+    assert!(sets_line_width(Topology::Lines));
+    assert!(sets_line_width(Topology::LineStrip));
+    assert_eq!(dynamic_for(Topology::Triangles), &CONTENT_DYNAMIC);
+    assert_eq!(dynamic_for(Topology::Lines), &LINE_DYNAMIC);
+    assert_eq!(dynamic_for(Topology::LineStrip), &LINE_DYNAMIC);
+
+    // The line list is the content list and the width, in that order: a reordering that dropped a
+    // stencil state would leave every line draw comparing whatever the last batch set.
+    assert_eq!(&LINE_DYNAMIC[..CONTENT_DYNAMIC.len()], &CONTENT_DYNAMIC[..]);
+    assert_eq!(LINE_DYNAMIC.len(), CONTENT_DYNAMIC.len() + 1);
+    for state in CONTENT_DYNAMIC {
+        assert!(
+            LINE_DYNAMIC.contains(&state),
+            "{state:?} is not in the line list"
+        );
     }
 }

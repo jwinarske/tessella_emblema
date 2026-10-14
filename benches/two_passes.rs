@@ -279,6 +279,8 @@ fn draw(
             layout: layout.pipeline(),
             instances: 1,
             per_drawable: false,
+            // A triangle list, so the pipeline's baked one pixel is never read.
+            line_width: None,
         }
     };
 
@@ -351,6 +353,8 @@ fn draw(
             layout: layout.pipeline(),
             instances: 1,
             per_drawable: false,
+            // A triangle list, so the pipeline's baked one pixel is never read.
+            line_width: None,
         }
     };
 

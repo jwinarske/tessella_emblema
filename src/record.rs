@@ -82,6 +82,17 @@ pub struct Program {
     /// group-one descriptor set. Both are set here per drawable rather than per batch, which is
     /// what this flag buys and what it costs.
     pub per_drawable: bool,
+    /// The width to rasterize this batch's lines at, or `None` for a pipeline that bakes it.
+    ///
+    /// `Some` exactly when the pipeline declared `VK_DYNAMIC_STATE_LINE_WIDTH`, which
+    /// [`crate::pipelines::dynamic_for`] does for the line topologies -- a `vkCmdSetLineWidth` for
+    /// a state a pipeline did not declare is ignored, and one left unset for a pipeline that did
+    /// declare it is undefined. So the two answers have to come from one place, and that place is
+    /// the caller: it holds the key the pipeline was built from *and* the device whose `wideLines`
+    /// decides the number, which `device::line_width` turns into this.
+    ///
+    /// `None` for every triangle batch, which is all but the two outline families.
+    pub line_width: Option<f32>,
 }
 
 /// Why a frame could not be recorded.
@@ -184,6 +195,14 @@ pub struct Counts {
     ///
     /// The run [`DrawOnce`] gave the frame's one value to, drawable by drawable.
     pub drawn_once: usize,
+    /// Batches recorded at a line width above one pixel.
+    ///
+    /// An outline is `gfx::Lines` at mbgl's width of two, and a device without `wideLines` draws it
+    /// one pixel wide whatever is asked. So a frame's outlines being wide is a property of the
+    /// *device* and not of the frame, and a reader of these counts cannot tell which happened
+    /// without this: zero here on a frame with outline batches says the fallback was taken, not
+    /// that nothing was drawn.
+    pub widened: usize,
 }
 
 /// Everything a frame reads that is not the batches.
@@ -335,6 +354,16 @@ pub fn content(
 
         record.bind_pipeline(found.pipeline);
         record.bind_descriptor_set(found.layout, set);
+
+        // Per batch, because the width is the family's: a batch is one family and one topology, and
+        // every drawable in it is drawn at the same width. Set only where the pipeline declared it
+        // dynamic -- see [`Program::line_width`] -- and that is also why it does not need resetting
+        // for the triangle batches between two line ones: a pipeline that did not declare it reads
+        // its own baked one pixel and not what the command buffer last carried.
+        if let Some(width) = found.line_width {
+            record.line_width(width);
+            counts.widened += usize::from(width > 1.0);
+        }
 
         // Per batch, because a batch is one layer: `batch::Key` carries `layer_index` and collapse
         // is scoped to `(layer, pass)`, so every drawable in a run belongs in one band. Set through

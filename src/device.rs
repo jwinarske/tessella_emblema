@@ -109,6 +109,54 @@ pub fn check_dynamic_rendering(supported: bool) -> Result<(), Unsupported> {
     }
 }
 
+/// The width mbgl draws a fill's outline at, in pixels.
+///
+/// `render_fill_layer.cpp:177` is `constexpr auto lineWidth = 2.0f`, and every `gfx::Lines` in that
+/// file takes it: the plain outline at :401 and the patterned one at :439 and :451. The wire
+/// carries no width -- `GeometryAdd` has a topology byte and nothing beside it -- so the constant
+/// is the consumer's, and it is true of every `gfx::Lines` mbgl builds for a fill.
+///
+/// A field in the ABI would be the honest answer if some other family ever drew lines at another
+/// width. The location indicator is the one to watch: its accuracy border is the other
+/// [`Topology`](tessella_capture_abi::envelope::Topology) the wire carries, and mbgl draws it with
+/// `gfx::LineStrip` through the *line* shader, which takes its width from a paint property rather
+/// than from a constant. Nothing on this wire sends one yet.
+pub const OUTLINE_WIDTH: f32 = 2.0;
+
+/// What a line-topology draw is recorded at, given what the device can do.
+///
+/// Takes the feature bit and the limit rather than a `vk::PhysicalDevice`, for
+/// [`check_dynamic_rendering`]'s reason: the caller creates the device, so only the caller can
+/// enable `wideLines`, and this decides what to do about the answer.
+///
+/// One pixel without the feature, which is not a workaround but the only answer: a device that does
+/// not have it rasterizes every line one pixel wide whatever a pipeline or a `vkCmdSetLineWidth`
+/// asks for, and asking for two is invalid usage besides. Both gate devices do have it --
+/// `lineWidthRange` is 1 to 32 on V3D 7.1.7.0 and 1 to 255 on RADV -- so the fallback is for a
+/// device this pass has not met.
+///
+/// Clamped into the range because that is the valid-usage condition: a width outside
+/// `lineWidthRange` is undefined behavior, and a device reporting a maximum below two is a device
+/// whose widest line is narrower than mbgl's outline. `lineWidthGranularity` is not read -- a
+/// non-strict line is rasterized at the nearest multiple the device supports, which is the
+/// device's rounding to do and not this crate's.
+///
+/// # What the fallback costs
+///
+/// Not half the coverage. The feather in `FILL_OUTLINE_BODY` fades over one pixel of distance from
+/// the line's own center, so the second pixel of a two-wide line is drawn at the tail of the
+/// `smoothstep` rather than at full strength. #132 is where that gap is measured.
+#[must_use]
+pub fn line_width(wide_lines: bool, range: [f32; 2]) -> f32 {
+    let [low, high] = range;
+    // A range that is not a range is treated as no feature. `f32::clamp` panics on an inverted or
+    // `NaN` bound, and a library has no business panicking over what a driver reported.
+    if !wide_lines || low.is_nan() || high.is_nan() || low > high {
+        return 1.0;
+    }
+    OUTLINE_WIDTH.clamp(low, high)
+}
+
 /// Which `VkFormat` a texture of this pixel and channel type is, as mbgl's Vulkan backend decides.
 ///
 /// Transcribed from `Texture2D::vulkanFormat` in `src/mbgl/vulkan/texture2d.cpp`, which is the

@@ -832,6 +832,51 @@ pub const CONTENT_DYNAMIC: [vk::DynamicState; 5] = [
     vk::DynamicState::STENCIL_WRITE_MASK,
 ];
 
+/// The same, for a draw whose primitive is a line.
+///
+/// [`CONTENT_DYNAMIC`] and the width, because the width is the *device*'s answer rather than the
+/// pipeline's: a line wider than one pixel needs `wideLines` enabled at device creation, and this
+/// crate does not create the device. Baked, every line pipeline would carry a capability it cannot
+/// check, and a device without the feature would need a second pipeline rather than a second
+/// argument -- `device::line_width` is where that falls back to one.
+///
+/// Declared for the line topologies alone rather than for every content pipeline. A
+/// `vkCmdSetLineWidth` before a triangle draw is ignored, so declaring it everywhere would be
+/// harmless and also untrue: a triangle pipeline's width is its baked one, and listing a state
+/// nothing sets is how the stencil reference came to be set and not declared.
+pub const LINE_DYNAMIC: [vk::DynamicState; 6] = [
+    vk::DynamicState::VIEWPORT,
+    vk::DynamicState::SCISSOR,
+    vk::DynamicState::STENCIL_COMPARE_MASK,
+    vk::DynamicState::STENCIL_REFERENCE,
+    vk::DynamicState::STENCIL_WRITE_MASK,
+    vk::DynamicState::LINE_WIDTH,
+];
+
+/// Whether a pipeline for this topology takes its line width per draw.
+///
+/// Read off [`dynamic_for`] rather than restating it, so the recorder and the pipeline cannot
+/// disagree: a `vkCmdSetLineWidth` for a state the pipeline did not declare is ignored, and a
+/// declared state left unset is undefined, so one answer has to serve both. What the caller does
+/// with it is [`crate::record::Program::line_width`].
+#[must_use]
+pub fn sets_line_width(wire: Topology) -> bool {
+    dynamic_for(wire).contains(&vk::DynamicState::LINE_WIDTH)
+}
+
+/// Which of the two lists a topology's pipeline declares.
+///
+/// `Triangles` takes [`CONTENT_DYNAMIC`]; both line topologies take [`LINE_DYNAMIC`]. A line strip
+/// is as wide as a line list -- the width is a property of the primitive, not of how the indices
+/// run -- so the location indicator's accuracy border gets it too, the day one is drawn here.
+#[must_use]
+pub const fn dynamic_for(wire: Topology) -> &'static [vk::DynamicState] {
+    match wire {
+        Topology::Triangles => &CONTENT_DYNAMIC,
+        Topology::Lines | Topology::LineStrip => &LINE_DYNAMIC,
+    }
+}
+
 /// The depth and stencil state a content draw gets.
 ///
 /// Three inputs, because the state has three sources. The **view** says whether there is depth to
@@ -1005,12 +1050,17 @@ pub fn color_attachment(blend: Blend, enabled: Enabled) -> vk::PipelineColorBlen
     }
 }
 
-/// No culling.
+/// No culling, and a one-pixel line.
 ///
 /// A fill's triangles come from an earcut tessellation and a line's from a stroker, and neither
 /// promises a winding order. mbgl does not cull either. Culling the wrong way is a layer that
 /// disappears at some zooms and not others, which is a bug nobody finds quickly, and the saving on a
 /// tiler is a fraction of a pass.
+///
+/// One pixel is the only width a pipeline may *bake*: without the `wideLines` feature enabled at
+/// device creation, a static `lineWidth` other than 1.0 is invalid usage, and this crate does not
+/// create the device. So the width every line pipeline draws at is set per batch instead, over the
+/// value here -- see [`LINE_DYNAMIC`]. A triangle pipeline keeps it, where nothing reads it.
 pub fn rasterization() -> vk::PipelineRasterizationStateCreateInfo<'static> {
     vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
@@ -1035,15 +1085,23 @@ const FRAGMENT_ENTRY: &core::ffi::CStr = c"fragment_main";
 /// the producer -- and the two fill outlines are pairs of indices, because mbgl draws them with
 /// `gfx::Lines`.
 ///
-/// # The line is one pixel wide and mbgl's is two
+/// # And two pixels wide, which is the device's answer rather than this one's
 ///
 /// `render_fill_layer.cpp:177` is `constexpr auto lineWidth = 2.0f`, and every `gfx::Lines` in that
-/// file takes it. This leaves the width at Vulkan's default of one, which is the only width a
-/// pipeline may name without the `wideLines` feature enabled at device creation -- and nothing here
-/// enables it. Both gate devices report the feature (`lineWidthRange` 1 to 32 on V3D 7.1.7.0 and on
-/// RADV), so the gap is a decision and not a limit. A one-pixel outline under a feather that fades
-/// over one pixel is thinner than mbgl's, which is a parity difference worth its own measurement
-/// rather than a guess folded in here.
+/// file takes it. Vulkan's default is one, and one is the only width a pipeline may *bake* without
+/// the `wideLines` feature enabled at device creation -- which this crate cannot do, because it
+/// does not create the device. So the width is dynamic state: [`LINE_DYNAMIC`] declares it for the
+/// line topologies and `device::line_width` decides the number from the feature and the limit,
+/// which is the one place a device without wide lines falls back to one.
+///
+/// Both gate devices report it -- `lineWidthRange` 1 to 32 on V3D 7.1.7.0 and 1 to 255 on RADV --
+/// so the fallback is for a part this pass has not met. What it costs there is measured rather than
+/// assumed: the patterned outline of the sprited capture covers 26,100 pixels at one and 47,697 at
+/// two on RADV, 27,193 and 49,996 on V3D, and the frame as a whole moves 5,217 pixels of 786,432.
+/// Not twice the coverage on either part, because the feather fades over one pixel of distance from
+/// the line's own center whatever the width: the second pixel of a two-wide line is drawn at
+/// 0.15625 of the first's strength, which `benches/first_pixel.rs`'s `fill_outline_at_two` reads as
+/// 40 against 215 -- the same two numbers on both devices.
 ///
 /// # Errors
 ///
@@ -1077,7 +1135,8 @@ pub fn build<'d>(
     let viewport = vk::PipelineViewportStateCreateInfo::default()
         .viewport_count(1)
         .scissor_count(1);
-    let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&CONTENT_DYNAMIC);
+    let dynamic =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(dynamic_for(key.topology));
     let raster = rasterization();
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);

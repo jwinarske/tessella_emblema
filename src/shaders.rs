@@ -751,9 +751,12 @@ fn vertex_main(in: In) -> Out {
 
 @fragment
 fn fragment_main(in: Out) -> @location(0) vec4<f32> {
-    // An outline is drawn as lines one pixel wide, which rasterize hard. The fade is this
-    // fragment's distance from the vertex's own screen position: the outline's geometry runs along
-    // the polygon's edge, so that distance is how far across the one-pixel line this pixel sits.
+    // An outline is drawn as lines, which rasterize hard -- two pixels wide, which is mbgl's
+    // `lineWidth` and what `pipelines::LINE_DYNAMIC` sets per batch where the device allows it. The
+    // fade is this fragment's distance from the vertex's own screen position: the outline's
+    // geometry runs along the polygon's edge, so that distance is how far across the line this
+    // pixel sits. It fades over one pixel whatever the line's width, so a two-wide line's second
+    // pixel is drawn at 0.15625 and its rim at nothing.
     //
     // `in.clip` is `@builtin(position)`, and in a fragment stage that builtin is the framebuffer
     // coordinate rather than the clip position the vertex stage wrote -- WGSL's `gl_FragCoord`.
@@ -2195,10 +2198,10 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
 /// # What the two of them multiply to
 ///
 /// `color * alpha * opacity`, in that order in mbgl and in any order here: the feather is coverage
-/// and the opacity is the layer's, so an outline at the edge of a one-pixel line in a half-opaque
-/// layer is a quarter of the sprite's own color. Dropping either leaves a plausible picture --
-/// the whole outline at full strength, or a hard one-pixel line -- which is why
-/// `benches/first_pixel.rs` reads a pixel that only both together cover.
+/// and the opacity is the layer's, so an outline half a pixel from the line's center in a
+/// half-opaque layer is a quarter of the sprite's own color. Dropping either leaves a plausible
+/// picture -- the whole outline at full strength, or a hard line with no fade at all -- which is
+/// why `benches/first_pixel.rs` reads a pixel that only both together cover.
 pub const FILL_OUTLINE_PATTERN_BODY: &str = r"
 struct Out {
     @builtin(position) clip: vec4<f32>,

@@ -99,6 +99,20 @@
 //! reason the topology is in the pipeline key. Drawn as triangles, its ring indices paint a band:
 //! 47,612 pixels of this frame against the 11,379 the line covers.
 //!
+//! And it is the one drawable whose width is a *device* question. mbgl draws every `gfx::Lines` of
+//! a fill at `lineWidth = 2.0f`, which needs `wideLines` enabled at device creation, so
+//! `device::line_width` decides it and the recording line reports how many batches got it. Drawn
+//! alone with `TSE_ONLY_SHADER=14`, the outline covers 26,100 pixels of this frame at width one
+//! and 47,697 at width two on RADV, 27,193 and 49,996 on V3D 7.1.7.0; the frame as a whole moves
+//! 5,217 pixels of 786,432 between the two widths, 4,659 of them darker. The ratio is not two,
+//! because the feather fades over one pixel of distance from the line's center whatever the width:
+//! the second pixel is drawn at 0.15625 of the first's strength, and the rim at nothing.
+//!
+//! The two devices disagree by about 2,300 pixels at either width, which is the rasterization floor
+//! this frame's outline already had -- a hard line's covered set is the one thing two parts need not
+//! agree on. The three captures with no sprite sheet have no line-topology drawable at all and are
+//! byte-identical between the widths.
+//!
 //! # Taking one with walls in it
 //!
 //! That frame is top-down, so its extrusion layer draws roofs and no walls at all -- and the depth
@@ -1085,6 +1099,10 @@ fn run(path: &str) -> Result<(), String> {
                 layout: layout.pipeline(),
                 instances: vertices::instances(plan),
                 per_drawable,
+                // The device's answer, for the two families drawn as lines. `None` for the
+                // triangle batches, whose pipelines bake one pixel and never read a
+                // `vkCmdSetLineWidth`.
+                line_width: pipelines::sets_line_width(*topology).then(|| device.line_width()),
             },
         );
         built.push(pipeline);
@@ -1122,7 +1140,8 @@ fn run(path: &str) -> Result<(), String> {
     // Whether this run is a diagnostic rather than a check. Drawing one layer leaves most of the
     // frame at the clear and most batches undrawn, which is what the two assertions below are
     // about -- so under it they report and do not fail.
-    let isolating = std::env::var("TSE_ONLY_LAYER").is_ok();
+    let isolating =
+        std::env::var("TSE_ONLY_LAYER").is_ok() || std::env::var("TSE_ONLY_SHADER").is_ok();
     let mut counts = Err("the recording did not run".to_string());
     device
         .submit(|record: Recorder<'_>| {
@@ -1169,9 +1188,20 @@ fn run(path: &str) -> Result<(), String> {
                         // the frame is traced to the layer that put it there -- the parks layer's
                         // black was found this way. The batch count below is not checked under it,
                         // because leaving layers undrawn is the point.
+                        //
+                        // `TSE_ONLY_SHADER=<n>` is the same instrument by family, and it exists
+                        // because a layer is not fine enough for the one measurement that needed
+                        // it: a patterned fill and its outline share a `layer_index`, so the
+                        // outline's own coverage cannot be read off a layer. #132 is the number it
+                        // was added for.
                         &|batch| {
                             if let Ok(only) = std::env::var("TSE_ONLY_LAYER")
                                 && only.parse::<u32>() != Ok(batch.key.layer_index)
+                            {
+                                return None;
+                            }
+                            if let Ok(only) = std::env::var("TSE_ONLY_SHADER")
+                                && only.parse::<i32>() != Ok(batch.key.builtin_shader)
                             {
                                 return None;
                             }
@@ -1191,13 +1221,18 @@ fn run(path: &str) -> Result<(), String> {
         .map_err(|why| format!("the submission: {why}"))?;
     let counts = counts?;
     println!(
-        "  the recording         {}   {} batches, {} drawables, {} draws, {} undrawn, {} unclipped",
+        "  the recording         {}   {} batches, {} drawables, {} draws, {} undrawn, \
+         {} unclipped, {} wide",
         if counts.undrawn == 0 { "ok  " } else { "WARN" },
         counts.batches,
         counts.drawables,
         counts.draws,
         counts.undrawn,
-        counts.unclipped
+        counts.unclipped,
+        // Batches recorded at a line width above one, which is a property of the device: an
+        // outline batch on a part without `wideLines` is drawn one pixel wide and counted here as
+        // zero. Printed rather than asserted for that reason.
+        counts.widened
     );
     // The 3D stencil, which is a property of the frame rather than of a batch: how many drawables
     // drew with the one draw-once value, and how many runs wanted it and had none. A frame with no

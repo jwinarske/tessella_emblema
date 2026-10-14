@@ -1222,6 +1222,24 @@ impl<'c> Recorder<'c> {
         }
     }
 
+    /// Sets the width a line primitive is rasterized at, in pixels.
+    ///
+    /// Dynamic rather than baked, because the answer is the *device*'s: a width above one needs the
+    /// `wideLines` feature enabled at device creation, and this crate does not create the device.
+    /// Baked, a pipeline would carry a capability it cannot check, and the fallback for a device
+    /// without the feature would be a second pipeline rather than a second argument.
+    ///
+    /// Only a pipeline that declared `VK_DYNAMIC_STATE_LINE_WIDTH` reads this -- any other uses the
+    /// width baked into its rasterization state, which is one. So a call before a triangle draw is
+    /// ignored rather than wrong, and `tessella_emblema::pipelines::build` declares it for the line
+    /// topologies alone.
+    pub fn line_width(&self, width: f32) {
+        // SAFETY: the command buffer is recording.
+        unsafe {
+            self.device.cmd_set_line_width(self.raw, width);
+        }
+    }
+
     /// Sets the stencil compare mask for both faces.
     ///
     /// A content draw's is the tile's `read_mask` -- its own zoom's field of the stencil byte. One

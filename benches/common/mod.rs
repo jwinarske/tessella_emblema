@@ -39,6 +39,14 @@ pub struct Open {
     handle: ash::Device,
     memory: vk::PhysicalDeviceMemoryProperties,
     pub limits: vk::PhysicalDeviceLimits,
+    /// Whether `wideLines` was reported *and* enabled, which is what lets a line be drawn wider
+    /// than one pixel.
+    ///
+    /// Reported by both gate devices, so the `false` arm is a device this pass has not met -- and
+    /// it is still the arm that has to be right, because asking a device without the feature for a
+    /// wider line is invalid usage rather than a wish it declines. [`Open::line_width`] is where
+    /// the two cases meet.
+    pub wide_lines: bool,
     physical: vk::PhysicalDevice,
     family: u32,
 }
@@ -151,12 +159,26 @@ impl Open {
         // device. `examples/device-report.rs` is what answers that, and #85 records what it means
         // for that board.
         let mut thirteen = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
+        // And `wideLines`, asked for only where it is reported. A fill's outline is `gfx::Lines` at
+        // mbgl's width of two and Vulkan's default width is one, so without this every outline in
+        // every frame this bench draws is a pixel narrower than the oracle's -- and a device that
+        // does not report it draws exactly that, which is why `device::line_width` has a fallback
+        // rather than this having an error.
+        //
+        // Asked for separately rather than with the rest of core: `create_device` fails outright on
+        // a feature the device does not have, and this one is a decision where dynamic rendering is
+        // a requirement.
+        // SAFETY: the instance and the handle are live.
+        let reported = unsafe { instance.get_physical_device_features(physical) };
+        let wide_lines = reported.wide_lines != 0;
+        let features = vk::PhysicalDeviceFeatures::default().wide_lines(wide_lines);
         // SAFETY: the info is fully initialized and names a family this device reported.
         let device = unsafe {
             instance.create_device(
                 physical,
                 &vk::DeviceCreateInfo::default()
                     .queue_create_infos(&queues)
+                    .enabled_features(&features)
                     .push_next(&mut thirteen),
                 None,
             )
@@ -171,9 +193,18 @@ impl Open {
             handle: device,
             memory,
             limits,
+            wide_lines,
             physical,
             family,
         })
+    }
+
+    /// The width a line-topology batch is recorded at on this device.
+    ///
+    /// `device::line_width` with this device's answers, so a bench asks the library the same
+    /// question the consumer does rather than deciding for itself.
+    pub fn line_width(&self) -> f32 {
+        device::line_width(self.wide_lines, self.limits.line_width_range)
     }
 
     /// What the device will do with a format, for the queries `device.rs` takes as a closure.

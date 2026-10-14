@@ -51,9 +51,16 @@ const MBGL: &[(&str, Composite)] = &[
     ("fill_outline_triangulated", Composite::Fixed(Blend::Alpha)),
     ("fill_pattern", Composite::Fixed(Blend::Alpha)),
     ("fill_outline_pattern", Composite::Fixed(Blend::Alpha)),
-    // render_fill_extrusion_layer.cpp:304 and :425, the second being the instanced path.
+    // render_fill_extrusion_layer.cpp:304 and :425, the second being the instanced path. The
+    // patterned families take the same two lines: `hasPattern` chooses the shader at :159 and
+    // :185 and nothing else, so one color builder serves both and its mode is alpha either way.
     ("fill_extrusion", Composite::Fixed(Blend::Alpha)),
     ("fill_extrusion_instanced", Composite::Fixed(Blend::Alpha)),
+    ("fill_extrusion_pattern", Composite::Fixed(Blend::Alpha)),
+    (
+        "fill_extrusion_pattern_instanced",
+        Composite::Fixed(Blend::Alpha),
+    ),
     // render_line_layer.cpp:276, on the passes with the opaque bit masked out.
     ("line", Composite::ByPass),
     ("line_pattern", Composite::ByPass),

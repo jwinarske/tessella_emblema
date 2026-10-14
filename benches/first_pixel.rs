@@ -26,7 +26,7 @@
 //! the pass. What the probe still owns is the *inputs* and the one pixel to read.
 //!
 //! It owned all of it once -- about a thousand lines of its own Vulkan, from the instance to the
-//! render pass to a linear-tiled image it mapped. Those pixels said the eighteen families' bodies
+//! render pass to a linear-tiled image it mapped. Those pixels said the families' bodies
 //! and the ABI's tables agree, which is worth having, and said nothing at all about the code that
 //! will draw them in a frame. `descriptors::Sets::write` pointed every block binding at one buffer
 //! for four merged slices and no test could see it; this bench now fails on the second case.
@@ -103,14 +103,15 @@ use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
     COLOR_RELIEF_DRAWABLE_UBO, COLOR_RELIEF_EVALUATED_PROPS_UBO, COLOR_RELIEF_TILE_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
-    FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, FILL_OUTLINE_PATTERN_DRAWABLE_UBO,
-    FILL_OUTLINE_PATTERN_TILE_PROPS_UBO, FILL_PATTERN_DRAWABLE_UBO, FILL_PATTERN_TILE_PROPS_UBO,
-    GLOBAL_PAINT_PARAMS_UBO, HEATMAP_DRAWABLE_UBO, HEATMAP_EVALUATED_PROPS_UBO,
-    HEATMAP_TEXTURE_PROPS_UBO, HILLSHADE_DRAWABLE_UBO, HILLSHADE_EVALUATED_PROPS_UBO,
-    HILLSHADE_PREPARE_DRAWABLE_UBO, HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO,
-    LINE_EVALUATED_PROPS_UBO, LINE_PATTERN_DRAWABLE_UBO, LINE_PATTERN_TILE_PROPS_UBO,
-    RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO,
-    SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
+    FILL_EXTRUSION_PROPS_UBO, FILL_EXTRUSION_TILE_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO,
+    FILL_OUTLINE_PATTERN_DRAWABLE_UBO, FILL_OUTLINE_PATTERN_TILE_PROPS_UBO,
+    FILL_PATTERN_DRAWABLE_UBO, FILL_PATTERN_TILE_PROPS_UBO, GLOBAL_PAINT_PARAMS_UBO,
+    HEATMAP_DRAWABLE_UBO, HEATMAP_EVALUATED_PROPS_UBO, HEATMAP_TEXTURE_PROPS_UBO,
+    HILLSHADE_DRAWABLE_UBO, HILLSHADE_EVALUATED_PROPS_UBO, HILLSHADE_PREPARE_DRAWABLE_UBO,
+    HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO, LINE_EVALUATED_PROPS_UBO,
+    LINE_PATTERN_DRAWABLE_UBO, LINE_PATTERN_TILE_PROPS_UBO, RASTER_DRAWABLE_UBO,
+    RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO, SYMBOL_EVALUATED_PROPS_UBO,
+    SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
 use tessella_capture_abi::terrain_ubo::BUILTIN_TERRAIN_SHADER;
 use tessella_capture_abi::{ProjectionMode, RenderPass, TextureChannelDataType, TexturePixelType};
@@ -552,14 +553,16 @@ const WALL_QUAD: [i16; 12] = [1, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 1];
 /// Eight bytes an instance -- two `i16` of position, the fraction and discard flag as one `u16`,
 /// and the edge distance as another. The same eight bytes the body reads ahead in as a storage
 /// element, which is the whole reason this stream is interleaved where the paint beside it is not.
-fn outline(points: &[([i16; 2], u16)]) -> Vec<u8> {
+fn outline(points: &[([i16; 2], u16, u16)]) -> Vec<u8> {
     let mut out = Vec::with_capacity(points.len() * 8);
-    for (position, decimals) in points {
+    for (position, decimals, edge) in points {
         out.extend_from_slice(&position[0].to_le_bytes());
         out.extend_from_slice(&position[1].to_le_bytes());
         out.extend_from_slice(&decimals.to_le_bytes());
-        // The edge distance, which this family does not read -- a pattern does.
-        out.extend_from_slice(&0u16.to_le_bytes());
+        // How far along the ring this point is, which only the patterned walls read: it is the
+        // horizontal axis their sprite runs along. Zero for the plain cases, where the body masks
+        // it off.
+        out.extend_from_slice(&edge.to_le_bytes());
     }
     out
 }
@@ -575,6 +578,31 @@ const FLAT_SKIRT: [u8; 12] = [0; 12];
 
 /// A triangle covering the viewport, in tile units that the identity makes clip units.
 const COVERING: [i16; 6] = [-1, -1, 3, -1, -1, 3];
+
+/// [`CLIP`] with the `z` column dropped, so a drawable's height reaches the shading and not the
+/// depth.
+///
+/// A roof is placed at its own height in meters, and `place` hands that to the matrix as the third
+/// component. Under [`CLIP`] a height of 37.5 is a clip `z` of 37.5, which is outside Vulkan's
+/// `0..w` and clipped away -- so a case that wants a height large enough to matter to the lighting
+/// needs a matrix that does not carry it into the depth.
+const FLAT_Z: [f32; 16] = [
+    1.0, 0.0, 0.0, 0.0, //
+    0.0, -1.0, 0.0, 0.0, //
+    0.0, 0.0, 0.0, 0.0, //
+    0.0, 0.0, 0.0, 1.0,
+];
+
+/// One sprite rectangle repeated for every instance, as the `UShort4` the wire declares.
+fn pattern_pair(rectangle: [u16; 4], instances: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(instances * 8);
+    for _ in 0..instances {
+        for value in &rectangle {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    out
+}
 
 /// A triangle covering the viewport in a coordinate space of zero to one.
 ///
@@ -1671,7 +1699,7 @@ fn cases() -> Vec<Case> {
                 // what keeps the lookahead inside the buffer on a real frame. One instance is
                 // drawn, so only the first point's flag is tested -- and that one is clear.
                 streams: vec![
-                    outline(&[([2, 0], 0), ([-2, 0], 1)]),
+                    outline(&[([2, 0], 0, 0), ([-2, 0], 1, 0)]),
                     per_vertex(&packed_color([0, 128, 255, 255]), 2),
                     per_vertex(&[0.0, 0.0], 2),
                     per_vertex(&[1.0, 1.0], 2),
@@ -1785,7 +1813,7 @@ fn cases() -> Vec<Case> {
             absent: &[],
             instanced: Some(Instanced {
                 streams: vec![
-                    outline(&[([2, 0], 0), ([-2, 0], 1)]),
+                    outline(&[([2, 0], 0, 0), ([-2, 0], 1, 0)]),
                     // Two endpoints, so the entry's `color_t` decides which is drawn.
                     per_vertex(&packed_pair([255, 0, 0, 255], [0, 128, 255, 255]), 2),
                     per_vertex(&[0.0, 0.0], 2),
@@ -1823,6 +1851,241 @@ fn cases() -> Vec<Case> {
             topology: Topology::Triangles,
             ubo_index: 1,
             expect: [8, 149, 255, 255],
+        },
+        // A patterned roof, which is the plain one's placement with a sprite in place of its
+        // color -- and the first case for either family mbgl draws when `fill-extrusion-pattern`
+        // resolves.
+        //
+        // The sprite is sampled at the center of one texel, which takes the pattern arithmetic
+        // apart: `pixel_coord_upper` is zero and `pixel_coord_lower` carries the whole offset, so
+        //
+        //   pattern_size = (12 - 4, 16 - 8) / 1.0 * 1.0          = (8, 8)
+        //   offset       = wrap(wrap(wrap(0, 8) * 256, 8) * 256 + (2.5, 4.5), 8) = (2.5, 4.5)
+        //   pos_a        = (1.0 * (0, 0) + (2.5, 4.5)) / (8, 8)  = (0.3125, 0.5625)
+        //   texel        = (4, 8) + (0.3125, 0.5625) * (8, 8)    = (6.5, 12.5)
+        //
+        // -- texel (6, 12) of a sixteen-square image, whose channels are its own coordinates
+        // scaled differently so a transposed lookup reads another color. `pattern_to` is the
+        // transpose of `pattern_from` and `fade` is zero, so a body that sampled the far sprite
+        // instead reads texel (10, 8) and (90, 18, 143).
+        //
+        // The lighting is the half that is *not* the plain family's, and the numbers are chosen
+        // to separate them:
+        //
+        //   least       = 1 - 1                               = 0
+        //   most        = max(0.5 + 1, 1)                     = 1.5
+        //   directional = mix(0, 1.5, 1)                      = 1.5
+        //   lit         = clamp(1.5 * 0.5, 0.15, 1)           = 0.75
+        //   out         = texel * 0.75 * 0.75                 = (54, 27, 143), alpha 191
+        //
+        // `props.color` is a decoy at a luminance of 0.2: a body that took the plain family's
+        // `max(1 - luminance + intensity, 1)` -- which is the arithmetic sitting two bodies up,
+        // and compiles here because the color is a uniform -- reads 1.8 for `most` and
+        // (65, 32, 172) for the pixel. The light color is a half rather than one so neither
+        // answer saturates the clamp, which would hide the difference.
+        //
+        // And the vertical gradient is *on*, with a height that would bind the clamp: a roof's
+        // normal is `(0, 0, 1)`, so mbgl's `if (normal.z == 0.0)` excludes it and this reads 54.
+        // A body that dropped the guard applies a factor of 0.7 and reads 38.
+        Case {
+            name: "fill_extrusion_pattern",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillExtrusionPatternShader as i32,
+            wire: PLANE,
+            layout: Layout::PerAttribute,
+            streams: vec![
+                shorts(&COVERING),
+                ushorts(&[0, 0, 0, 0, 0, 0]),
+                per_vertex(&[0.0, 0.0], 3),
+                per_vertex(&[37.5, 37.5], 3),
+                ushorts(&[4, 8, 12, 16, 4, 8, 12, 16, 4, 8, 12, 16]),
+                ushorts(&[8, 4, 16, 12, 8, 4, 16, 12, 8, 4, 16, 12]),
+            ],
+            uniforms: vec![
+                block(
+                    &FILL_EXTRUSION_DRAWABLE_UBO,
+                    &[
+                        // The identity with its `z` column dropped, so the roof's height reaches
+                        // the lighting without reaching the depth: a clip `z` of 37.5 is outside
+                        // Vulkan's `0..w` and nothing would be drawn at all.
+                        ("matrix", At::F(&FLAT_Z)),
+                        ("pixel_coord_lower", At::F(&[2.5, 4.5])),
+                        ("tile_ratio", At::F(&[1.0])),
+                        ("base_t", At::F(&[0.0])),
+                        ("height_t", At::F(&[0.0])),
+                    ],
+                ),
+                block(
+                    &FILL_EXTRUSION_TILE_PROPS_UBO,
+                    &[("texsize", At::F(&[16.0, 16.0]))],
+                ),
+                block(
+                    &FILL_EXTRUSION_PROPS_UBO,
+                    &[
+                        ("color", At::F(&[0.2, 0.2, 0.2, 1.0])),
+                        ("light_color", At::F(&[0.5, 0.5, 0.5])),
+                        ("light_position", At::F(&[0.0, 0.0, 1.0])),
+                        ("light_intensity", At::F(&[1.0])),
+                        ("vertical_gradient", At::F(&[1.0])),
+                        ("opacity", At::F(&[0.75])),
+                        ("fade", At::F(&[0.0])),
+                        ("from_scale", At::F(&[1.0])),
+                        ("to_scale", At::F(&[1.0])),
+                    ],
+                ),
+                block(&GLOBAL_PAINT_PARAMS_UBO, &[("pixel_ratio", At::F(&[1.0]))]),
+            ],
+            images: vec![Image::new(16, |x, y| {
+                [
+                    u8::try_from(x * 16).unwrap_or(255),
+                    u8::try_from(y * 4).unwrap_or(255),
+                    255,
+                    255,
+                ]
+            })],
+            vertices: 3,
+            topology: Topology::Triangles,
+            ubo_index: 0,
+            pass: None,
+            absent: &[],
+            instanced: None,
+            expect: [54, 27, 143, 191],
+        },
+        // And the wall standing under it, which is the family the edge distance exists for.
+        //
+        // The geometry is `extrusion_wall`'s: one quad instanced over an outline of two points,
+        // the far one read ahead out of the shared buffer. What is new is where the sprite runs.
+        // A roof tiles over its footprint; a wall has none, so mbgl tiles it over how far along
+        // the ring the wall begins and how high up the fragment is:
+        //
+        //   edge_distance = (1 + 4) / 2                            = 2.5   at the center pixel
+        //   z             = 0.5                                    at clip `y` of zero
+        //   along         = (2.5, 0.5 * 9.0)                       = (2.5, 4.5)
+        //   pos_a         = (1.0 * (2.5, 4.5) + (0, 0)) / (8, 8)   = (0.3125, 0.5625)
+        //
+        // -- the same texel (6, 12) the roof above reads, by a different route, which is the
+        // point: the two bodies differ in what they hand `pattern_pos` and in nothing else about
+        // the sampling. A body that passed the *position* instead reads the wall's own tile
+        // coordinates and lands somewhere else entirely; one that dropped `height_factor` reads
+        // texel (6, 8); one that ignored the edge distance reads texel (4, 12).
+        //
+        // The two ends carry different distances -- 1 at the flagged point and 4 at the other --
+        // so a body reading neither, or reading one twice, moves the pixel. Which end is paired
+        // with which vertex it cannot say: the read pixel is the midpoint and the mean of the two
+        // is the same either way. `tests/shaders.rs` pins that line as text for that reason.
+        //
+        // The lighting is the wall's own, with the vertical gradient on and arranged to land on
+        // the clamp's floor at both ends, as `extrusion_wall_dim` arranges it for the plain
+        // family:
+        //
+        //   edge        = normalize((-2, 0) - (2, 0))              = (-1, 0)
+        //   normal      = (0, -1, 0),  facing = clamp(2, 0, 1)     = 1
+        //   directional = mix(0, max(0.5 + 1, 1), 1)               = 1.5
+        //   dimmest     = mix(0.7, 0.98, 1 - 1)                    = 0.7
+        //   factor      = clamp((t + 0) * sqrt(1.5 / 150), 0.7, 1) = 0.7  for t of 0 and of 1
+        //   directional *= (1 - 1) + 1 * 0.7                       = 1.05
+        //   lit         = clamp(1.05 * 0.5, 0.15, 1)               = 0.525
+        //   out         = texel * 0.525 * 0.75                     = (38, 19, 100), alpha 191
+        //
+        // So the gradient is under test here where the roof above says it is excluded: a body
+        // that dropped it reads (54, 27, 143) -- the roof's own pixel, which is the coincidence
+        // this pair is arranged to break.
+        Case {
+            name: "fill_extrusion_pattern_wall",
+            at: (SIDE / 2, SIDE / 2),
+            family: BuiltIn::FillExtrusionPatternInstancedShader as i32,
+            wire: PLANE,
+            layout: Layout::PerAttribute,
+            streams: vec![shorts(&WALL_QUAD)],
+            uniforms: vec![
+                block(
+                    &FILL_EXTRUSION_DRAWABLE_UBO,
+                    &[
+                        ("matrix", At::F(&WALL_CLIP)),
+                        ("height_factor", At::F(&[9.0])),
+                        ("tile_ratio", At::F(&[1.0])),
+                        ("base_t", At::F(&[0.0])),
+                        ("height_t", At::F(&[0.0])),
+                    ],
+                ),
+                block(
+                    &FILL_EXTRUSION_TILE_PROPS_UBO,
+                    &[("texsize", At::F(&[16.0, 16.0]))],
+                ),
+                block(
+                    &FILL_EXTRUSION_PROPS_UBO,
+                    &[
+                        ("color", At::F(&[0.2, 0.2, 0.2, 1.0])),
+                        ("light_color", At::F(&[0.5, 0.5, 0.5])),
+                        ("light_position", At::F(&[0.0, -2.0, 0.0])),
+                        ("light_intensity", At::F(&[1.0])),
+                        ("vertical_gradient", At::F(&[1.0])),
+                        ("opacity", At::F(&[0.75])),
+                        ("fade", At::F(&[0.0])),
+                        ("from_scale", At::F(&[1.0])),
+                        ("to_scale", At::F(&[1.0])),
+                    ],
+                ),
+                block(&GLOBAL_PAINT_PARAMS_UBO, &[("pixel_ratio", At::F(&[1.0]))]),
+            ],
+            images: vec![Image::new(16, |x, y| {
+                [
+                    u8::try_from(x * 16).unwrap_or(255),
+                    u8::try_from(y * 4).unwrap_or(255),
+                    255,
+                    255,
+                ]
+            })],
+            vertices: 6,
+            topology: Topology::Triangles,
+            ubo_index: 0,
+            pass: None,
+            absent: &[],
+            instanced: Some(Instanced {
+                // The near point carries a distance of 4 and the flagged far one 1, which is the
+                // pair the body averages at the pixel read.
+                streams: vec![
+                    outline(&[([2, 0], 0, 4), ([-2, 0], 1, 1)]),
+                    per_vertex(&[0.0, 0.0], 2),
+                    per_vertex(&[1.5, 1.5], 2),
+                    pattern_pair([4, 8, 12, 16], 2),
+                    pattern_pair([8, 4, 16, 12], 2),
+                ],
+                packing: vec![
+                    Packed {
+                        stream: 0,
+                        offset: 0,
+                        stride: 8,
+                    },
+                    Packed {
+                        stream: 0,
+                        offset: 4,
+                        stride: 8,
+                    },
+                    Packed {
+                        stream: 1,
+                        offset: 0,
+                        stride: 8,
+                    },
+                    Packed {
+                        stream: 2,
+                        offset: 0,
+                        stride: 8,
+                    },
+                    Packed {
+                        stream: 3,
+                        offset: 0,
+                        stride: 8,
+                    },
+                    Packed {
+                        stream: 4,
+                        offset: 0,
+                        stride: 8,
+                    },
+                ],
+                count: 1,
+            }),
+            expect: [38, 19, 100, 191],
         },
         // A raster tile, which is the first case to sample anything.
         //
@@ -3980,7 +4243,8 @@ const WHICH: blocks::Which = blocks::Which {
 
 /// The one slot a case declares that is the frame's rather than a layer's.
 ///
-/// `GlobalPaintParamsUBO`, which twelve of the twenty-two families declare. Named here rather than
+/// `GlobalPaintParamsUBO`, which nineteen of the twenty-four families' modules declare on a plane.
+/// Named here rather than
 /// asked of `slots::scope`, because that is what this probe is checking: an oracle derived from
 /// the code under test moves with it.
 const FRAME_WIDE_SLOT: u32 = tessella_capture_abi::generated::ubo_slots::ID_GLOBAL_PAINT_PARAMS_UBO;
@@ -4568,7 +4832,7 @@ fn draw_case<'d>(
         }
         let entries = bytes.len() / stride;
         // Where the producer would have put it: a frame-wide block arrives under `layer_index:
-        // -1` rather than under the layer drawing, and twelve of the twenty-two families declare
+        // -1` rather than under the layer drawing, and nineteen of the twenty-four families declare
         // one.
         //
         // Decided here from the slot rather than asked of `slots::held_at`, which is the thing

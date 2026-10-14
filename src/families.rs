@@ -18,7 +18,8 @@
 //!
 //! # What is not here
 //!
-//! Sixteen of mbgl's thirty-six shader entries. [`UNDRAWN`] lists them with the reason, and
+//! Twenty-three of mbgl's thirty-six shader entries. [`UNDRAWN`] lists the other thirteen with
+//! the reason, and
 //! [`for_wire`] returns `None` for each, so a producer naming one is a drawable this crate skips
 //! rather than a panic. The list is pinned by a test: adding a family here without removing it
 //! there fails, and so does the reverse.
@@ -27,14 +28,16 @@ use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_capture_abi::generated::shader_attributes::{
     BACKGROUND_PATTERN_SHADER, BACKGROUND_SHADER, CIRCLE_SHADER, COLOR_RELIEF_SHADER,
     FILL_EXTRUSION_INSTANCED_SHADER, FILL_EXTRUSION_INSTANCED_SHADER_INSTANCE,
-    FILL_EXTRUSION_SHADER, FILL_OUTLINE_PATTERN_SHADER, FILL_OUTLINE_SHADER,
-    FILL_OUTLINE_TRIANGULATED_SHADER, FILL_PATTERN_SHADER, FILL_SHADER, HEATMAP_SHADER,
-    HEATMAP_TEXTURE_SHADER, HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER, LINE_PATTERN_SHADER,
-    LINE_SHADER, RASTER_SHADER, SYMBOL_ICON_SHADER, SYMBOL_SDFSHADER, SYMBOL_TEXT_AND_ICON_SHADER,
-    ShaderAttribute,
+    FILL_EXTRUSION_PATTERN_INSTANCED_SHADER, FILL_EXTRUSION_PATTERN_INSTANCED_SHADER_INSTANCE,
+    FILL_EXTRUSION_PATTERN_SHADER, FILL_EXTRUSION_SHADER, FILL_OUTLINE_PATTERN_SHADER,
+    FILL_OUTLINE_SHADER, FILL_OUTLINE_TRIANGULATED_SHADER, FILL_PATTERN_SHADER, FILL_SHADER,
+    HEATMAP_SHADER, HEATMAP_TEXTURE_SHADER, HILLSHADE_PREPARE_SHADER, HILLSHADE_SHADER,
+    LINE_PATTERN_SHADER, LINE_SHADER, RASTER_SHADER, SYMBOL_ICON_SHADER, SYMBOL_SDFSHADER,
+    SYMBOL_TEXT_AND_ICON_SHADER, ShaderAttribute,
 };
 use tessella_capture_abi::generated::texture_slots::{
     BACKGROUND_PATTERN_SHADER_TEXTURES, COLOR_RELIEF_SHADER_TEXTURES,
+    FILL_EXTRUSION_PATTERN_INSTANCED_SHADER_TEXTURES, FILL_EXTRUSION_PATTERN_SHADER_TEXTURES,
     FILL_OUTLINE_PATTERN_SHADER_TEXTURES, FILL_PATTERN_SHADER_TEXTURES,
     HEATMAP_TEXTURE_SHADER_TEXTURES, HILLSHADE_PREPARE_SHADER_TEXTURES, HILLSHADE_SHADER_TEXTURES,
     LINE_PATTERN_SHADER_TEXTURES, RASTER_SHADER_TEXTURES, SYMBOL_ICON_SHADER_TEXTURES,
@@ -45,15 +48,15 @@ use tessella_capture_abi::generated::ubo_layouts::{
     BACKGROUND_PROPS_UBO, CIRCLE_DRAWABLE_UBO, CIRCLE_EVALUATED_PROPS_UBO,
     COLOR_RELIEF_DRAWABLE_UBO, COLOR_RELIEF_EVALUATED_PROPS_UBO, COLOR_RELIEF_TILE_PROPS_UBO,
     FILL_DRAWABLE_UBO, FILL_EVALUATED_PROPS_UBO, FILL_EXTRUSION_DRAWABLE_UBO,
-    FILL_EXTRUSION_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO, FILL_OUTLINE_PATTERN_DRAWABLE_UBO,
-    FILL_OUTLINE_PATTERN_TILE_PROPS_UBO, FILL_OUTLINE_TRIANGULATED_DRAWABLE_UBO,
-    FILL_PATTERN_DRAWABLE_UBO, FILL_PATTERN_TILE_PROPS_UBO, GLOBAL_PAINT_PARAMS_UBO,
-    HEATMAP_DRAWABLE_UBO, HEATMAP_EVALUATED_PROPS_UBO, HEATMAP_TEXTURE_PROPS_UBO,
-    HILLSHADE_DRAWABLE_UBO, HILLSHADE_EVALUATED_PROPS_UBO, HILLSHADE_PREPARE_DRAWABLE_UBO,
-    HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO, LINE_DRAWABLE_UBO,
-    LINE_EVALUATED_PROPS_UBO, LINE_PATTERN_DRAWABLE_UBO, LINE_PATTERN_TILE_PROPS_UBO,
-    RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO,
-    SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
+    FILL_EXTRUSION_PROPS_UBO, FILL_EXTRUSION_TILE_PROPS_UBO, FILL_OUTLINE_DRAWABLE_UBO,
+    FILL_OUTLINE_PATTERN_DRAWABLE_UBO, FILL_OUTLINE_PATTERN_TILE_PROPS_UBO,
+    FILL_OUTLINE_TRIANGULATED_DRAWABLE_UBO, FILL_PATTERN_DRAWABLE_UBO, FILL_PATTERN_TILE_PROPS_UBO,
+    GLOBAL_PAINT_PARAMS_UBO, HEATMAP_DRAWABLE_UBO, HEATMAP_EVALUATED_PROPS_UBO,
+    HEATMAP_TEXTURE_PROPS_UBO, HILLSHADE_DRAWABLE_UBO, HILLSHADE_EVALUATED_PROPS_UBO,
+    HILLSHADE_PREPARE_DRAWABLE_UBO, HILLSHADE_PREPARE_TILE_PROPS_UBO, HILLSHADE_TILE_PROPS_UBO,
+    LINE_DRAWABLE_UBO, LINE_EVALUATED_PROPS_UBO, LINE_PATTERN_DRAWABLE_UBO,
+    LINE_PATTERN_TILE_PROPS_UBO, RASTER_DRAWABLE_UBO, RASTER_EVALUATED_PROPS_UBO,
+    SYMBOL_DRAWABLE_UBO, SYMBOL_EVALUATED_PROPS_UBO, SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
 use tessella_capture_abi::terrain_ubo::{
     BUILTIN_TERRAIN_SHADER, TERRAIN_MESH_ATTRIBUTES, TERRAIN_MESH_ELEVATION_SLOT,
@@ -62,11 +65,11 @@ use tessella_capture_abi::terrain_ubo::{
 use crate::pipelines::Blend;
 use crate::shaders::{
     self, BACKGROUND_BODY, BACKGROUND_PATTERN_BODY, CIRCLE_BODY, COLOR_RELIEF_BODY, FILL_BODY,
-    FILL_EXTRUSION_BODY, FILL_EXTRUSION_INSTANCED_BODY, FILL_OUTLINE_BODY,
-    FILL_OUTLINE_PATTERN_BODY, FILL_OUTLINE_TRIANGULATED_BODY, FILL_PATTERN_BODY, HEATMAP_BODY,
-    HEATMAP_TEXTURE_BODY, HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_BODY, LINE_PATTERN_BODY,
-    Paint, Property, RASTER_BODY, SYMBOL_ICON_BODY, SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY,
-    TERRAIN_BODY,
+    FILL_EXTRUSION_BODY, FILL_EXTRUSION_INSTANCED_BODY, FILL_EXTRUSION_PATTERN_BODY,
+    FILL_EXTRUSION_PATTERN_INSTANCED_BODY, FILL_OUTLINE_BODY, FILL_OUTLINE_PATTERN_BODY,
+    FILL_OUTLINE_TRIANGULATED_BODY, FILL_PATTERN_BODY, HEATMAP_BODY, HEATMAP_TEXTURE_BODY,
+    HILLSHADE_BODY, HILLSHADE_PREPARE_BODY, LINE_BODY, LINE_PATTERN_BODY, Paint, Property,
+    RASTER_BODY, SYMBOL_ICON_BODY, SYMBOL_SDF_BODY, SYMBOL_TEXT_AND_ICON_BODY, TERRAIN_BODY,
 };
 use crate::surface::{Surface, TERRAIN_DRAWABLE_UBO};
 
@@ -454,6 +457,81 @@ const FILL_EXTRUSION_INSTANCED_PAINT: &[Property] = &[
         returns: "f32",
         varies: "mix_value(in.fill_extrusion_height, fill_extrusion_drawable_ubo[ubo_index].height_t)",
         constant: "fill_extrusion_props_ubo[0].height",
+    },
+];
+
+/// `fill_extrusion_pattern`'s four. No color among them, which is mbgl's table and not an
+/// omission: the surface a patterned extrusion shows is the sprite, so `FillExtrusionPatternShader`
+/// declares no color attribute at all and its lighting carries no surface term.
+///
+/// The two rectangles are a pair of `vec4`s and are read straight through rather than mixed, for
+/// `fill_pattern`'s reason: the `_t` beside them cross-fades the two *sprites* in the fragment
+/// stage and not the corners of either.
+const FILL_EXTRUSION_PATTERN_PAINT: &[Property] = &[
+    Property {
+        location: 2,
+        name: "base",
+        returns: "f32",
+        varies: "mix_value(in.fill_extrusion_base, fill_extrusion_drawable_ubo[ubo_index].base_t)",
+        constant: "fill_extrusion_props_ubo[0].base",
+    },
+    Property {
+        location: 3,
+        name: "height",
+        returns: "f32",
+        varies: "mix_value(in.fill_extrusion_height, fill_extrusion_drawable_ubo[ubo_index].height_t)",
+        constant: "fill_extrusion_props_ubo[0].height",
+    },
+    Property {
+        location: 4,
+        name: "pattern_from",
+        returns: "vec4<f32>",
+        varies: "vec4<f32>(in.fill_extrusion_pattern_from)",
+        constant: "fill_extrusion_tile_props_ubo[ubo_index].pattern_from",
+    },
+    Property {
+        location: 5,
+        name: "pattern_to",
+        returns: "vec4<f32>",
+        varies: "vec4<f32>(in.fill_extrusion_pattern_to)",
+        constant: "fill_extrusion_tile_props_ubo[ubo_index].pattern_to",
+    },
+];
+
+/// `fill_extrusion_pattern_instanced`'s four: the same properties one location higher, because the
+/// outline position and the packed decimals come before them in the instance table.
+///
+/// One higher and not two, which is the difference from [`FILL_EXTRUSION_INSTANCED_PAINT`]: this
+/// family's per-vertex table is the template corner alone, so the instance run starts a location
+/// earlier.
+const FILL_EXTRUSION_PATTERN_INSTANCED_PAINT: &[Property] = &[
+    Property {
+        location: 3,
+        name: "base",
+        returns: "f32",
+        varies: "mix_value(in.fill_extrusion_base, fill_extrusion_drawable_ubo[ubo_index].base_t)",
+        constant: "fill_extrusion_props_ubo[0].base",
+    },
+    Property {
+        location: 4,
+        name: "height",
+        returns: "f32",
+        varies: "mix_value(in.fill_extrusion_height, fill_extrusion_drawable_ubo[ubo_index].height_t)",
+        constant: "fill_extrusion_props_ubo[0].height",
+    },
+    Property {
+        location: 5,
+        name: "pattern_from",
+        returns: "vec4<f32>",
+        varies: "vec4<f32>(in.fill_extrusion_pattern_from)",
+        constant: "fill_extrusion_tile_props_ubo[ubo_index].pattern_from",
+    },
+    Property {
+        location: 6,
+        name: "pattern_to",
+        returns: "vec4<f32>",
+        varies: "vec4<f32>(in.fill_extrusion_pattern_to)",
+        constant: "fill_extrusion_tile_props_ubo[ubo_index].pattern_to",
     },
 ];
 
@@ -868,6 +946,42 @@ pub static ALL: &[Family] = &[
         composite: Composite::Fixed(Blend::Alpha),
     },
     Family {
+        shader: BuiltIn::FillExtrusionPatternShader as i32,
+        name: "fill_extrusion_pattern",
+        blocks: &[
+            &FILL_EXTRUSION_DRAWABLE_UBO,
+            &FILL_EXTRUSION_TILE_PROPS_UBO,
+            &FILL_EXTRUSION_PROPS_UBO,
+            &GLOBAL_PAINT_PARAMS_UBO,
+        ],
+        attributes: &FILL_EXTRUSION_PATTERN_SHADER,
+        instance_attributes: &[],
+        textures: &FILL_EXTRUSION_PATTERN_SHADER_TEXTURES,
+        properties: FILL_EXTRUSION_PATTERN_PAINT,
+        body: FILL_EXTRUSION_PATTERN_BODY,
+        surfaces: LIFTS_A_HEIGHT,
+        height: true,
+        composite: Composite::Fixed(Blend::Alpha),
+    },
+    Family {
+        shader: BuiltIn::FillExtrusionPatternInstancedShader as i32,
+        name: "fill_extrusion_pattern_instanced",
+        blocks: &[
+            &FILL_EXTRUSION_DRAWABLE_UBO,
+            &FILL_EXTRUSION_TILE_PROPS_UBO,
+            &FILL_EXTRUSION_PROPS_UBO,
+            &GLOBAL_PAINT_PARAMS_UBO,
+        ],
+        attributes: &FILL_EXTRUSION_PATTERN_INSTANCED_SHADER,
+        instance_attributes: &FILL_EXTRUSION_PATTERN_INSTANCED_SHADER_INSTANCE,
+        textures: &FILL_EXTRUSION_PATTERN_INSTANCED_SHADER_TEXTURES,
+        properties: FILL_EXTRUSION_PATTERN_INSTANCED_PAINT,
+        body: FILL_EXTRUSION_PATTERN_INSTANCED_BODY,
+        surfaces: LIFTS_A_HEIGHT,
+        height: true,
+        composite: Composite::Fixed(Blend::Alpha),
+    },
+    Family {
         shader: BuiltIn::LineShader as i32,
         name: "line",
         blocks: &[
@@ -1100,9 +1214,15 @@ const SYMBOL_BLOCKS: &[&UboLayout] = &[
 /// with a sprite sheet named it twice -- a patterned fill with `fill-antialias` emits a patterned
 /// outline beside it, and `families_p` is a scene that does.
 ///
-/// What is left here is claims again: a capture of a style that uses one of these is what would
-/// settle it. The two extrusion patterns are the ones still waiting, and no scene in
-/// `tools/parity/scenes` sets `fill-extrusion-pattern`.
+/// And so were the two extrusion patterns, which is the fourth time that sentence turned out to be
+/// about the *scenes* rather than about the producer. tessella emits both shaders for a layer whose
+/// `fill-extrusion-pattern` resolves and has done since the property was built; what no capture
+/// carried was a style that sets it. `tools/parity/scenes/extrusion_pattern_p.json` is one, and the
+/// frame it captures plans all seventeen of its geometries across ten families.
+///
+/// What is left here is claims again, and they are narrower ones: `LineGradientShader` and
+/// `LineSDFShader` are the two the producer has no drawable for at all, and the rest are not map
+/// layers. A capture of a style that uses one is still what would settle the first two.
 pub static UNDRAWN: &[(BuiltIn, &str)] = &[
     (
         BuiltIn::None,
@@ -1132,14 +1252,6 @@ pub static UNDRAWN: &[(BuiltIn, &str)] = &[
     (
         BuiltIn::CustomSymbolIconShader,
         "an embedder's own symbols, which this crate has no producer for",
-    ),
-    (
-        BuiltIn::FillExtrusionPatternShader,
-        "the producer emits no drawable for it yet",
-    ),
-    (
-        BuiltIn::FillExtrusionPatternInstancedShader,
-        "the producer emits no drawable for it yet",
     ),
     (
         BuiltIn::LineGradientShader,

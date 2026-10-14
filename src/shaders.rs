@@ -2759,6 +2759,310 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
 }
 ";
 
+/// The patterned extrusion's body: a roof with a sprite tiled over it.
+///
+/// [`FILL_EXTRUSION_BODY`]'s placement and lighting with [`FILL_PATTERN_BODY`]'s sprite
+/// arithmetic, and the eighteenth of mbgl's shaders this crate draws. The producer emits it for a
+/// layer whose `fill-extrusion-pattern` resolves, which `tools/parity/scenes/extrusion_pattern_p`
+/// is a scene that does.
+///
+/// # The lighting is not the plain family's
+///
+/// It is shorter by exactly the surface color, and that is mbgl's difference rather than a
+/// simplification. `FillExtrusionShader` reads the color, takes its relative luminance and widens
+/// the shading range by `1.0 - luminance + light_intensity`, so a pale building is shaded less
+/// than a dark one. `FillExtrusionPatternShader` has no color attribute at all -- the surface is
+/// the sprite, which the vertex stage has not sampled -- so mbgl uses the constant
+/// `max(0.5 + light_intensity, 1.0)` in its place and multiplies the sampled color by the result
+/// in the fragment stage.
+///
+/// Copying the plain body's lighting here would compile, draw, and be wrong by the luminance of
+/// whatever `fill-extrusion-color` the layer happens to carry beside its pattern -- which the
+/// pattern replaces. `benches/first_pixel.rs`'s `fill_extrusion_pattern` is the case that reads
+/// the difference: its inputs make the two formulas disagree.
+///
+/// # The vertical gradient is dead here, as it is in the plain roof
+///
+/// mbgl guards it with `normal.z == 0.0` and the normal is `vec3(0, 0, 1)`, so a roof never takes
+/// it. Written out all the same, for [`FILL_EXTRUSION_BODY`]'s reason: the branch is the oracle's
+/// and a body that dropped it would agree by coincidence of what this family draws rather than by
+/// computing the same thing. The walls beside it are
+/// [`FILL_EXTRUSION_PATTERN_INSTANCED_BODY`], where the normal is horizontal and the gradient is
+/// the whole point.
+pub const FILL_EXTRUSION_PATTERN_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) lighting: vec4<f32>,
+    @location(1) pos_a: vec2<f32>,
+    @location(2) pos_b: vec2<f32>,
+    @location(3) pattern_from: vec4<f32>,
+    @location(4) pattern_to: vec4<f32>,
+    @location(5) @interpolate(flat) ubo: u32,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let drawable = fill_extrusion_drawable_ubo[ubo_index];
+    let props = fill_extrusion_props_ubo[0];
+    let global = global_paint_params_ubo[0];
+    var out: Out;
+
+    let footprint = vec2<f32>(in.fill_extrusion_pos);
+
+    // The fraction the position was packed with, seven bits an axis, as the plain roof reads it.
+    let packed = floor(f32(in.fill_extrusion_decimals_ed.x) / 2.0);
+    let high = floor(packed / 256.0);
+    let decimals = vec2<f32>(high, packed - high * 256.0) / 128.0;
+
+    let base = max(paint_base(in), 0.0);
+    let height = max(paint_height(in), 0.0);
+    let on_roof = 1.0;
+    let z = select(base, height, on_roof > 0.0);
+
+    // Straight through, not mixed: a pattern's rectangles are corners in the atlas, and the
+    // cross-fade between the two is `fade` in the fragment stage.
+    let pattern_from = paint_pattern_from(in);
+    let pattern_to = paint_pattern_to(in);
+    out.pattern_from = pattern_from;
+    out.pattern_to = pattern_to;
+
+    // The sprite's extent in the atlas, as the size it should cover on screen.
+    let display_a = (pattern_from.zw - pattern_from.xy) / max(global.pixel_ratio, 1e-6);
+    let display_b = (pattern_to.zw - pattern_to.xy) / max(global.pixel_ratio, 1e-6);
+
+    // A roof's pattern runs over its footprint, which is the position *without* the decimals --
+    // mbgl's `vec2(in_position)`, where the clip position below adds them.
+    out.pos_a = pattern_pos(
+        drawable.pixel_coord_upper,
+        drawable.pixel_coord_lower,
+        props.from_scale * display_a,
+        drawable.tile_ratio,
+        footprint
+    );
+    out.pos_b = pattern_pos(
+        drawable.pixel_coord_upper,
+        drawable.pixel_coord_lower,
+        props.to_scale * display_b,
+        drawable.tile_ratio,
+        footprint
+    );
+
+    // A roof faces straight up, so the directional term is the light's own elevation. The range
+    // it is mixed into is a constant rather than the surface's luminance: see this body's note.
+    let normal = vec3<f32>(0.0, 0.0, 1.0);
+    let facing = clamp(dot(normal, props.light_position), 0.0, 1.0);
+    let least = 1.0 - props.light_intensity;
+    let most = max(0.5 + props.light_intensity, 1.0);
+    var directional = mix(least, most, facing);
+
+    // The gradient down a wall, which a roof's normal does not take. Written as mbgl writes it.
+    if normal.z == 0.0 {
+        let dimmest = mix(0.7, 0.98, 1.0 - props.light_intensity);
+        let factor = clamp((on_roof + base) * pow(height / 150.0, 0.5), dimmest, 1.0);
+        directional *= (1.0 - props.vertical_gradient) + props.vertical_gradient * factor;
+    }
+
+    // Shading is floored at a tint complementary to the light, so a colored light leaves its
+    // opposite in the shadows rather than driving them to black. No surface color in it: the
+    // sprite is the surface, and the fragment stage multiplies the two.
+    let floor_light = mix(vec3<f32>(0.0), vec3<f32>(0.3), 1.0 - props.light_color);
+    let lit = clamp(directional * props.light_color, floor_light, vec3<f32>(1.0));
+
+    // Premultiplied, over a lighting whose alpha was one.
+    out.lighting = vec4<f32>(lit, 1.0) * props.opacity;
+
+    out.clip = place(vec3<f32>(footprint + decimals, z), drawable.matrix);
+    out.ubo = ubo_index;
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    // The slot, carried: a fragment invocation's own copy of a private is zero.
+    ubo_index = in.ubo;
+    let tile = fill_extrusion_tile_props_ubo[ubo_index];
+    let props = fill_extrusion_props_ubo[0];
+    let texsize = tile.texsize;
+
+    let in_a = wrap(in.pos_a, vec2<f32>(1.0, 1.0));
+    let pos_a = mix(in.pattern_from.xy / texsize, in.pattern_from.zw / texsize, in_a);
+    let color_a = textureSample(fill_extrusion_image, fill_extrusion_image_sampler, pos_a);
+
+    let in_b = wrap(in.pos_b, vec2<f32>(1.0, 1.0));
+    let pos_b = mix(in.pattern_to.xy / texsize, in.pattern_to.zw / texsize, in_b);
+    let color_b = textureSample(fill_extrusion_image, fill_extrusion_image_sampler, pos_b);
+
+    return mix(color_a, color_b, props.fade) * in.lighting;
+}
+";
+
+/// The patterned extrusion's walls: one per outline edge, with the sprite running along them.
+///
+/// [`FILL_EXTRUSION_INSTANCED_BODY`]'s geometry and [`FILL_EXTRUSION_PATTERN_BODY`]'s sprite, and
+/// the one body here that needs the *edge distance*. The plain walls read the same word and mask
+/// it off -- "it is for a pattern, and this family draws none" is what that body says about it --
+/// so this is the family that word was always for.
+///
+/// # The pattern coordinate is not a position
+///
+/// A roof tiles over its footprint, which is a place on the ground. A wall has no footprint: it is
+/// a vertical strip, and mbgl tiles it over `vec2(edgedistance, z * height_factor)` -- how far
+/// along the ring this edge begins and how high up this vertex is. Feed it a position instead and
+/// the sprite runs over the building's plan rather than up its side, which draws something
+/// plausible and wrong: the pattern then slides with the wall's compass direction instead of
+/// standing still on it.
+///
+/// `height_factor` is the drawable's own, and it is what puts the vertical axis in the same units
+/// as the horizontal one.
+///
+/// # The edge distance is read from the *other* end
+///
+/// `in_position.x == 0.0 ? nextInstanceDecimalsEd.y : instanceDecimalsEd.y`, which pairs the
+/// vertex at `p1` with the *next* instance's accumulated distance. Transcribed as mbgl has it
+/// rather than as it reads: the distance accumulates to a point along the ring, and swapping the
+/// two ends is a pattern that runs backwards along every wall -- a difference no count would
+/// catch.
+pub const FILL_EXTRUSION_PATTERN_INSTANCED_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) lighting: vec4<f32>,
+    @location(1) pos_a: vec2<f32>,
+    @location(2) pos_b: vec2<f32>,
+    @location(3) pattern_from: vec4<f32>,
+    @location(4) pattern_to: vec4<f32>,
+    @location(5) @interpolate(flat) ubo: u32,
+}
+
+// Where a wall's foot stands, as the plain walls read it: the integer tile position plus the
+// fraction packed beside the discard flag.
+fn outline_point(position: vec2<f32>, decimals: u32) -> vec2<f32> {
+    let pair = f32(decimals >> 1u);
+    let high = floor(pair / 256.0);
+    return position + vec2<f32>(high, pair - high * 256.0) / 128.0;
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    // Not `in.instance_index`, which is this draw's instance. See the constant's own note.
+    ubo_index = pushed.ubo_index;
+    let drawable = fill_extrusion_drawable_ubo[ubo_index];
+    let props = fill_extrusion_props_ubo[0];
+    let global = global_paint_params_ubo[0];
+    var out: Out;
+
+    // A ring's closing point has no edge leaving it and so no wall to raise. Tested first, which
+    // is also what keeps the lookahead below inside the buffer.
+    if (in.fill_extrusion_decimals_ed.x & 1u) != 0u {
+        out.clip = vec4<f32>(0.0);
+        out.lighting = vec4<f32>(0.0);
+        out.pos_a = vec2<f32>(0.0);
+        out.pos_b = vec2<f32>(0.0);
+        out.pattern_from = vec4<f32>(0.0);
+        out.pattern_to = vec4<f32>(0.0);
+        out.ubo = ubo_index;
+        return out;
+    }
+
+    let p1 = outline_point(
+        vec2<f32>(in.fill_extrusion_outline_pos),
+        in.fill_extrusion_decimals_ed.x
+    );
+
+    // The next outline point, from the same bytes read as a storage element. Both halves of the
+    // second word are wanted here: the low one is the decimals and the flag, the high one is the
+    // edge distance this vertex may be the one to use.
+    let next = shared_instance[in.instance_index + 1u];
+    let next_position = vec2<f32>(
+        f32((next.fill_extrusion_outline_pos << 16u) >> 16u),
+        f32(next.fill_extrusion_outline_pos >> 16u)
+    );
+    let next_decimals = next.fill_extrusion_decimals_ed & 0xFFFFu;
+    let next_edge = f32(next.fill_extrusion_decimals_ed >> 16u);
+    let p2 = outline_point(next_position, next_decimals);
+
+    // A wall faces along the outline's normal, which is its edge turned a quarter turn. Flat in
+    // `z`, which is what makes the gradient below apply to every vertex of this family.
+    let edge = normalize(p2 - p1);
+    let normal = vec3<f32>(-edge.y, edge.x, 0.0);
+
+    let base = max(paint_base(in), 0.0);
+    let height = max(paint_height(in), 0.0);
+
+    // The template's corner chooses which end of the edge and which end of the wall: `x` picks
+    // the point, `y` picks the foot or the top.
+    let t = f32(in.fill_extrusion_pos.y);
+    let z = select(base, height, t > 0.0);
+    let at_p1 = in.fill_extrusion_pos.x == 0;
+    let foot = select(p2, p1, at_p1);
+    // And the other end's distance, which is mbgl's pairing. See this body's note.
+    let edge_distance = select(f32(in.fill_extrusion_decimals_ed.y), next_edge, at_p1);
+
+    let pattern_from = paint_pattern_from(in);
+    let pattern_to = paint_pattern_to(in);
+    out.pattern_from = pattern_from;
+    out.pattern_to = pattern_to;
+
+    let display_a = (pattern_from.zw - pattern_from.xy) / max(global.pixel_ratio, 1e-6);
+    let display_b = (pattern_to.zw - pattern_to.xy) / max(global.pixel_ratio, 1e-6);
+
+    // Along the ring and up the wall, in tile units. See this body's note.
+    let along = vec2<f32>(edge_distance, z * drawable.height_factor);
+    out.pos_a = pattern_pos(
+        drawable.pixel_coord_upper,
+        drawable.pixel_coord_lower,
+        props.from_scale * display_a,
+        drawable.tile_ratio,
+        along
+    );
+    out.pos_b = pattern_pos(
+        drawable.pixel_coord_upper,
+        drawable.pixel_coord_lower,
+        props.to_scale * display_b,
+        drawable.tile_ratio,
+        along
+    );
+
+    // The shading range is a constant rather than the surface's luminance, for the reason
+    // `FILL_EXTRUSION_PATTERN_BODY` gives: there is no surface color to read.
+    let facing = clamp(dot(normal, props.light_position), 0.0, 1.0);
+    let least = 1.0 - props.light_intensity;
+    let most = max(0.5 + props.light_intensity, 1.0);
+    var directional = mix(least, most, facing);
+
+    // The gradient down a wall, which this family's normal always takes.
+    let dimmest = mix(0.7, 0.98, 1.0 - props.light_intensity);
+    let factor = clamp((t + base) * pow(height / 150.0, 0.5), dimmest, 1.0);
+    directional *= (1.0 - props.vertical_gradient) + props.vertical_gradient * factor;
+
+    let floor_light = mix(vec3<f32>(0.0), vec3<f32>(0.3), 1.0 - props.light_color);
+    let lit = clamp(directional * props.light_color, floor_light, vec3<f32>(1.0));
+
+    out.lighting = vec4<f32>(lit, 1.0) * props.opacity;
+    out.clip = place(vec3<f32>(foot, z), drawable.matrix);
+    out.ubo = ubo_index;
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    ubo_index = in.ubo;
+    let tile = fill_extrusion_tile_props_ubo[ubo_index];
+    let props = fill_extrusion_props_ubo[0];
+    let texsize = tile.texsize;
+
+    let in_a = wrap(in.pos_a, vec2<f32>(1.0, 1.0));
+    let pos_a = mix(in.pattern_from.xy / texsize, in.pattern_from.zw / texsize, in_a);
+    let color_a = textureSample(fill_extrusion_image, fill_extrusion_image_sampler, pos_a);
+
+    let in_b = wrap(in.pos_b, vec2<f32>(1.0, 1.0));
+    let pos_b = mix(in.pattern_to.xy / texsize, in.pattern_to.zw / texsize, in_b);
+    let color_b = textureSample(fill_extrusion_image, fill_extrusion_image_sampler, pos_b);
+
+    return mix(color_a, color_b, props.fade) * in.lighting;
+}
+";
+
 /// The ground's own body, which is the surface every raised family is placed on.
 ///
 /// The one family mbgl has no shader for. Its mesh is `tessella_layout::terrain::mesh` -- 129

@@ -3,7 +3,7 @@
 //!
 //! [`tessella_emblema::draws`] puts a drawable's slot in `firstInstance`, because every body reads
 //! it as `ubo_index` and a draw parameter costs nothing where `vkCmdPushConstants` costs 0.9 us a
-//! draw on V3D. That holds for all eighteen families drawn today, and every one of them draws a
+//! draw on V3D. That holds for all twenty-four families drawn today, and every one of them draws a
 //! single instance.
 //!
 //! The instanced wall family is the first that would draw more than one, and its body needs
@@ -517,7 +517,8 @@ fn by_column(open: &Open) -> Result<(), String> {
 ///
 /// Without it the measurement is one-sided. "The element fetched equals `firstInstance`" would
 /// also be what a device that shifted *every* vertex fetch by `firstInstance` produced, and that
-/// device would break the eighteen families drawn today rather than only the instanced one. So the
+/// device would break the twenty-four families drawn today rather than only the instanced two. So
+/// the
 /// same module and the same buffer are read at the vertex rate and the four draws compared to each
 /// other.
 ///

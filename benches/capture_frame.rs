@@ -84,6 +84,30 @@
 //!     --capture pitched.tslcap --out pitched.png
 //! ```
 //!
+//! # And one with a ground under it
+//!
+//! `--dem` (tessella#380) puts a terrain in the capture, which is what raises the layers standing
+//! on it. The same tile under a terrain style at 1.5 exaggeration:
+//!
+//! ```text
+//! python3 tools/parity/scenes/dem.py 14 8801 5374 > dem.png
+//! capture-render --style <a terrain scene> --tile berlin-z14.mvt --tile-at 14/8801/5374 \
+//!     --source berlin --dem dem.png --lon 13.4 --lat 52.5 --zoom 14 --pitch 60 \
+//!     --capture raised.tslcap
+//! ```
+//!
+//! Replayed, that is 99 records and 17 batches, twelve of them raised, and it draws: the surfaces
+//! come out `Plane and Terrain`, every raised layer binds the ground's elevation at
+//! `surface::TERRAIN_ELEVATION_SLOT`, and 12.8% of the frame's pixels differ from the flat one --
+//! the relief, which is what a raise is.
+//!
+//! **Sixteen of its seventeen batches draw.** The seventeenth is the ground itself, which arrives
+//! as `terrain_ubo::BUILTIN_TERRAIN_SHADER` and which `families::ALL` has no entry for: the layers
+//! standing on the surface draw and the surface under them does not. That is why the recording's
+//! count is checked against the batches that *resolved to a program* rather than against all of
+//! them -- `record::content`'s own note names the case, "a batch this consumer does not draw, which
+//! is a real case".
+//!
 //! The tile is the parity harness's own, off `serve.sh` on 8080, and has to be decompressed: the
 //! server sends it gzipped and the decoder refuses that with "wire type 7 at byte 0 is a group".
 //! `--tile-at` and `--source` are what place it; without them the tool draws the style's background
@@ -110,7 +134,7 @@ use ash::vk;
 use tessella_capture_abi::EnvelopeKind;
 use tessella_capture_abi::RenderPass;
 use tessella_capture_abi::capture;
-use tessella_capture_abi::envelope::{DrawFlags, TileId, ViewId};
+use tessella_capture_abi::envelope::{DrawFlags, Rect16, TileId, ViewId};
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_capture_abi::ring::Ring;
 use tessella_consume::batch;
@@ -120,11 +144,12 @@ use tessella_consume::upload::Upload;
 use tessella_emblema::blocks::Blocks;
 use tessella_emblema::descriptors::Sets;
 use tessella_emblema::device::Attachment;
+use tessella_emblema::images::Images;
 use tessella_emblema::pipelines::Blend;
 use tessella_emblema::store::Store;
 use tessella_emblema::surface::Surface;
 use tessella_emblema::{
-    blocks, buffers, families, masks, pipelines, record, slots, target, vertices,
+    blocks, buffers, descriptors, families, masks, pipelines, record, slots, target, vertices,
 };
 use tessella_vk::Recorder;
 
@@ -181,6 +206,85 @@ fn compile(source: &str) -> Result<Vec<u32>, String> {
     .map_err(|why| format!("validation: {why:?}"))?;
     naga::back::spv::write_vec(&parsed, &info, &naga::back::spv::Options::default(), None)
         .map_err(|why| format!("spirv: {why}"))
+}
+
+/// Declares and fills every texture the stream sent, and leaves them readable by a shader.
+///
+/// `benches/a_frame.rs` has the same twenty lines over a fixture's two atlases, and the shape is
+/// the ABI's rather than either bench's: `Images::upload` asks for a region's rows one at a time
+/// and `Upload::rows` is what says where a row is -- an offset and a stride per region, which
+/// differ between the two payload forms. A backend reading the wrong one uploads the right number
+/// of bytes to the right place from the wrong rows.
+fn stage<'d>(
+    images: &mut Images<'d>,
+    gpu: tessella_vk::Gpu<'d>,
+    record: Recorder<'_>,
+    host: &Host,
+) -> Result<usize, String> {
+    let mut empty = 0;
+    for work in host.uploads().work() {
+        let Upload::Texture {
+            texture,
+            size,
+            shape,
+            rects,
+            bytes,
+        } = work
+        else {
+            continue;
+        };
+        let pixels = host
+            .uploads()
+            .bytes(bytes)
+            .ok_or("a texture upload's bytes are not in the host's buffer")?;
+        let rows = work
+            .rows()
+            .ok_or("a texture upload has no row layout")?
+            .map_err(|why| format!("texture {}: {why:?}", texture.0))?;
+
+        // A texture of no area is not an image: `VkImageCreateInfo` requires every extent to be
+        // at least one, and a producer sends `0x0` for an atlas with nothing in it -- the captured
+        // Berlin frame carries one. Skipped rather than declared, which is what `Error::NoArea`
+        // says: RADV allocates it and says nothing, V3D fails the submission three calls later
+        // with an error naming neither the texture nor the extent.
+        if size.width == 0 || size.height == 0 {
+            empty += 1;
+            continue;
+        }
+        images
+            .declare(gpu, record, *texture, *size, shape.format, shape.channel)
+            .map_err(|why| format!("texture {}: {why}", texture.0))?;
+
+        // An empty rect list is one region covering the whole texture, which is what
+        // `upload::rows` answers for it -- so the rects handed to `Images` are the same list with
+        // that one substituted.
+        let whole = [Rect16 {
+            x: 0,
+            y: 0,
+            w: u16::try_from(size.width).map_err(|_| "a texture past 65535".to_string())?,
+            h: u16::try_from(size.height).map_err(|_| "a texture past 65535".to_string())?,
+        }];
+        let regions: &[Rect16] = if rects.is_empty() { &whole } else { rects };
+        let texel = shape.texel();
+        images
+            .upload(gpu, record, *texture, regions, &|index, row| {
+                let at = rows.get(index)?;
+                let width = usize::from(regions.get(index)?.w) * texel;
+                let start = at.at + usize::from(row) * at.stride;
+                pixels.get(start..start + width)
+            })
+            .map_err(|why| format!("texture {}: {why}", texture.0))?;
+
+        let held = images
+            .image(*texture)
+            .ok_or_else(|| format!("texture {} was not held", texture.0))?;
+        record.transition(
+            held,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+    }
+    Ok(empty)
 }
 
 /// A render state, as the flags it is made of.
@@ -332,14 +436,20 @@ fn run(path: &str) -> Result<(), String> {
         )
     })?;
     let mut flags: BTreeMap<(i32, i32), BTreeSet<u8>> = BTreeMap::new();
+    // And one geometry per pair, for the textures: a set binds the views a *drawable* names, and
+    // the drawables of one (layer, family) name the same ones -- the elevation a raised layer
+    // samples is the ground's tile, not the drawable's own.
+    let mut drawn_by: BTreeMap<(i32, i32), tessella_capture_abi::envelope::GeometryId> =
+        BTreeMap::new();
     for batch in frame.batches.iter() {
-        flags
-            .entry((
-                batch.key.builtin_shader,
-                i32::try_from(batch.key.layer_index).unwrap_or(i32::MAX),
-            ))
-            .or_default()
-            .insert(batch.key.draw_flags);
+        let at = (
+            batch.key.builtin_shader,
+            i32::try_from(batch.key.layer_index).unwrap_or(i32::MAX),
+        );
+        flags.entry(at).or_default().insert(batch.key.draw_flags);
+        if let Some(geometry) = batch.geometries.first() {
+            drawn_by.entry(at).or_insert(*geometry);
+        }
     }
     let raised = frame
         .batches
@@ -377,6 +487,12 @@ fn run(path: &str) -> Result<(), String> {
     composites.dedup_by_key(|(name, pass, _)| (*name, *pass));
 
     let joiner = frame.joiner;
+    // What each geometry samples, as the producer named it: a `TextureRef` is a texture id and the
+    // slot it arrives at, and both halves of a set's image pair are filled from one.
+    let mut refs: BTreeMap<
+        tessella_capture_abi::envelope::GeometryId,
+        Vec<tessella_capture_abi::envelope::TextureRef>,
+    > = BTreeMap::new();
     let plans: Vec<(
         tessella_capture_abi::envelope::GeometryId,
         vertices::Plan,
@@ -421,6 +537,7 @@ fn run(path: &str) -> Result<(), String> {
             // The plan itself is kept, not only what it needs on the device: the pipeline key
             // and the module both come off it, and this is the only place it is built.
             let needs = buffers::needs(&plan, add.indexes);
+            refs.insert(*geometry, drawable.geometry.texture_refs.clone());
             out.push((*geometry, plan, needs, drawable.geometry.segments.clone()));
         }
         println!(
@@ -471,6 +588,27 @@ fn run(path: &str) -> Result<(), String> {
     if !failed.is_empty() {
         return Err(format!("{} geometries did not upload", failed.len()));
     }
+
+    // The textures the stream carried, declared at the sizes it named and filled from the rows
+    // `Upload::rows` resolves. A flat capture has none and this does nothing; a raised one has the
+    // ground's DEM, which every layer standing on it samples -- so without this the sets of a
+    // raised frame are refused, "the set has 1 texture bindings and 0 arrived".
+    //
+    // Its own submission, because `Images` records copies and a frame cannot begin until they have
+    // landed: the draw below samples what this leaves in `SHADER_READ_ONLY_OPTIMAL`.
+    let mut images = Images::new();
+    let mut staged = Ok(0);
+    device
+        .submit(|record: Recorder<'_>| {
+            staged = stage(&mut images, gpu, record, &host);
+        })
+        .map_err(|why| format!("staging the textures: {why}"))?;
+    let empty = staged?;
+    println!(
+        "  the textures          ok   {} declared, {} bytes on the device, {empty} of no area",
+        images.textures(),
+        images.total_bytes()
+    );
 
     // The blocks, each under the view and layer the producer named -- which for the frame-wide
     // ones is not a layer at all. `line` and `circle` both declare `GlobalPaintParamsUBO` and both
@@ -528,14 +666,6 @@ fn run(path: &str) -> Result<(), String> {
             refused.push(format!("shader {shader} has no family here"));
             continue;
         };
-        if !family.textures.is_empty() {
-            refused.push(format!(
-                "{} samples {} texture(s), and no batch in this frame binds any",
-                family.name,
-                family.textures.len()
-            ));
-            continue;
-        }
         let which = blocks::Which {
             view,
             layer: *layer,
@@ -604,8 +734,18 @@ fn run(path: &str) -> Result<(), String> {
             view,
             layer: *layer,
         };
+        // The views this pair's drawables name, as the producer named them: the family's own
+        // textures and the surface's, which for a raised layer is the ground's DEM at
+        // `surface::TERRAIN_ELEVATION_SLOT`. `bound_from` places them by slot rather than by
+        // arrival order, which is the defect #95 was.
+        let named = drawn_by
+            .get(&(*shader, *layer))
+            .and_then(|geometry| refs.get(geometry))
+            .map_or(&[][..], Vec::as_slice);
+        let bound = descriptors::bound_from(&images, bindings, named)
+            .map_err(|why| format!("{name} on layer {layer}: its textures: {why}"))?;
         let set = sets
-            .write(layout, bindings, which, *shader, &held, &[])
+            .write(layout, bindings, which, *shader, &held, &bound)
             .map_err(|why| format!("{name} on layer {layer}: {why}"))?;
         written.push((which, *shader, *name, set));
     }
@@ -835,8 +975,16 @@ fn run(path: &str) -> Result<(), String> {
         );
         built.push(pipeline);
     }
+    // Batches rather than keys: a program this crate has no family for may be several batches, and
+    // what the recording is checked against below is how many draws were skipped.
+    let unprogrammed = frame
+        .batches
+        .iter()
+        .filter(|batch| !resolved.contains_key(&program_key(batch.key)))
+        .count();
     println!(
-        "  the pipelines         {}   {} for {batches} batches, {} modules, {} undrawable",
+        "  the pipelines         {}   {} for {batches} batches, {} modules, {} undrawable, \
+         {unprogrammed} batches skipped",
         if undrawable.is_empty() {
             "ok  "
         } else {
@@ -936,8 +1084,25 @@ fn run(path: &str) -> Result<(), String> {
         counts.undrawn,
         counts.unclipped
     );
-    if counts.batches != batches && !isolating {
-        return Err(format!("{} of {batches} batches recorded", counts.batches));
+    // Every batch this crate has a program for, and the ones it has none for accounted for rather
+    // than ignored. A raised capture carries the ground itself -- `BUILTIN_TERRAIN_SHADER`, which
+    // `families::ALL` has no entry for -- so the layers standing on it draw and the surface under
+    // them does not. `record::content`'s own note names the case: "a batch this consumer does not
+    // draw, which is a real case".
+    if !isolating {
+        if counts.batches + unprogrammed != batches {
+            return Err(format!(
+                "{} of {batches} batches recorded and {unprogrammed} had no program, which does \
+                 not account for all of them",
+                counts.batches
+            ));
+        }
+        if counts.undrawn != unprogrammed {
+            return Err(format!(
+                "{} batches were skipped at the recording and {unprogrammed} had no program",
+                counts.undrawn
+            ));
+        }
     }
 
     // And the pixels. Two things are asked of them, and both are properties of this style rather

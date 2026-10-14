@@ -112,9 +112,10 @@ use tessella_capture_abi::generated::ubo_layouts::{
     RASTER_EVALUATED_PROPS_UBO, SYMBOL_DRAWABLE_UBO, SYMBOL_EVALUATED_PROPS_UBO,
     SYMBOL_TILE_PROPS_UBO, UboLayout,
 };
+use tessella_capture_abi::terrain_ubo::BUILTIN_TERRAIN_SHADER;
 use tessella_capture_abi::{ProjectionMode, RenderPass, TextureChannelDataType, TexturePixelType};
 use tessella_emblema::device::{self, Attachment, check_vertex_formats, vertex_format};
-use tessella_emblema::families::family;
+use tessella_emblema::families::for_wire;
 use tessella_emblema::images::Images;
 use tessella_emblema::pipelines::{Blend, Cache, Targets};
 use tessella_emblema::store::Store;
@@ -237,12 +238,18 @@ struct Case {
     /// observable through *where* geometry lands, and the families' own arithmetic is easier to
     /// read off a surface that does nothing.
     wire: Wire,
-    /// Which family's module to draw, resolved through `families::family`.
+    /// Which family's module to draw, as the id the wire carries, resolved through
+    /// `families::for_wire`.
     ///
     /// Named rather than restated: the oracle's value is that it runs the modules the library
     /// ships, and a case carrying its own copy of a family's blocks, tables and body would
     /// verify the copy.
-    family: BuiltIn,
+    ///
+    /// An `i32` and not a [`BuiltIn`], for the reason `Family::shader` is one: the ground is not
+    /// one of mbgl's shaders, so its id -- `BUILTIN_TERRAIN_SHADER`, 128 -- is not representable
+    /// in the enum. Every other case writes `BuiltIn::Something as i32`, which is the same value
+    /// the producer puts on the wire.
+    family: i32,
     /// How `streams` is laid out: one buffer per attribute, or one shared interleaved buffer.
     layout: Layout,
     /// One stream per attribute in the table's order, or one interleaved stream.
@@ -767,7 +774,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::FillShader,
+            family: BuiltIn::FillShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -805,7 +812,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill_near_half",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::FillShader,
+            family: BuiltIn::FillShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -846,7 +853,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill_no_color",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::FillShader,
+            family: BuiltIn::FillShader as i32,
             wire: NO_COLOR,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -897,7 +904,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill_constant",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::FillShader,
+            family: BuiltIn::FillShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             // The two empty streams keep their place in the table's order, which is what
@@ -946,7 +953,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "drawable_at_one",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::FillShader,
+            family: BuiltIn::FillShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -997,7 +1004,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "background",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::BackgroundShader,
+            family: BuiltIn::BackgroundShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![shorts(&COVERING)],
@@ -1036,7 +1043,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "background_blended",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::BackgroundShader,
+            family: BuiltIn::BackgroundShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![shorts(&COVERING)],
@@ -1066,7 +1073,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "background_faded",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::BackgroundShader,
+            family: BuiltIn::BackgroundShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![shorts(&COVERING)],
@@ -1098,7 +1105,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "background_faded_over",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::BackgroundShader,
+            family: BuiltIn::BackgroundShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![shorts(&COVERING)],
@@ -1136,7 +1143,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill_outline",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::FillOutlineShader,
+            family: BuiltIn::FillOutlineShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -1193,7 +1200,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill_extrusion",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::FillExtrusionShader,
+            family: BuiltIn::FillExtrusionShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -1262,7 +1269,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill_extrusion_raised",
             at: (18, 2),
-            family: BuiltIn::FillExtrusionShader,
+            family: BuiltIn::FillExtrusionShader as i32,
             wire: RAISED,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -1341,7 +1348,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "extrusion_dim",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::FillExtrusionShader,
+            family: BuiltIn::FillExtrusionShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -1425,7 +1432,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "extrusion_wall",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::FillExtrusionInstancedShader,
+            family: BuiltIn::FillExtrusionInstancedShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![shorts(&WALL_QUAD)],
@@ -1526,7 +1533,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "extrusion_wall_dim",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::FillExtrusionInstancedShader,
+            family: BuiltIn::FillExtrusionInstancedShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![shorts(&WALL_QUAD)],
@@ -1645,7 +1652,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "raster",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::RasterShader,
+            family: BuiltIn::RasterShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -1730,7 +1737,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "raster_interleaved",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::RasterShader,
+            family: BuiltIn::RasterShader as i32,
             wire: PLANE,
             layout: Layout::Interleaved {
                 stride: 12,
@@ -1801,7 +1808,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "raster_adjusted",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::RasterShader,
+            family: BuiltIn::RasterShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -1869,7 +1876,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "heatmap_texture",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::HeatmapTextureShader,
+            family: BuiltIn::HeatmapTextureShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![shorts(&UNIT)],
@@ -1939,7 +1946,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "color_relief",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::ColorReliefShader,
+            family: BuiltIn::ColorReliefShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -2019,7 +2026,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "symbol_sdf",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::SymbolSDFShader,
+            family: BuiltIn::SymbolSDFShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: symbol_streams(5),
@@ -2057,7 +2064,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "symbol_below",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::SymbolSDFShader,
+            family: BuiltIn::SymbolSDFShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: symbol_streams(6),
@@ -2089,7 +2096,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "hillshade_prep",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::HillshadePrepareShader,
+            family: BuiltIn::HillshadePrepareShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -2144,7 +2151,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "hillshade",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::HillshadeShader,
+            family: BuiltIn::HillshadeShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -2236,7 +2243,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "heatmap",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::HeatmapShader,
+            family: BuiltIn::HeatmapShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -2309,7 +2316,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "background_pattern",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::BackgroundPatternShader,
+            family: BuiltIn::BackgroundPatternShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![shorts(&COVERING)],
@@ -2383,7 +2390,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill_pattern",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::FillPatternShader,
+            family: BuiltIn::FillPatternShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -2477,7 +2484,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "line_pattern",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::LinePatternShader,
+            family: BuiltIn::LinePatternShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -2566,7 +2573,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "symbol_icon",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::SymbolIconShader,
+            family: BuiltIn::SymbolIconShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -2602,7 +2609,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "both_as_icon",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::SymbolTextAndIconShader,
+            family: BuiltIn::SymbolTextAndIconShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: text_and_icon_streams(5, 0),
@@ -2633,7 +2640,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "both_as_glyph",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::SymbolTextAndIconShader,
+            family: BuiltIn::SymbolTextAndIconShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: text_and_icon_streams(5, 1),
@@ -2690,7 +2697,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill_on_globe",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::FillShader,
+            family: BuiltIn::FillShader as i32,
             wire: BENT,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -2770,7 +2777,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill_anchored",
             at: (25, 22),
-            family: BuiltIn::FillShader,
+            family: BuiltIn::FillShader as i32,
             wire: ANCHORED,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -2834,7 +2841,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "fill_raised",
             at: (8, 13),
-            family: BuiltIn::FillShader,
+            family: BuiltIn::FillShader as i32,
             wire: RAISED,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -2914,7 +2921,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "raster_raised_skirt",
             at: (5, 25),
-            family: BuiltIn::RasterShader,
+            family: BuiltIn::RasterShader as i32,
             wire: RAISED,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -2985,6 +2992,148 @@ fn cases() -> Vec<Case> {
             instanced: None,
             expect: [32, 16, 64, 64],
         },
+        // The ground itself, which is the surface the two cases above are drawn *on*.
+        //
+        // Drawn on a plane, not on [`RAISED`]: the producer leaves the ground's own drawables
+        // unflagged -- "it is the surface rather than something standing on it, and its own family
+        // raises it" -- so its placement is the plane's and the raise is in its body. Which is why
+        // this case reads what `fill_raised` reads through a surface, from a different set: the
+        // elevation is binding 1 of the family's own table at slot 0, not the surface's at slot 8.
+        //
+        // The DEM and the sampling are `fill_raised`'s, so the heights are the same three numbers:
+        //
+        //   uv       = position * 0.1 + 0.3, so the three vertices read texels (0,0), (2,0), (0,2)
+        //   meters   = dot((r, g, 0), (1, 0.5, 0)) - 10        =  -10,  70,  10
+        //   height   = (meters - a center of 20) * 0.01        = -0.30, 0.50, -0.10
+        //   clip     = (0.3x + 5h, -(0.3y + 5h))  ->  (-1.8, 1.8), (3.4, -2.2), (-0.8, -0.4)
+        //   pixels   = (-12.8, 44.8), (70.4, -19.2), (3.2, 9.6)
+        //
+        // A wider matrix than `fill_raised`'s -- a base of 0.3 against a height coefficient of 5 --
+        // because this case has an eighth mutation to separate and the search found no pixel with
+        // a margin over a pixel at 0.2 against 3. Pixel (3, 12) is one of twenty-seven that the
+        // right placement covers and eight wrong ones do not: the texture coordinate unscaled or
+        // unoffset, the center not subtracted, the exaggeration dropped, the unpack's base added
+        // rather than subtracted, its green weight ignored, the height not handed to `place` at
+        // all -- and the eighth, which is this family's own: the skirt subtracted without the
+        // flag, so the whole surface drops instead of its curtain. It sits 1.5 px inside the right
+        // triangle and 1.4 from the nearest wrong one.
+        //
+        // The pixel's value is the other half: a ground has no paint of its own, so what it draws
+        // is `color` out of its block -- the style's background color, which is what makes bare
+        // terrain read continuous with the flat map.
+        Case {
+            name: "terrain",
+            at: (3, 12),
+            family: BUILTIN_TERRAIN_SHADER,
+            wire: PLANE,
+            layout: Layout::PerAttribute,
+            streams: vec![
+                shorts(&COVERING),
+                // Unflagged: this is the surface, and the curtain is the case below.
+                shorts(&[0, 0, 0, 0, 0, 0]),
+            ],
+            uniforms: vec![block(
+                &TERRAIN_DRAWABLE_UBO,
+                &[
+                    (
+                        "matrix",
+                        At::F(&[
+                            0.3, 0.0, 0.0, 0.0, //
+                            0.0, 0.3, 0.0, 0.0, //
+                            5.0, 5.0, 0.0, 0.0, //
+                            0.0, 0.0, 0.0, 1.0,
+                        ]),
+                    ),
+                    // Red and green both weighted, so both are under test; the base is subtracted,
+                    // which is the sign a mutation gets wrong.
+                    ("unpack", At::F(&[1.0, 0.5, 0.0, 10.0])),
+                    // What bare ground is painted. Three channels that are distinct and land on
+                    // exact bytes, so the pixel says which component went where.
+                    ("color", At::F(&[0.2, 0.6, 0.8, 1.0])),
+                    // The coordinate's scale, then its offset in `yz`, then the exaggeration.
+                    ("params", At::F(&[0.1, 0.3, 0.3, 0.01])),
+                    // The ground's own skirt, the center the height is measured from, and the
+                    // layer seam only a surface reads. The first is non-zero with every flag at
+                    // nought so that a drop applied unconditionally moves the triangle.
+                    ("skirt", At::F(&[0.15, 20.0, 0.4, 0.0])),
+                ],
+            )],
+            images: vec![Image::new(4, |x, y| {
+                [
+                    u8::try_from(x * 40).unwrap_or(255),
+                    u8::try_from(y * 20).unwrap_or(255),
+                    0,
+                    255,
+                ]
+            })],
+            vertices: 3,
+            ubo_index: 0,
+            pass: None,
+            absent: &[],
+            instanced: None,
+            expect: [51, 153, 204, 255],
+        },
+        // The ground's own curtain, which is a fifth of a tile rather than the two pixels a layer
+        // on the ground hangs.
+        //
+        // Isolated the way `raster_raised_skirt` isolates the layer's: `unpack` is nought, so the
+        // DEM contributes no height and the only thing reaching `position.z` is the skirt. The
+        // matrix is the case above's.
+        //
+        //   drop  = -flag * skirt.x = -0.15,  and the third column is 5
+        //   clip  = (0.3x - 0.75, -(0.3y - 0.75))
+        //   so the three vertices land at (-0.8, 32.8), (18.4, 32.8), (-0.8, 13.6) in pixels
+        //
+        // Pixel (4, 26) is inside that and inside none of the wrong ones: with no drop the quad
+        // sits at (11.2, 20.8), (30.4, 20.8), (11.2, 1.6); with the sign flipped it goes off the
+        // bottom right; with the drop scaled by the exaggeration it moves a hundredth as far;
+        // reading `skirt.z` -- 0.4, which is why it is not nought -- takes it off the screen to the
+        // left; and reading `skirt.y`, or the padding short beside the flag, draws the uncurtained
+        // triangle. It sits 5.3 px inside the right triangle and 8.6 from the nearest wrong one.
+        //
+        // A second color, so a case cannot pass on the other's block.
+        Case {
+            name: "terrain_skirt",
+            at: (4, 26),
+            family: BUILTIN_TERRAIN_SHADER,
+            wire: PLANE,
+            layout: Layout::PerAttribute,
+            streams: vec![
+                shorts(&COVERING),
+                // Flagged, which is what the mesh sets on the vertices it hangs the curtain from.
+                // The second short is the padding the stride wants and nothing reads.
+                shorts(&[1, 0, 1, 0, 1, 0]),
+            ],
+            uniforms: vec![block(
+                &TERRAIN_DRAWABLE_UBO,
+                &[
+                    (
+                        "matrix",
+                        At::F(&[
+                            0.3, 0.0, 0.0, 0.0, //
+                            0.0, 0.3, 0.0, 0.0, //
+                            5.0, 5.0, 0.0, 0.0, //
+                            0.0, 0.0, 0.0, 1.0,
+                        ]),
+                    ),
+                    // No height from the DEM at all: this case is the curtain alone.
+                    ("unpack", At::F(&[0.0, 0.0, 0.0, 0.0])),
+                    ("color", At::F(&[0.8, 0.4, 0.2, 1.0])),
+                    ("params", At::F(&[0.1, 0.3, 0.3, 0.01])),
+                    // The ground's skirt, no center, and a layer seam that is not it.
+                    ("skirt", At::F(&[0.15, 0.0, 0.4, 0.0])),
+                ],
+            )],
+            // The DEM, which `unpack` weights at nothing. Bound because the body samples it and an
+            // unbound sampler is undefined rather than nought.
+            images: vec![Image::new(4, |_, _| [128, 128, 128, 255])],
+            vertices: 3,
+            ubo_index: 0,
+            pass: None,
+            absent: &[],
+            instanced: None,
+            expect: [204, 102, 51, 255],
+        },
         // A circle, read at its own center: the extrusion interpolates to zero there, which is
         // inside the fill and nowhere near the stroke. With no stroke width the stroke's own
         // selection is skipped, so what is left is the fill color times its opacity.
@@ -2994,7 +3143,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "circle",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::CircleShader,
+            family: BuiltIn::CircleShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -3062,7 +3211,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "circle_constant",
             at: (SIDE / 2, SIDE / 2),
-            family: BuiltIn::CircleShader,
+            family: BuiltIn::CircleShader as i32,
             wire: PLANE,
             layout: Layout::PerAttribute,
             streams: vec![
@@ -3295,7 +3444,7 @@ const WHICH: blocks::Which = blocks::Which {
 
 /// The one slot a case declares that is the frame's rather than a layer's.
 ///
-/// `GlobalPaintParamsUBO`, which eight of the twenty families declare. Named here rather than
+/// `GlobalPaintParamsUBO`, which eight of the twenty-one families declare. Named here rather than
 /// asked of `slots::scope`, because that is what this probe is checking: an oracle derived from
 /// the code under test moves with it.
 const FRAME_WIDE_SLOT: u32 = tessella_capture_abi::generated::ubo_slots::ID_GLOBAL_PAINT_PARAMS_UBO;
@@ -3738,8 +3887,12 @@ fn draw_case<'d>(
     case: &Case,
 ) -> Result<[u8; 4], String> {
     let gpu = open.gpu();
-    let found = family(case.family)
-        .ok_or_else(|| format!("{}: {:?} is not a drawn family", case.name, case.family))?;
+    let found = for_wire(case.family).ok_or_else(|| {
+        format!(
+            "{}: shader {} is not a drawn family",
+            case.name, case.family
+        )
+    })?;
     // The producer's records first, then the plan a consumer makes of them -- because the plan is
     // what says which module to assemble. A location no descriptor arrived for is left out of the
     // vertex input and its property read from the layer's block instead, which is a different
@@ -3770,7 +3923,7 @@ fn draw_case<'d>(
 
     // Where the vertices land, from the case's three wire inputs rather than named. `Surface::of`
     // is the producer's half -- the camera's projection, the drawable's flags, and whether its
-    // layer holds a bend block -- and `Family::surface` is this crate's, because only sixty-five
+    // layer holds a bend block -- and `Family::surface` is this crate's, because only sixty-six
     // of the pairs have a module. A frame loop makes those two calls and nothing else, so a rule
     // that answers wrongly shows up here as a pixel in the wrong place.
     let surface = found.surface(Surface::of(
@@ -3796,7 +3949,7 @@ fn draw_case<'d>(
     // `Depth::Write` because a case is one draw with nothing behind it: the arm that writes is
     // the one a single draw exercises, and no case here has a second layer to be rejected by.
     let key = pipelines::key(
-        case.family as i32,
+        case.family,
         surface,
         &plan,
         case.pass.map_or(Blend::Unblended, |pass| found.blend(pass)),
@@ -3858,7 +4011,8 @@ fn draw_case<'d>(
         }
         let entries = bytes.len() / stride;
         // Where the producer would have put it: a frame-wide block arrives under `layer_index:
-        // -1` rather than under the layer drawing, and eight of the twenty families declare one.
+        // -1` rather than under the layer drawing, and eight of the twenty-one families declare
+        // one.
         //
         // Decided here from the slot rather than asked of `slots::held_at`, which is the thing
         // under test. The first version of this did ask, and the mutation that made every block
@@ -3942,14 +4096,14 @@ fn draw_case<'d>(
         .pipeline(gpu, &key, &bindings, &words, probe.targets)
         .map_err(|why| format!("{}: pipeline: {why}", case.name))?;
     let layout = cache
-        .layout(gpu, case.family as i32, surface, &bindings)
+        .layout(gpu, case.family, surface, &bindings)
         .map_err(|why| format!("{}: layout: {why}", case.name))?;
     // Two sets where a case is instanced: the layer's, and the one over this geometry's own
     // instance buffer. Sized for two always, which costs a pool entry and keeps the call the same.
     let mut sets = descriptors::Sets::new(gpu, 2, &bindings)
         .map_err(|why| format!("{}: pool: {why}", case.name))?;
     let set = sets
-        .write(layout, &bindings, WHICH, case.family as i32, &held, &bound)
+        .write(layout, &bindings, WHICH, case.family, &held, &bound)
         .map_err(|why| format!("{}: set: {why}", case.name))?;
 
     // The group-one set, over the buffer the ABI says is bound twice. Which buffer that is comes

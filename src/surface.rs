@@ -174,14 +174,19 @@ static TERRAIN_TEXTURE_SLOTS: [u32; 1] = [TERRAIN_ELEVATION_SLOT];
 
 /// The wire slot a raised family's elevation texture arrives at.
 ///
-/// Hand-agreed, the way [`crate::slots`]'s four unpaired blocks are. A family's textures come from
-/// the generated table, which carries each one's slot -- but a surface's do not: the producer holds
-/// this as a private constant and publishes no table for it, so the number is agreed rather than
-/// derived.
+/// The ABI's own constant, re-exported here because this is where a surface's textures are named:
+/// a family's come from the generated table, which carries each one's slot, and a surface's are
+/// written out beside its placement.
 ///
-/// Its own note there is the reason for the value: "past every slot mbgl's own families use, so a
-/// terrain variant's second texture cannot land on one the flat variant already reads."
-pub const TERRAIN_ELEVATION_SLOT: u32 = 8;
+/// It was agreed rather than derived -- "the producer holds this as a private constant and
+/// publishes no table for it" was this note -- and tessella#382 published it, so the agreement is
+/// now a read. The reason for the value is the ABI's: past every slot mbgl's own families use, so
+/// a terrain variant's extra texture cannot land on one the flat variant already reads.
+///
+/// Not to be confused with `terrain_ubo::TERRAIN_MESH_ELEVATION_SLOT`, which is nought: that is
+/// the ground's *own* family, whose table declares one texture and so has nothing to clear. See
+/// [`crate::families`].
+pub const TERRAIN_ELEVATION_SLOT: u32 = tessella_capture_abi::terrain_ubo::TERRAIN_ELEVATION_SLOT;
 
 /// What a vertex is placed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

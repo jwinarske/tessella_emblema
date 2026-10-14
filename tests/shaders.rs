@@ -1116,6 +1116,70 @@ const fn is_identifier(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+/// A per-drawable block is read at the slot the draw carries, never at entry nought.
+///
+/// The one mutation the pixel oracle cannot see, because every case it draws but one sits at slot
+/// nought -- `drawable_at_one` is that one, and it is a single family. A body indexing its own
+/// drawable block at `[0]` draws the first tile of a layer correctly and every other tile with the
+/// first one's matrix, which reads as a camera fault rather than as a typo.
+///
+/// Over the block *names* rather than over a list: mbgl calls a per-drawable block
+/// `<Family>DrawableUBO` and this crate's two extensions follow it, so what is checked is every
+/// block whose name says it is per drawable -- on every surface, because two of the three that add
+/// a block add one of these.
+///
+/// A properties block is the opposite case and is not checked here: it is one entry for the whole
+/// layer, so `[0]` is right for it and `[ubo_index]` would be the defect.
+#[test]
+fn a_drawable_block_is_read_at_the_draws_own_slot() {
+    let mut checked = 0;
+    for family in ALL {
+        for surface in family.surfaces {
+            let source = family.module(*surface, &[]).expect("assembles");
+            for block in family.blocks.iter().chain(surface.blocks()) {
+                if !block.name.contains("Drawable") {
+                    continue;
+                }
+                let binding = binding_name_of(&tessella_emblema::preamble::type_name(block.name));
+                let what = format!("{}{}", family.name, surface.suffix());
+                assert!(
+                    source.contains(&format!("{binding}[ubo_index]")),
+                    "{what} never reads {} at the draw's own slot",
+                    block.name
+                );
+                assert!(
+                    !source.contains(&format!("{binding}[0]")),
+                    "{what} reads {} at entry nought, which is the first drawable's",
+                    block.name
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 0, "no family declares a per-drawable block");
+}
+
+/// The WGSL binding name a block's type gets, which is the type's own name in snake case.
+///
+/// The type name is `preamble::type_name`, which is the library's; this is `shaders::binding_name`, which
+/// is private and is these few lines. What it is used for here is finding the text to search for,
+/// so a divergence would show up as a test that asserts nothing -- which the `checked` count is
+/// what guards against.
+fn binding_name_of(declared: &str) -> String {
+    let mut out = String::with_capacity(declared.len() + 4);
+    for (at, ch) in declared.char_indices() {
+        if ch.is_ascii_uppercase() {
+            if at != 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Every family on every surface it has compiles, validates and emits.
 #[test]
 fn every_family_on_every_surface_compiles() {
@@ -1133,7 +1197,7 @@ fn every_family_on_every_surface_compiles() {
         }
     }
     assert_eq!(
-        pairs, 65,
+        pairs, 66,
         "the matrix grew or shrank; look at the new pairs"
     );
 }
@@ -1375,6 +1439,10 @@ const UNREAD_COMPONENTS: &[(&str, &str, &str)] = &[
     ("raster", "tessella_skirt", "y"),
     ("hillshade", "tessella_skirt", "y"),
     ("color_relief", "tessella_skirt", "y"),
+    // And the ground's own pair, for the same reason from the other side: the flag in `x`, and in
+    // `y` the padding short that takes the vertex to the stride Filament insists on. See
+    // `terrain_ubo::TERRAIN_MESH_STRIDE`, and `encode_terrain`, which writes it as zero.
+    ("terrain", "tessella_terrain_skirt", "y"),
 ];
 
 /// Every component of every attribute is read, not just the identifier.

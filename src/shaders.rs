@@ -2607,3 +2607,82 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
     return in.shade;
 }
 ";
+
+/// The ground's own body, which is the surface every raised family is placed on.
+///
+/// The one family mbgl has no shader for. Its mesh is `tessella_layout::terrain::mesh` -- 129
+/// vertices a side over a tile's own coordinates, shared by every tile of the frame -- drawn once
+/// per tile through that tile's matrix, with the height read from that tile's DEM per vertex.
+///
+/// # It raises itself, and not through [`Surface::Terrain`]
+///
+/// A fill standing on the ground is placed on `Surface::Terrain`, which reads the same block and
+/// does the same arithmetic. This body does it inline instead, for two reasons that are both the
+/// same fact: the ground is not standing on a surface, it *is* one, so the family declares the
+/// raise block as its own and the plane's placement is all it needs on top -- and its elevation
+/// arrives at the slot its own table declares rather than at the one a raised mbgl family's table
+/// leaves free, so the texture it samples is a different binding of a different set.
+///
+/// `tessella_fluorite`'s `terrain.mat` is the sibling of this, and `terrain_height.glsl` the
+/// shared half it factors out.
+///
+/// # The skirt, which only the ground has
+///
+/// The curtain hanging from each tile edge, hiding the crack where two tiles at different zooms
+/// sample the DEM at different resolutions. A flagged vertex takes the surface's height and then
+/// drops `skirt.x` meters -- a fifth of a tile, which is invisible only because the ground is the
+/// backmost thing there is. A layer *on* the ground hangs a far shallower one, `skirt.z`, which is
+/// [`Surface::Terrain`]'s business and not this body's.
+///
+/// The flag is the mesh's second attribute rather than a third component of the first, and that is
+/// Filament's doing rather than a choice: it draws nothing at all from a `Short3` position. The
+/// ABI's [`TERRAIN_MESH_ATTRIBUTES`](tessella_capture_abi::terrain_ubo::TERRAIN_MESH_ATTRIBUTES)
+/// carries the pair and the stride that pads them to a multiple of four.
+///
+/// # The color is a varying and not a second block read
+///
+/// What bare ground is painted -- the style's `background-color`, so a terrain with nothing over
+/// it reads continuous with the flat map. It rides in the per-drawable block, where every tile's
+/// copy holds the same four numbers, and `ubo_index` is the vertex stage's: a fragment stage has
+/// no instance to index by, so the vertex stage passes it on the way through.
+pub const TERRAIN_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec4<f32>,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let ground = terrain_drawable_ubo[ubo_index];
+    let position = vec2<f32>(in.tessella_terrain_pos);
+
+    // One multiply-add an axis: the producer folded the DEM's width, its border pixel, the half
+    // texel that puts a cell at its own center, and which square of a coarser DEM tile this one
+    // occupies, into these three numbers.
+    let uv = position * ground.params.x + ground.params.yz;
+    // Explicit level: a vertex stage has no derivatives to pick one from. The channels come back
+    // normalized and the unpack vector is in bytes, which is what scales them back up.
+    let channels = textureSampleLevel(elevation, elevation_sampler, uv, 0.0).rgb * 255.0;
+    let meters = dot(channels, ground.unpack.rgb) - ground.unpack.a;
+    // Relative to the ground under the camera's center, which `skirt.y` carries: the camera sits a
+    // fixed distance above the plane while a height in meters reaches the screen multiplied by
+    // pixels-per-meter, so measured from sea level the ground climbs toward a camera that does not
+    // climb with it. Subtracted before the exaggeration, so stretching the relief leaves the center
+    // where it is.
+    var height = (meters - ground.skirt.y) * ground.params.w;
+    // And the skirt drops, on the flagged vertices alone. Not scaled by the exaggeration: the
+    // curtain is a depth below the surface rather than a part of the relief.
+    height -= f32(in.tessella_terrain_skirt.x) * ground.skirt.x;
+
+    var out: Out;
+    out.clip = place(vec3<f32>(position, height), ground.matrix);
+    out.color = ground.color;
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    return in.color;
+}
+";

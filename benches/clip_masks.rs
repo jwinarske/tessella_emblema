@@ -26,6 +26,7 @@ use ash::vk;
 use std::collections::{BTreeMap, BTreeSet};
 
 use tessella_capture_abi::envelope::TileId;
+use tessella_capture_abi::envelope::Topology;
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_consume::stencil;
 use tessella_emblema::device::{self, Attachment};
@@ -314,6 +315,7 @@ fn scene(device: &Open, matrix: [f32; 16]) -> Result<Scene<'_>, String> {
     let fill_key = pipelines::Key {
         shader: BuiltIn::BackgroundShader as i32,
         surface: tessella_emblema::surface::Surface::Plane,
+        topology: Topology::Triangles,
         permutation: 0,
         layout: Vec::new(),
         // Unblended, so the fill's pixel is what the fragment stage returned rather than what it
@@ -651,6 +653,7 @@ fn the_draw_once_blends_a_pixel_once(device: &Open) -> Result<(), String> {
     let key = |stencil| pipelines::Key {
         shader: BuiltIn::BackgroundShader as i32,
         surface: tessella_emblema::surface::Surface::Plane,
+        topology: Topology::Triangles,
         permutation: 0,
         layout: Vec::new(),
         blend: pipelines::Blend::Alpha,

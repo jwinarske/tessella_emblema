@@ -2180,6 +2180,104 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
 }
 ";
 
+/// The fill-outline-pattern family's body: a patterned fill's outline.
+///
+/// The fourteenth shader, and the last of mbgl's fill family this crate had no entry for. A fill
+/// with `fill-antialias` emits an outline beside it, and a *patterned* fill emits a patterned one:
+/// the same geometry as [`FILL_PATTERN_BODY`], drawn as lines, tiled with the same sprite.
+///
+/// It is the two bodies either side of it with nothing new of its own. The sprite's size and its
+/// place in the atlas are [`FILL_PATTERN_BODY`]'s arithmetic exactly -- the same two divisions, the
+/// same `pattern_pos` anchor, the same cross-fade through `fade` -- and the one-pixel feather is
+/// [`FILL_OUTLINE_BODY`]'s, the fragment's distance from its own vertex's screen position with the
+/// `y` flip that `ADJUST_COORDINATE_SPACE` makes necessary.
+///
+/// # What the two of them multiply to
+///
+/// `color * alpha * opacity`, in that order in mbgl and in any order here: the feather is coverage
+/// and the opacity is the layer's, so an outline at the edge of a one-pixel line in a half-opaque
+/// layer is a quarter of the sprite's own color. Dropping either leaves a plausible picture --
+/// the whole outline at full strength, or a hard one-pixel line -- which is why
+/// `benches/first_pixel.rs` reads a pixel that only both together cover.
+pub const FILL_OUTLINE_PATTERN_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) pos_a: vec2<f32>,
+    @location(1) pos_b: vec2<f32>,
+    @location(2) pattern_from: vec4<f32>,
+    @location(3) pattern_to: vec4<f32>,
+    @location(4) opacity: f32,
+    @location(5) screen: vec2<f32>,
+    @location(6) @interpolate(flat) ubo: u32,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let drawable = fill_outline_pattern_drawable_ubo[ubo_index];
+    let props = fill_evaluated_props_ubo[0];
+    let global = global_paint_params_ubo[0];
+    var out: Out;
+
+    // Straight through, not mixed: see `FILL_PATTERN_BODY`'s own note.
+    let pattern_from = paint_pattern_from(in);
+    let pattern_to = paint_pattern_to(in);
+    out.pattern_from = pattern_from;
+    out.pattern_to = pattern_to;
+
+    let display_a = (pattern_from.zw - pattern_from.xy) / max(global.pixel_ratio, 1e-6);
+    let display_b = (pattern_to.zw - pattern_to.xy) / max(global.pixel_ratio, 1e-6);
+
+    let position = vec2<f32>(in.fill_pos);
+    out.pos_a = pattern_pos(
+        drawable.pixel_coord_upper,
+        drawable.pixel_coord_lower,
+        props.from_scale * display_a,
+        drawable.tile_ratio,
+        position
+    );
+    out.pos_b = pattern_pos(
+        drawable.pixel_coord_upper,
+        drawable.pixel_coord_lower,
+        props.to_scale * display_b,
+        drawable.tile_ratio,
+        position
+    );
+
+    out.opacity = paint_opacity(in);
+    let clip = place(vec3<f32>(position, 0.0), drawable.matrix);
+    out.clip = clip;
+    // The flipped copy this stage reads back, for `FILL_OUTLINE_BODY`'s reason.
+    out.screen = (vec2<f32>(clip.x, -clip.y) / clip.w + 1.0) / 2.0 * global.world_size;
+    out.ubo = ubo_index;
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    // The slot, carried: a fragment invocation's own copy of a private is zero.
+    ubo_index = in.ubo;
+    let tile = fill_outline_pattern_tile_props_ubo[ubo_index];
+    let props = fill_evaluated_props_ubo[0];
+
+    let texsize = tile.texsize;
+
+    let in_a = wrap(in.pos_a, vec2<f32>(1.0, 1.0));
+    let pos_a = mix(in.pattern_from.xy / texsize, in.pattern_from.zw / texsize, in_a);
+    let color_a = textureSample(fill_image, fill_image_sampler, pos_a);
+
+    let in_b = wrap(in.pos_b, vec2<f32>(1.0, 1.0));
+    let pos_b = mix(in.pattern_to.xy / texsize, in.pattern_to.zw / texsize, in_b);
+    let color_b = textureSample(fill_image, fill_image_sampler, pos_b);
+
+    // The outline's own one-pixel feather, as `FILL_OUTLINE_BODY` measures it.
+    let distance = length(in.screen - in.clip.xy);
+    let alpha = 1.0 - smoothstep(0.0, 1.0, distance);
+
+    return mix(color_a, color_b, props.fade) * alpha * in.opacity;
+}
+";
+
 /// The heatmap family's body: one Gaussian per point, summed into a texture.
 ///
 /// The first pass of two. Each point feature draws a quad carrying a Gaussian kernel, the quads

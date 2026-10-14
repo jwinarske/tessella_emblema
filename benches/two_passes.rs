@@ -38,6 +38,7 @@ mod passes;
 
 use ash::vk;
 use tessella_capture_abi::RenderPass;
+use tessella_capture_abi::envelope::Topology;
 use tessella_capture_abi::envelope::{Rect16, ViewId};
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_consume::host::Host;
@@ -234,6 +235,7 @@ fn draw(
         let key = pipelines::key(
             BuiltIn::FillShader as i32,
             Surface::Plane,
+            Topology::Triangles,
             plans.get(&passes::DRAWN).ok_or("the child has no plan")?,
             // Both views draw in the translucent pass, so neither writes depth and both take
             // the translucent arm of whatever their family composites with.
@@ -286,6 +288,7 @@ fn draw(
         let key = pipelines::key(
             BuiltIn::RasterShader as i32,
             Surface::Plane,
+            Topology::Triangles,
             plans.get(&passes::SAMPLES).ok_or("no parent plan")?,
             raster.blend(RenderPass::TRANSLUCENT.bits()),
             pipelines::Depth::TestOnly,

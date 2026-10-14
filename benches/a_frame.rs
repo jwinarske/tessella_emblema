@@ -40,6 +40,7 @@ use std::collections::BTreeMap;
 
 use ash::vk;
 use tessella_capture_abi::RenderPass;
+use tessella_capture_abi::envelope::Topology;
 use tessella_capture_abi::envelope::{DrawFlags, GeometryId, Rect16, TileId};
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_consume::host::Host;
@@ -500,6 +501,7 @@ fn draw(
             let key = pipelines::key(
                 BuiltIn::FillShader as i32,
                 Surface::Plane,
+                Topology::Triangles,
                 plans
                     .get(&id)
                     .ok_or_else(|| format!("geometry {} has no plan", id.0))?,
@@ -573,6 +575,7 @@ fn draw(
         let key = pipelines::key(
             BuiltIn::RasterShader as i32,
             Surface::Plane,
+            Topology::Triangles,
             plans
                 .get(&frame::SAMPLER)
                 .ok_or("the sampling geometry has no plan")?,

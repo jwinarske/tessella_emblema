@@ -21,6 +21,7 @@
 //! which of the two strides was meant.
 
 use ash::vk;
+use tessella_capture_abi::envelope::Topology;
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_emblema::pipelines::{self, Invalid, Key, Slot};
 use tessella_emblema::surface::Surface;
@@ -39,6 +40,7 @@ fn key(layout: Vec<Slot>) -> Key {
     Key {
         shader: BuiltIn::FillShader as i32,
         surface: Surface::Plane,
+        topology: Topology::Triangles,
         permutation: 0,
         layout,
         blend: pipelines::Blend::Alpha,

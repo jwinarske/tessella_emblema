@@ -21,6 +21,8 @@
 mod common;
 
 use ash::vk;
+use tessella_capture_abi::envelope::Topology;
+use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_emblema::device::{self, Attachment, stride_of};
 use tessella_emblema::families;
 use tessella_emblema::pipelines::{self, Key, Slot, Targets};
@@ -82,6 +84,10 @@ fn key_for(family: &families::Family, surface: Surface) -> Result<Key, String> {
     Ok(Key {
         shader: family.shader,
         surface,
+        // The wire's answer for this family, which for the two fill outlines is a pair of indices
+        // per primitive. Asked of the ABI rather than fixed at triangles, so a family whose
+        // producer sends lines builds the pipeline it will be drawn with.
+        topology: BuiltIn::from_repr(family.shader).map_or(Topology::Triangles, Topology::of),
         permutation: 0,
         layout,
         blend: pipelines::Blend::Alpha,
@@ -142,9 +148,9 @@ fn every_pipeline_builds(device: &Open) -> Result<(), String> {
             drop(module);
         }
     }
-    if built != 132 {
+    if built != 140 {
         return Err(format!(
-            "{built} pipelines, which is not 66 modules times two attachment kinds"
+            "{built} pipelines, which is not 70 modules times two attachment kinds"
         ));
     }
     println!("  every pipeline        ok   {built} pipelines, all resident at once");
@@ -269,15 +275,15 @@ fn the_cache_reuses(device: &Open) -> Result<(), String> {
         }
     }
 
-    if cache.built() != 66 {
+    if cache.built() != 70 {
         return Err(format!(
-            "{} pipelines built for 66 keys asked {asked} times",
+            "{} pipelines built for 70 keys asked {asked} times",
             cache.built()
         ));
     }
-    if cache.len() != 66 || cache.modules() != 66 {
+    if cache.len() != 70 || cache.modules() != 70 {
         return Err(format!(
-            "{} pipelines and {} modules held, wanted 66 of each",
+            "{} pipelines and {} modules held, wanted 70 of each",
             cache.len(),
             cache.modules()
         ));

@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use tessella_capture_abi::envelope::Topology;
 use tessella_capture_abi::envelope::{AttributeDesc, SlabRef};
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_capture_abi::generated::shader_attributes::{FILL_SHADER, RASTER_SHADER};
@@ -46,6 +47,7 @@ fn the_same_drawable_twice_is_one_key() {
     let a = key(
         BuiltIn::RasterShader as i32,
         Surface::Plane,
+        Topology::Triangles,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -55,6 +57,7 @@ fn the_same_drawable_twice_is_one_key() {
     let b = key(
         BuiltIn::RasterShader as i32,
         Surface::Plane,
+        Topology::Triangles,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -70,6 +73,7 @@ fn a_different_stride_is_a_different_pipeline() {
     let a = key(
         BuiltIn::RasterShader as i32,
         Surface::Plane,
+        Topology::Triangles,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -79,6 +83,7 @@ fn a_different_stride_is_a_different_pipeline() {
     let b = key(
         BuiltIn::RasterShader as i32,
         Surface::Plane,
+        Topology::Triangles,
         &planned(16, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -91,11 +96,49 @@ fn a_different_stride_is_a_different_pipeline() {
     );
 }
 
+/// One family's two topologies are two pipelines, because the primitive is baked into the
+/// pipeline rather than set per draw.
+///
+/// The case the wire carries a topology for: the location indicator's accuracy circle is one
+/// family drawing a triangle fan and a line strip over one vertex buffer. A cache keyed without
+/// this hands the second drawable the first's pipeline and draws its indices as the other
+/// primitive -- which for a fill outline's pairs is a band along every ring instead of a line, and
+/// for a fan read as pairs is every other edge.
+#[test]
+fn a_different_topology_is_a_different_pipeline() {
+    let of = |topology| {
+        key(
+            BuiltIn::RasterShader as i32,
+            Surface::Plane,
+            topology,
+            &planned(12, 0, SOMEWHERE),
+            Blend::Alpha,
+            Depth::Write,
+            Enabled::ALL,
+            Stencil::Clip,
+        )
+    };
+    // By the key's own equality, which is what the cache's `HashMap` looks it up by. Pairwise
+    // rather than through a set, because `Key` is `Eq` and `Hash` and deliberately not `Ord`.
+    let keys: Vec<_> = Topology::ALL.iter().map(|at| (at, of(*at))).collect();
+    for (one, left) in &keys {
+        for (other, right) in &keys {
+            assert_eq!(
+                left == right,
+                one == other,
+                "{one:?} and {other:?} key the same"
+            );
+        }
+    }
+    assert_eq!(keys.len(), 3, "the ABI names three topologies");
+}
+
 #[test]
 fn a_different_offset_within_a_vertex_is_a_different_pipeline() {
     let a = key(
         BuiltIn::RasterShader as i32,
         Surface::Plane,
+        Topology::Triangles,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -105,6 +148,7 @@ fn a_different_offset_within_a_vertex_is_a_different_pipeline() {
     let b = key(
         BuiltIn::RasterShader as i32,
         Surface::Plane,
+        Topology::Triangles,
         &planned(12, 4, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -127,6 +171,7 @@ fn the_surface_and_the_permutation_each_separate_a_key() {
     let flat = key(
         BuiltIn::RasterShader as i32,
         Surface::Plane,
+        Topology::Triangles,
         &base,
         Blend::Alpha,
         Depth::Write,
@@ -136,6 +181,7 @@ fn the_surface_and_the_permutation_each_separate_a_key() {
     let bent = key(
         BuiltIn::RasterShader as i32,
         Surface::Globe,
+        Topology::Triangles,
         &base,
         Blend::Alpha,
         Depth::Write,
@@ -156,6 +202,7 @@ fn the_surface_and_the_permutation_each_separate_a_key() {
     let varied = key(
         BuiltIn::RasterShader as i32,
         Surface::Plane,
+        Topology::Triangles,
         &short,
         Blend::Alpha,
         Depth::Write,
@@ -182,6 +229,7 @@ fn the_family_separates_a_key() {
         key(
             BuiltIn::RasterShader as i32,
             Surface::Plane,
+            Topology::Triangles,
             &base,
             Blend::Alpha,
             Depth::Write,
@@ -191,6 +239,7 @@ fn the_family_separates_a_key() {
         key(
             BuiltIn::HillshadeShader as i32,
             Surface::Plane,
+            Topology::Triangles,
             &base,
             Blend::Alpha,
             Depth::Write,
@@ -213,6 +262,7 @@ fn where_the_bytes_live_does_not_separate_a_key() {
         key(
             BuiltIn::RasterShader as i32,
             Surface::Plane,
+            Topology::Triangles,
             &planned(12, 0, SOMEWHERE),
             Blend::Alpha,
             Depth::Write,
@@ -222,6 +272,7 @@ fn where_the_bytes_live_does_not_separate_a_key() {
         key(
             BuiltIn::RasterShader as i32,
             Surface::Plane,
+            Topology::Triangles,
             &planned(12, 0, elsewhere),
             Blend::Alpha,
             Depth::Write,
@@ -271,6 +322,7 @@ fn a_shorter_run_is_a_different_pipeline() {
         key(
             BuiltIn::FillShader as i32,
             Surface::Plane,
+            Topology::Triangles,
             &full,
             Blend::Alpha,
             Depth::Write,
@@ -280,6 +332,7 @@ fn a_shorter_run_is_a_different_pipeline() {
         key(
             BuiltIn::FillShader as i32,
             Surface::Plane,
+            Topology::Triangles,
             &partial,
             Blend::Alpha,
             Depth::Write,
@@ -296,6 +349,7 @@ fn the_key_caches() {
     let flat = key(
         BuiltIn::RasterShader as i32,
         Surface::Plane,
+        Topology::Triangles,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -305,6 +359,7 @@ fn the_key_caches() {
     let strided = key(
         BuiltIn::RasterShader as i32,
         Surface::Plane,
+        Topology::Triangles,
         &planned(16, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -319,6 +374,7 @@ fn the_key_caches() {
     let again = key(
         BuiltIn::RasterShader as i32,
         Surface::Plane,
+        Topology::Triangles,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -335,6 +391,7 @@ fn the_layout_records_the_format_the_table_declared() {
     let got = key(
         BuiltIn::RasterShader as i32,
         Surface::Plane,
+        Topology::Triangles,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
         Depth::Write,
@@ -365,6 +422,7 @@ fn the_input_rate_separates_a_key() {
         key(
             BuiltIn::RasterShader as i32,
             Surface::Plane,
+            Topology::Triangles,
             &per_vertex,
             Blend::Alpha,
             Depth::Write,
@@ -374,6 +432,7 @@ fn the_input_rate_separates_a_key() {
         key(
             BuiltIn::RasterShader as i32,
             Surface::Plane,
+            Topology::Triangles,
             &per_instance,
             Blend::Alpha,
             Depth::Write,

@@ -73,9 +73,9 @@ fn blocks_for<'d>(
         let slot = binding
             .slot
             .ok_or_else(|| format!("binding {} carries no slot", binding.binding))?;
-        // Through `held_at`, because a frame-wide block is not the layer's: eight of the
-        // twenty-one
-        // families declare `GlobalPaintParamsUBO`, which arrives under `layer_index: -1`. Asked
+        // Through `held_at`, because a frame-wide block is not the layer's: twelve of the
+        // twenty-two families declare `GlobalPaintParamsUBO`, which arrives under
+        // `layer_index: -1`. Asked
         // of the library rather than decided here, because what this bench checks is that a set
         // can be written for every family and not where the buffers are -- `first_pixel` is where
         // the scope has an oracle of its own, and a wrong answer there changes a pixel.

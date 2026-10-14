@@ -51,6 +51,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use ash::vk;
+use tessella_capture_abi::envelope::Topology;
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_emblema::device::{self, Attachment};
 use tessella_emblema::pipelines::{self, Blend, Key, Targets};
@@ -304,6 +305,7 @@ fn measure(
             // have.
             shader: BuiltIn::FillShader as i32,
             surface: Surface::Plane,
+            topology: Topology::Triangles,
             permutation: 0,
             layout: Vec::new(),
             blend: Blend::Unblended,

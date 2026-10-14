@@ -330,8 +330,9 @@ impl<'d> Sets<'d> {
                 binding: binding.binding,
             })?;
             // Not always `which`. A frame-wide buffer arrives under `layer_index: -1` because it
-            // belongs to the renderer rather than to a layer, and eight of the twenty-one families
-            // declare one -- so a set written for layer four still finds `GlobalPaintParamsUBO`
+            // belongs to the renderer rather than to a layer, and twelve of the twenty-two
+            // families declare one -- so a set written for layer four still finds
+            // `GlobalPaintParamsUBO`
             // where the producer put it. `slots::held_at` is which, and mbgl's own numbering is
             // what decides.
             let held = crate::slots::held_at(which, slot);

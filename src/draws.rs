@@ -29,10 +29,11 @@
 //! for the divisor of one every binding here has is the builtin itself.
 //!
 //! So the two uses are exclusive, and [`indexed`] refuses the combination rather than recording a
-//! draw that is wrong in two ways at once. Twenty-one of the twenty-two families draw one
-//! instance, where the slot and the instance index agree. The other is the instanced extrusion,
-//! and it is built around this: it passes a slot of zero and takes `ubo_index` from a push
-//! constant that `shaders::module` declares for it alone.
+//! draw that is wrong in two ways at once. Twenty-two of the twenty-four families draw one
+//! instance, where the slot and the instance index agree. The other two are the instanced
+//! extrusions -- the plain walls and the patterned ones -- and both are built around this: each
+//! passes a slot of zero and takes `ubo_index` from a push constant that `shaders::module`
+//! declares for those two alone.
 
 use tessella_capture_abi::envelope::Segment;
 

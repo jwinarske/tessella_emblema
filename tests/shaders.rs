@@ -376,6 +376,72 @@ fn the_patterns_keep_their_tiling_decisions() {
     );
 }
 
+/// The patterned extrusion keeps the three decisions a pixel cannot reach.
+///
+/// `benches/first_pixel.rs`'s two cases read everything about these families that a pixel can say:
+/// the lighting constant, the sprite's rectangle, the edge distance and the height factor are each
+/// worth a different number there. Three things are not reachable that way, and all three are
+/// mbgl's rather than this crate's choices.
+///
+/// * **Which end of the edge the distance comes from.** mbgl pairs the vertex at `p1` with the
+///   *next* instance's accumulated distance -- `in_position.x == 0.0 ? nextInstanceDecimalsEd.y :
+///   instanceDecimalsEd.y` -- which reads backwards and is what the oracle does. A pixel cannot
+///   tell: the case reads the wall's midpoint, where the two ends average to the same number
+///   whichever way round they are. Swapping them runs the sprite backwards along every wall.
+/// * **The roof tiles over its footprint and not over its placed position.** The decimals are
+///   added to the clip position and not to the pattern's, which is mbgl's `vec2(in_position)`
+///   against `in_position + decimals`. A fraction of a tile unit is far below a pixel of sprite.
+/// * **Neither family mixes its rectangles with `pattern_from_t`.** Halfway between two sprites'
+///   corners is a rectangle containing neither sprite; the cross-fade is `fade` in the fragment
+///   stage. The same check the fill pattern gets above.
+#[test]
+fn the_patterned_extrusion_keeps_its_decisions() {
+    let assembled = |name: &str| {
+        ALL.iter()
+            .find(|family| family.name == name)
+            .unwrap_or_else(|| panic!("{name} is in the matrix"))
+            .module(Surface::Plane, &[])
+            .expect("assembles")
+    };
+    let roof = assembled("fill_extrusion_pattern");
+    let wall = assembled("fill_extrusion_pattern_instanced");
+
+    assert!(
+        wall.contains(
+            "let edge_distance = select(f32(in.fill_extrusion_decimals_ed.y), next_edge, at_p1);"
+        ),
+        "the patterned wall does not take its edge distance from the end mbgl takes it from:\n{wall}"
+    );
+    assert!(
+        wall.contains("let along = vec2<f32>(edge_distance, z * drawable.height_factor);"),
+        "the patterned wall's sprite does not run along the ring and up the wall"
+    );
+    assert!(
+        roof.contains("        footprint\n") && roof.contains("vec3<f32>(footprint + decimals, z)"),
+        "the patterned roof tiles over something other than its footprint:\n{roof}"
+    );
+    for (name, source) in [("roof", &roof), ("wall", &wall)] {
+        assert!(
+            source.contains("    return vec4<f32>(in.fill_extrusion_pattern_from);")
+                && !source.contains("drawable.pattern_from_t")
+                && !source.contains("drawable.pattern_to_t"),
+            "the patterned extrusion's {name} interpolates a sprite name"
+        );
+        assert!(
+            source.contains(
+                "let display_a = (pattern_from.zw - pattern_from.xy) / max(global.pixel_ratio, 1e-6);"
+            ) && source.contains("props.from_scale * display_a,")
+                && source.contains("props.to_scale * display_b,"),
+            "the patterned extrusion's {name} drops a scale or the pixel ratio"
+        );
+        assert_eq!(
+            source.matches("drawable.tile_ratio,").count(),
+            2,
+            "the patterned extrusion's {name} does not convert both sprites to tile units"
+        );
+    }
+}
+
 /// The line pattern keeps the four decisions that run a sprite along a line wrongly.
 ///
 /// * **The distance along the line is fourteen bits across two bytes.** The fourth byte is the
@@ -935,10 +1001,10 @@ fn the_slot_arrives_as_the_instance_index() {
     }
 }
 
-/// And the instanced family takes it from a push constant, because it cannot take it from there.
+/// And the instanced families take it from a push constant, because they cannot take it from there.
 ///
-/// The one exception, and it is forced rather than chosen. `firstInstance` is part of the address
-/// an instance-rate vertex attribute is fetched from, measured on RADV and V3D in
+/// The two exceptions, and they are forced rather than chosen. `firstInstance` is part of the
+/// address an instance-rate vertex attribute is fetched from, measured on RADV and V3D in
 /// `benches/instance_fetch.rs`, so a draw of more than one instance cannot put the slot there --
 /// `draws::indexed` refuses the pair. The cost is one `vkCmdPushConstants` per walls drawable,
 /// which is one drawable a tile a layer rather than one per anything that scales.
@@ -981,8 +1047,8 @@ fn the_instanced_family_takes_its_slot_from_a_push_constant() {
         }
     }
     assert_eq!(
-        seen, 3,
-        "the instanced extrusion on a plane, on the bend and on a raised ground"
+        seen, 6,
+        "the two instanced extrusions, each on a plane, on the bend and on a raised ground"
     );
 }
 
@@ -1295,7 +1361,7 @@ fn every_family_on_every_surface_compiles() {
         }
     }
     assert_eq!(
-        pairs, 70,
+        pairs, 76,
         "the matrix grew or shrank; look at the new pairs"
     );
 }
@@ -1359,7 +1425,7 @@ fn every_permutation_of_every_family_compiles() {
     // Not a round number and not worth deriving: it is the shape of the table, and a change to it
     // is a change worth looking at.
     assert_eq!(
-        modules, 231,
+        modules, 261,
         "the permutations grew or shrank; look at the new ones"
     );
 }
@@ -1507,12 +1573,18 @@ fn only_the_flagged_families_read_a_curtain() {
 /// attribute is shared between a family and its variants, and a component only one variant needs
 /// arrives for both.
 const UNREAD_COMPONENTS: &[(&str, &str, &str)] = &[
-    // `a_decimals_ed.y` is the edge distance, which only `fill_extrusion_pattern.vertex.glsl`
-    // reads. The plain family declares the pair and uses the first of it.
+    // `a_decimals_ed.y` is the edge distance, which a wall tiles its pattern along. Three of the
+    // four extrusion families declare the pair and read the first of it; the fourth is the one the
+    // component is there for.
+    //
+    // A roof has no use for it either way: `FillExtrusionPatternShader` tiles over the footprint,
+    // so the *patterned* roof reads `.x` and stops exactly as the plain one does. The distance
+    // only means something going up a wall.
     ("fill_extrusion", "fill_extrusion_decimals_ed", "y"),
-    // The walls declare the same pair per instance and read the same half of it. The edge distance
-    // is for a pattern and this family draws none -- the patterned instanced variant is the one
-    // that would read it, and it has no body here yet.
+    ("fill_extrusion_pattern", "fill_extrusion_decimals_ed", "y"),
+    // The plain walls declare the same pair per instance and read the same half of it: the edge
+    // distance is for a pattern and this family draws none.
+    // `fill_extrusion_pattern_instanced` is the one that reads it, and it is not sanctioned here.
     (
         "fill_extrusion_instanced",
         "fill_extrusion_decimals_ed",
@@ -1697,6 +1769,15 @@ const UNUSED_FACTORS: &[(&str, &str)] = &[
     ("fill_outline_pattern", "pattern_to_t"),
     ("line_pattern", "pattern_from_t"),
     ("line_pattern", "pattern_to_t"),
+    ("fill_extrusion_pattern", "pattern_from_t"),
+    ("fill_extrusion_pattern", "pattern_to_t"),
+    ("fill_extrusion_pattern_instanced", "pattern_from_t"),
+    ("fill_extrusion_pattern_instanced", "pattern_to_t"),
+    // And the color, which the *drawable* block carries for the plain extrusion beside it. A
+    // patterned extrusion has no color attribute at all -- the sprite is the surface -- so there
+    // is nothing for `color_t` to mix. `fill_extrusion` reads both.
+    ("fill_extrusion_pattern", "color_t"),
+    ("fill_extrusion_pattern_instanced", "color_t"),
 ];
 
 /// Attribute and factor pairs whose names do not match, as `(attribute field, factor)`.

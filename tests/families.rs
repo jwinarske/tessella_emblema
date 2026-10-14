@@ -126,10 +126,11 @@ fn every_family_declares_at_least_one_block() {
 
 /// The families that hand `place` a height are the ones that leave the surface.
 ///
-/// Both halves of a building: the roof and the walls standing under it. Nothing else here has a
-/// third component to give, and a family that gained one without needing it would be asking a
-/// surface for a term it has no use for -- which on the direct bend does not exist at all, so
-/// these two are also the only families that skip that surface.
+/// Both halves of a building, twice over: the roof and the walls standing under it, plain and
+/// patterned. Nothing else here has a third component to give, and a family that gained one
+/// without needing it would be asking a surface for a term it has no use for -- which on the
+/// direct bend does not exist at all, so these four are also the only families that skip that
+/// surface.
 #[test]
 fn only_the_extrusions_have_height() {
     let raised: Vec<&str> = ALL
@@ -137,12 +138,20 @@ fn only_the_extrusions_have_height() {
         .filter(|entry| entry.height)
         .map(|entry| entry.name)
         .collect();
-    assert_eq!(raised, vec!["fill_extrusion", "fill_extrusion_instanced"]);
+    assert_eq!(
+        raised,
+        vec![
+            "fill_extrusion",
+            "fill_extrusion_instanced",
+            "fill_extrusion_pattern",
+            "fill_extrusion_pattern_instanced",
+        ]
+    );
 }
 
-/// And the only family drawn per instance is the walls.
+/// And the only families drawn per instance are the walls, plain and patterned.
 ///
-/// Pinned because an empty `instance_attributes` is what the other eighteen rely on: it decides
+/// Pinned because an empty `instance_attributes` is what the other twenty rely on: it decides
 /// whether `ubo_index` rides `firstInstance` or a push constant, whether the module declares a
 /// second descriptor group, and whether a geometry's buffer is created with a second usage. A
 /// family that gained the field by accident would move all three at once.
@@ -153,25 +162,36 @@ fn only_the_walls_are_drawn_per_instance() {
         .filter(|entry| !entry.instance_attributes.is_empty())
         .map(|entry| entry.name)
         .collect();
-    assert_eq!(instanced, vec!["fill_extrusion_instanced"]);
+    assert_eq!(
+        instanced,
+        vec![
+            "fill_extrusion_instanced",
+            "fill_extrusion_pattern_instanced"
+        ]
+    );
 
-    // And every one of its instance attributes that names a shared buffer names the same one,
-    // which is what makes the module's single group-one binding right.
-    let walls = ALL
-        .iter()
-        .find(|entry| entry.name == "fill_extrusion_instanced")
-        .expect("the walls are drawn");
-    let shared: Vec<&str> = walls
-        .instance_attributes
-        .iter()
-        .filter_map(|attribute| attribute.shared_buffer)
-        .collect();
-    assert_eq!(shared, vec!["idFillExtrusionInstanced"; 2]);
+    // And every one of their instance attributes that names a shared buffer names the same one,
+    // which is what makes each module's single group-one binding right. Two for the plain walls
+    // and two for the patterned ones: the base, the height and the two rectangles are the
+    // drawable's own buffers, not the shared outline.
+    for name in instanced {
+        let walls = ALL
+            .iter()
+            .find(|entry| entry.name == name)
+            .expect("it was just found");
+        let shared: Vec<&str> = walls
+            .instance_attributes
+            .iter()
+            .filter_map(|attribute| attribute.shared_buffer)
+            .collect();
+        assert_eq!(shared, vec!["idFillExtrusionInstanced"; 2], "{name}");
+    }
 }
 
 /// A family is found by the id the wire carries, and the table holds one mbgl has no name for.
 ///
-/// `Family::shader` was a `BuiltIn` and is the `i32` the wire carries. For the twenty families mbgl
+/// `Family::shader` was a `BuiltIn` and is the `i32` the wire carries. For the twenty-three families
+/// mbgl
 /// declares that is the same set of values -- every one of them is an mbgl shader and this checks
 /// it -- and what it buys is the one that is not: mbgl has no terrain, so the ground's id is
 /// tessella's own `BUILTIN_TERRAIN_SHADER`, which is 128 and past the enum's thirty-six.

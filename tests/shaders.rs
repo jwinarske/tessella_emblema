@@ -673,8 +673,10 @@ fn the_line_keeps_its_extrusion_decisions() {
 
 /// The symbol SDF keeps the five decisions that draw something plausible when wrong.
 ///
-/// * **The atlas is read from `.r`.** `GLYPH_ATLAS_FORMAT` is one channel, which is `R8_UNORM`
-///   here and `GL_ALPHA` in mbgl. Reading `.a` gives 1.0 everywhere: every glyph a solid block.
+/// * **The atlas is read from `.a`.** `GLYPH_ATLAS_FORMAT` is one channel, which is `R8_UNORM`
+///   here -- and the view swizzles that channel to alpha, as mbgl's does, so a body transcribed
+///   from mbgl reads the right one. Through such a view `.r` is zero everywhere: no type at all.
+///   See `device::component_swizzle`, which is the other half of this pair.
 /// * **The halo is subtracted, not drawn under.** `min(halo, 1.0 - fill)` keeps a translucent
 ///   fill's halo translucent; without it the two coverages add where they meet.
 /// * **Zero distance is 192/256, and the field is 8 units a pixel.** Both are how the atlas was
@@ -693,8 +695,8 @@ fn the_symbol_sdf_keeps_its_edge_decisions() {
     let source = sdf.module(Surface::Plane, &[]).expect("assembles");
 
     assert!(
-        source.contains("textureSample(symbol_image, symbol_image_sampler, in.tex).r;"),
-        "the atlas is not read from red:\n{source}"
+        source.contains("textureSample(symbol_image, symbol_image_sampler, in.tex).a;"),
+        "the atlas is not read from alpha:\n{source}"
     );
     assert!(
         source.contains(

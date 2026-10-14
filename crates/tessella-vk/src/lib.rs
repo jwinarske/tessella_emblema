@@ -227,10 +227,36 @@ impl<'d> Gpu<'d> {
     /// undefined, and this cannot check it -- a `Memory::bind_image` has no handle to leave behind.
     /// Binding before viewing is the order [`crate::Memory::bind_image`] documents.
     ///
+    /// Identity components. A view that reads a channel back somewhere else is
+    /// [`Self::view_as`].
+    ///
     /// # Errors
     ///
     /// [`Error::Call`] if `vkCreateImageView` fails.
     pub fn view(self, image: &Image<'_>, format: vk::Format) -> Result<ImageView<'d>, Error> {
+        self.view_as(image, format, vk::ComponentMapping::default())
+    }
+
+    /// The same, with the components a sampler reads the texels through.
+    ///
+    /// A one-channel format is `R8_UNORM`, and a shader sampling it gets the value in `r` with
+    /// `(0, 0, 1)` beside it. mbgl's bodies read such a texture's `a` -- a glyph's distance field,
+    /// a dash's -- because its own backend swizzles the view to `(0, 0, 0, R)`
+    /// (`vulkan/texture2d.cpp:359`). The swizzle belongs to the *view*, so it is the one place
+    /// where a transcribed body can be taken at its word.
+    ///
+    /// Which mapping a texture gets is not this crate's to decide: `tessella_emblema::device`
+    /// reads it off the pixel type the wire carries.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Call`] if `vkCreateImageView` fails.
+    pub fn view_as(
+        self,
+        image: &Image<'_>,
+        format: vk::Format,
+        components: vk::ComponentMapping,
+    ) -> Result<ImageView<'d>, Error> {
         // SAFETY: the create info is fully initialized and names an image made by this device; the
         // device outlives the returned view by the lifetime on `Gpu`.
         let raw = unsafe {
@@ -239,6 +265,7 @@ impl<'d> Gpu<'d> {
                     .image(image.raw)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
+                    .components(components)
                     .subresource_range(whole(format)),
                 None,
             )

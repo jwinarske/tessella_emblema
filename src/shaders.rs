@@ -2519,6 +2519,311 @@ fn fragment_main(in: Out) -> @location(0) vec4<f32> {
 }
 ";
 
+/// The line-gradient family's body: a line colored by a ramp rather than by a paint property.
+///
+/// [`LINE_BODY`] with the color taken out and the ramp put in its place. `line-gradient` is a
+/// *color stop list along the line*, which mbgl bakes into one 256x1 image per layer -- so there is
+/// no color attribute, no `color_t` in the drawable block, and the fragment samples instead.
+///
+/// # The progress is the whole line's, not this tile's
+///
+/// The same fourteen bits [`LINE_PATTERN_BODY`] reads as a distance in tile units, divided by
+/// `MAX_LINE_DISTANCE` rather than scaled: what a ramp wants is where along the line this fragment
+/// is as a fraction. The producer only puts a usable number there when the source sets
+/// `lineMetrics` -- a line cut by a tile boundary has to keep the progress it had whole, or every
+/// piece restarts the gradient and the seam is visible at every edge. That is why the style spec
+/// allows `line-gradient` on a `GeoJSON` source alone, and why `capture-render` had to learn to
+/// read
+/// one before this family could be drawn here at all.
+pub const LINE_GRADIENT_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) normal: vec2<f32>,
+    @location(1) outset: f32,
+    @location(2) inset: f32,
+    @location(3) gamma_scale: f32,
+    @location(4) blur: f32,
+    @location(5) opacity: f32,
+    @location(6) progress: f32,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let drawable = line_gradient_drawable_ubo[ubo_index];
+    let global = global_paint_params_ubo[0];
+    var out: Out;
+
+    // The byte pair encodes a unit vector over 63, biased by 128.
+    let extrude_scale = 63.0;
+    // The distance the edge fades out over: half a device pixel each side.
+    let antialiasing = 1.0 / max(global.pixel_ratio, 1e-6) / 2.0;
+
+    // The normal is the low bit of each component; the center is what is left.
+    let packed = vec2<f32>(in.line_pos_normal);
+    let center = floor(packed * 0.5);
+    var normal = packed - 2.0 * center;
+    normal.y = normal.y * 2.0 - 1.0;
+
+    // Four unnormalized bytes. The first two are the extrusion and the low two bits of the third
+    // say which way a round end point's extrude points. The rest of the third with the fourth is
+    // the distance along the line, which this family reads as the ramp's coordinate.
+    let data = vec4<f32>(in.line_data);
+    let extrude = data.xy - 128.0;
+    let direction = (data.z % 4.0) - 1.0;
+
+    // How far along the *whole* line this vertex is, as a fraction of `MAX_LINE_DISTANCE`. The
+    // same fourteen bits `LINE_PATTERN_BODY` reads as a distance, divided rather than scaled:
+    // a ramp is 256 texels of the line's whole length, so what it wants is the fraction.
+    //
+    // Whole, not this tile's piece. A line cut by a tile boundary keeps the progress it had in
+    // the source, which is what `lineMetrics` is for -- without it each piece would start the
+    // gradient over, and the seam would be visible at every tile edge.
+    out.progress = (floor(data.z / 4.0) + data.w * 64.0) * 2.0 / 32767.0;
+
+    let gapwidth = paint_gapwidth(in) * 0.5;
+    let halfwidth = paint_width(in) * 0.5;
+    let line_offset = -1.0 * paint_offset(in);
+
+    // The quad reaches `outset` from the center and the fill starts at `inset`. With no gap the
+    // inset is zero and the line is solid; with one, both edges are drawn and the middle left
+    // open, which is how a road casing is a casing rather than a slab.
+    let inset = gapwidth + select(0.0, antialiasing, gapwidth > 0.0);
+    let outset = gapwidth
+        + halfwidth * select(1.0, 2.0, gapwidth > 0.0)
+        + select(antialiasing, 0.0, halfwidth == 0.0);
+
+    // The extrusion down to a normal and back up by this vertex's line width.
+    let dist = outset * extrude / extrude_scale;
+
+    // A line drawn to the side of the real one. The vector points along the extrude, rotated
+    // where a round end point's extrude points somewhere else.
+    let u = 0.5 * direction;
+    let t = 1.0 - abs(u);
+    let turn = mat2x2<f32>(t, -u, u, t);
+    let offset2 = line_offset * extrude / extrude_scale * normal.y * turn;
+
+    let ratio = max(drawable.ratio, 1e-6);
+
+    // Placed and extruded separately, because the projected extrusion is what says how much
+    // perspective squashed this edge -- and that length is wanted on its own below. `displace` is
+    // the surface's, since the extrusion is linear on a plane and is not on a sphere.
+    let at = center + offset2 / ratio;
+    let projected_extrude = displace(at, dist / ratio, drawable.matrix);
+    let clip = place(vec3<f32>(at, 0.0), drawable.matrix) + projected_extrude;
+    out.clip = clip;
+
+    // How much the perspective view squashed or stretched the extrusion, which is what keeps the
+    // fade a constant width in pixels. Guarded: a zero-length extrusion would be 0/0 and NaN a
+    // whole line away.
+    let unprojected = length(dist);
+    let projected = length(projected_extrude.xy / clip.w * global.units_to_pixels);
+    out.gamma_scale = unprojected / max(projected, 1e-6);
+
+    out.normal = normal;
+    out.outset = outset;
+    out.inset = inset;
+    out.blur = paint_blur(in);
+    out.opacity = paint_opacity(in);
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    // How far this pixel is from the center of the line, in pixels.
+    let distance = length(in.normal) * in.outset;
+
+    // The fade: in across the inner edge for a line with a gap, out across the outer one.
+    let blur2 = (in.blur + 1.0 / max(global_paint_params_ubo[0].pixel_ratio, 1e-6))
+        * in.gamma_scale;
+    let alpha = clamp(
+        min(distance - (in.inset - blur2), in.outset - distance) / blur2,
+        0.0,
+        1.0
+    );
+
+    // The color is the ramp at this fragment's progress. One row, sampled at its middle: mbgl
+    // bakes `line-gradient` into a 256x1 image per layer, so the `y` is the texel's center and
+    // not an edge.
+    let color = textureSample(line_image, line_image_sampler, vec2<f32>(in.progress, 0.5));
+    return color * (alpha * in.opacity);
+}
+";
+
+/// The line-SDF family's body: a dashed line, where the dash is a distance field.
+///
+/// [`LINE_BODY`] with three additions, and the third is the one worth reading twice.
+///
+/// **The distance along the line**, as [`LINE_PATTERN_BODY`] reads it, scaled by the pattern's own
+/// `patternscale` -- which is the producer's conversion from tile units to the atlas's.
+///
+/// **Two rows of the atlas, crossfaded.** A dash pattern is rasterized per zoom, so a layer
+/// crossing a zoom boundary is between two of them; `tex_y_a` and `tex_y_b` are the rows and
+/// `mix` is how far across. Sampling one row alone makes a dash that jumps at every zoom step.
+///
+/// **A threshold divided by the line's width.** The atlas holds a signed distance field in its
+/// alpha, and the dash's edge is where that field crosses a half. `sdfgamma` is how soft that
+/// crossing is at this zoom -- and it is divided by `floorwidth`, the width the dash was
+/// rasterized at, because a wide line stretches the field over more pixels. Without the division a
+/// thick road's dashes have soft ends and a thin road's are sharp, which reads as a renderer that
+/// cannot draw wide dashes.
+///
+/// `floorwidth` is this family's ninth attribute and the only paint property no other line family
+/// has.
+pub const LINE_SDF_BODY: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) normal: vec2<f32>,
+    @location(2) outset: f32,
+    @location(3) inset: f32,
+    @location(4) gamma_scale: f32,
+    @location(5) blur: f32,
+    @location(6) opacity: f32,
+    @location(7) tex_a: vec2<f32>,
+    @location(8) tex_b: vec2<f32>,
+    @location(9) floorwidth: f32,
+    @location(10) @interpolate(flat) ubo: u32,
+}
+
+@vertex
+fn vertex_main(in: In) -> Out {
+    ubo_index = in.instance_index;
+    let drawable = line_sdf_drawable_ubo[ubo_index];
+    let global = global_paint_params_ubo[0];
+    var out: Out;
+
+    // The byte pair encodes a unit vector over 63, biased by 128.
+    let extrude_scale = 63.0;
+    // The distance the edge fades out over: half a device pixel each side.
+    let antialiasing = 1.0 / max(global.pixel_ratio, 1e-6) / 2.0;
+
+    // The normal is the low bit of each component; the center is what is left.
+    let packed = vec2<f32>(in.line_pos_normal);
+    let center = floor(packed * 0.5);
+    var normal = packed - 2.0 * center;
+    normal.y = normal.y * 2.0 - 1.0;
+
+    // Four unnormalized bytes. The first two are the extrusion and the low two bits of the third
+    // say which way a round end point's extrude points. The rest of the third with the fourth is
+    // the distance along the line, which this family runs its dash pattern along.
+    let data = vec4<f32>(in.line_data);
+    let extrude = data.xy - 128.0;
+    let direction = (data.z % 4.0) - 1.0;
+
+    let gapwidth = paint_gapwidth(in) * 0.5;
+    let halfwidth = paint_width(in) * 0.5;
+    let line_offset = -1.0 * paint_offset(in);
+
+    // The quad reaches `outset` from the center and the fill starts at `inset`. With no gap the
+    // inset is zero and the line is solid; with one, both edges are drawn and the middle left
+    // open, which is how a road casing is a casing rather than a slab.
+    let inset = gapwidth + select(0.0, antialiasing, gapwidth > 0.0);
+    let outset = gapwidth
+        + halfwidth * select(1.0, 2.0, gapwidth > 0.0)
+        + select(antialiasing, 0.0, halfwidth == 0.0);
+
+    // The extrusion down to a normal and back up by this vertex's line width.
+    let dist = outset * extrude / extrude_scale;
+
+    // A line drawn to the side of the real one. The vector points along the extrude, rotated
+    // where a round end point's extrude points somewhere else.
+    let u = 0.5 * direction;
+    let t = 1.0 - abs(u);
+    let turn = mat2x2<f32>(t, -u, u, t);
+    let offset2 = line_offset * extrude / extrude_scale * normal.y * turn;
+
+    let ratio = max(drawable.ratio, 1e-6);
+
+    // Placed and extruded separately, because the projected extrusion is what says how much
+    // perspective squashed this edge -- and that length is wanted on its own below. `displace` is
+    // the surface's, since the extrusion is linear on a plane and is not on a sphere.
+    let at = center + offset2 / ratio;
+    let projected_extrude = displace(at, dist / ratio, drawable.matrix);
+    let clip = place(vec3<f32>(at, 0.0), drawable.matrix) + projected_extrude;
+    out.clip = clip;
+
+    // How much the perspective view squashed or stretched the extrusion, which is what keeps the
+    // fade a constant width in pixels. Guarded: a zero-length extrusion would be 0/0 and NaN a
+    // whole line away.
+    let unprojected = length(dist);
+    let projected = length(projected_extrude.xy / clip.w * global.units_to_pixels);
+    out.gamma_scale = unprojected / max(projected, 1e-6);
+
+    out.normal = normal;
+    out.outset = outset;
+    out.inset = inset;
+    out.color = paint_color(in);
+    out.blur = paint_blur(in);
+    out.opacity = paint_opacity(in);
+
+    // Where this vertex reads the dash atlas, in both rows the layer is crossfading between.
+    //
+    // `x` is the distance along the line scaled by the pattern's own, divided by the width the
+    // dash was *rasterized* at: a dash is drawn into the atlas at one width and stretched to the
+    // line's, so dividing here is what keeps a wide road's dashes the same shape as a narrow
+    // one's rather than the same length.
+    //
+    // `y` is the row. The normal runs -1 to 1 across the line, so this reads the atlas across the
+    // dash as well as along it, and `tex_y` picks which of the two patterns the row belongs to.
+    let linesofar = (floor(data.z / 4.0) + data.w * 64.0) * 2.0;
+    let floorwidth = paint_floorwidth(in);
+    out.floorwidth = floorwidth;
+    let safe_floor = max(floorwidth, 1e-6);
+    out.tex_a = vec2<f32>(
+        linesofar * drawable.patternscale_a.x / safe_floor,
+        normal.y * drawable.patternscale_a.y + drawable.tex_y_a
+    );
+    out.tex_b = vec2<f32>(
+        linesofar * drawable.patternscale_b.x / safe_floor,
+        normal.y * drawable.patternscale_b.y + drawable.tex_y_b
+    );
+    out.ubo = ubo_index;
+    return out;
+}
+
+@fragment
+fn fragment_main(in: Out) -> @location(0) vec4<f32> {
+    // The slot, carried: a fragment invocation's own copy of a private is zero.
+    ubo_index = in.ubo;
+    let tile = line_sdf_tile_props_ubo[ubo_index];
+
+    // How far this pixel is from the center of the line, in pixels.
+    let distance = length(in.normal) * in.outset;
+
+    // The fade: in across the inner edge for a line with a gap, out across the outer one.
+    let blur2 = (in.blur + 1.0 / max(global_paint_params_ubo[0].pixel_ratio, 1e-6))
+        * in.gamma_scale;
+    let alpha = clamp(
+        min(distance - (in.inset - blur2), in.outset - distance) / blur2,
+        0.0,
+        1.0
+    );
+
+    // The dash itself, which is a distance field in the atlas's alpha rather than a picture: the
+    // two rows are the pattern the layer is crossfading from and to, and `mix` is how far between
+    // them this frame is.
+    //
+    // The threshold is the field's own half, widened by the gamma the producer computed for this
+    // zoom and *narrowed* by the line's width: a wide line stretches the field across more pixels,
+    // so the same gamma would soften its edges more. Dividing by the width is what keeps a dash's
+    // edge as sharp on a thick road as on a thin one.
+    // `.r`, where mbgl reads `.a`: a one-channel format is `R8_UNORM` here and alpha reads 1.0.
+    // mbgl's Vulkan backend swizzles an `Alpha` texture's view to `(0, 0, 0, R)`
+    // (`texture2d.cpp:359`) and this crate does not, which is the same difference the glyph atlas
+    // is read across -- see `SYMBOL_SDF_BODY`. Read as alpha, every dash is solid: the field comes
+    // back as one everywhere and the `smoothstep` saturates, which is exactly what a capture of
+    // `dash_style.json` drew before this line said `.r`.
+    let sdfdist_a = textureSample(line_image, line_image_sampler, in.tex_a).r;
+    let sdfdist_b = textureSample(line_image, line_image_sampler, in.tex_b).r;
+    let sdfdist = mix(sdfdist_a, sdfdist_b, tile.mix);
+    let gamma = tile.sdfgamma / max(in.floorwidth, 1e-6);
+    let dash = smoothstep(0.5 - gamma, 0.5 + gamma, sdfdist);
+
+    return in.color * (alpha * dash * in.opacity);
+}
+";
+
 /// `FillOutlineTriangulatedShader`: a fill's outline as extruded quads rather than lines.
 ///
 /// A fill's antialiasing *is* its outline -- `fill-antialias` turns it on -- and the triangles

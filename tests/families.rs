@@ -190,8 +190,8 @@ fn only_the_walls_are_drawn_per_instance() {
 
 /// A family is found by the id the wire carries, and the table holds one mbgl has no name for.
 ///
-/// `Family::shader` was a `BuiltIn` and is the `i32` the wire carries. For the twenty-three families
-/// mbgl
+/// `Family::shader` was a `BuiltIn` and is the `i32` the wire carries. For the twenty-five
+/// families mbgl
 /// declares that is the same set of values -- every one of them is an mbgl shader and this checks
 /// it -- and what it buys is the one that is not: mbgl has no terrain, so the ground's id is
 /// tessella's own `BUILTIN_TERRAIN_SHADER`, which is 128 and past the enum's thirty-six.

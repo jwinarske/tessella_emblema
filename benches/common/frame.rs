@@ -45,7 +45,7 @@ pub const LAYER: i32 = 0;
 /// The layer that samples a texture, which covers a band across the top.
 ///
 /// A raster, because it is the shortest family that samples: three attributes, two blocks and two
-/// images. Fifteen of the twenty-four families sample something and nothing had driven a
+/// images. Seventeen of the twenty-six families sample something and nothing had driven a
 /// `TextureUpdate` into a sampler, so this is the layer that does -- see #93.
 pub const SAMPLED: i32 = 2;
 

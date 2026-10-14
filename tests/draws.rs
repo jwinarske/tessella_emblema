@@ -97,7 +97,7 @@ fn an_instanced_family_repeats_every_segment() {
 /// One instance keeps the slot, which is every family drawn today.
 ///
 /// The boundary, stated on its own: the refusal is about more than one instance and not about
-/// instancing as an idea, so the twenty-two families that draw once go on carrying their slot.
+/// instancing as an idea, so the twenty-four families that draw once go on carrying their slot.
 #[test]
 fn one_instance_still_carries_the_slot() {
     let got = indexed(&[segment(0, 0, 4, 6)], 7, 1).expect("draws");

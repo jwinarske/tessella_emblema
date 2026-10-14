@@ -81,9 +81,9 @@
 //!
 //! [`families`] is what a producer's `builtin_shader` resolves to: the blocks, tables, body and
 //! surfaces one family's module is assembled from, keyed by the shader rather than by a name
-//! because nothing on the wire carries a name. It also states the coverage -- twenty-three of
-//! mbgl's thirty-six shader entries are drawn here and the other thirteen are listed with the
-//! reason, pinned against the enum so neither list can drift -- and the twenty-fourth family, the
+//! because nothing on the wire carries a name. It also states the coverage -- twenty-five of
+//! mbgl's thirty-six shader entries are drawn here and the other eleven are listed with the
+//! reason, pinned against the enum so neither list can drift -- and the twenty-sixth family, the
 //! ground, which mbgl has no shader for at all. And one fact that is not part of a module:
 //! [`families::Composite`], how a draw of the family composites over the target, which mbgl keeps
 //! in the same place -- its render layer's own source, not a style and not the wire.

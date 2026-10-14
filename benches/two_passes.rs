@@ -5,7 +5,7 @@
 //! this is a frame that acts on it: the child's pass renders into an image held under a `TextureId`
 //! that no upload will ever name, and the parent's pass samples it.
 //!
-//! Two of the twenty-four families are this shape -- `heatmap` draws its kernels into a
+//! Two of the twenty-six families are this shape -- `heatmap` draws its kernels into a
 //! half-resolution
 //! target and reads it back through a color ramp, and `hillshade_prepare` is the same -- so neither
 //! could draw at all before. `benches/first_pixel.rs` has a case for each, and each is a *single*

@@ -3,7 +3,7 @@
 //!
 //! DR-25's shape, as the envelopes carry it. `heatmap` draws its kernels into a half-resolution
 //! target and then draws that target through a color ramp, and `hillshade_prepare` has the same two
-//! passes -- so two of the twenty-four families cannot draw at all without this.
+//! passes -- so two of the twenty-six families cannot draw at all without this.
 //!
 //! # Why a fill and a raster rather than a heatmap
 //!

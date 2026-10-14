@@ -81,10 +81,22 @@ fn run() -> Result<(), String> {
     let (mut ring, geometry) = passes::write(1 << 16);
     let mut host = Host::new();
     let progress = host.read(ring.consumer());
-    if progress.unknown != 0 || progress.malformed != 0 || progress.undeclared != 0 {
+    // All four: see `benches/a_frame.rs` for why `unsupported` is the one worth naming. Here it
+    // would be a `ViewTarget` whose format this build has no case for -- the second pass then has
+    // no image to draw into and the first has nothing to sample, which is this bench's whole
+    // subject arriving as silence.
+    if progress.unknown != 0
+        || progress.malformed != 0
+        || progress.undeclared != 0
+        || progress.unsupported != 0
+    {
         return Err(format!(
-            "{} unknown, {} malformed and {} undeclared of {} records",
-            progress.unknown, progress.malformed, progress.undeclared, progress.records
+            "{} unknown, {} malformed, {} undeclared and {} this build cannot honor, of {} records",
+            progress.unknown,
+            progress.malformed,
+            progress.undeclared,
+            progress.unsupported,
+            progress.records
         ));
     }
 

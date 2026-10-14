@@ -363,6 +363,8 @@ impl<'d> Rig<'d> {
                     record.bind_pipeline(pipeline);
                     record.stencil_compare_mask(0);
                     record.stencil_reference(0);
+                    // Declared dynamic for the 3D draw-once's sake, so it has to be set here too.
+                    record.stencil_write_mask(0);
                     record.bind_vertex_buffers(
                         0,
                         &[self.quad.raw(), self.instances.raw()],
@@ -421,6 +423,7 @@ fn pipeline<'d>(
         blend: Blend::Unblended,
         depth: pipelines::Depth::Write,
         enabled: pipelines::Enabled::ALL,
+        stencil: pipelines::Stencil::Clip,
     };
     let built = pipelines::build(gpu, &key, &layout, &module, rig.targets)
         .map_err(|why| format!("pipeline: {why:?}"))?;

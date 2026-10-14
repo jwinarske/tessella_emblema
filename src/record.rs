@@ -36,9 +36,14 @@
 //! is expressed with a **compare mask of zero** rather than a second pipeline: the test is a baked
 //! `EQUAL`, and `(0 & 0) == (stencil & 0)` passes for every texel whatever the buffer holds. So
 //! unclipped is a value, not a branch -- and the same two `vkCmdSet` calls serve both.
+//!
+//! That spelling is the clip scheme's alone. A 3D drawable compares `NOT_EQUAL`, where a mask of
+//! no bits makes both sides zero and *fails* everywhere -- so the scheme is baked per pipeline
+//! ([`crate::pipelines::Stencil`]) and a 3D run with no value to spend has its test turned off
+//! rather than neutralized. See [`DrawOnce`] for what a value is and how one frame has one.
 
 use ash::vk;
-use tessella_capture_abi::envelope::{GeometryId, ViewId};
+use tessella_capture_abi::envelope::{DrawFlags, GeometryId, ViewId};
 use tessella_consume::batch::{Batch, Batches};
 use tessella_consume::join::Joiner;
 use tessella_consume::stencil::Partition;
@@ -166,8 +171,19 @@ pub struct Counts {
     pub draws: usize,
     /// Batches skipped because the caller resolved no program.
     pub undrawn: usize,
-    /// Drawables whose tile has no mask, and which are therefore unclipped.
+    /// Drawables that asked for their tile's clip mask and had none.
+    ///
+    /// Narrower than it was, and the narrowing is the point: this counted every drawable whose
+    /// `clipping` answered `(0, 0)`, which included every drawable that never wanted a mask -- a
+    /// background covers the viewport and carries no stencil bit at all. Those are
+    /// [`crate::pipelines::Stencil::Off`] now and are not counted, so what is left is the case
+    /// worth noticing: a drawable clipped to a tile the partition had no assignment for. The
+    /// captured Berlin frame went from 16 to 0 on that reading and nothing about it changed.
     pub unclipped: usize,
+    /// Drawables drawn with the 3D draw-once mask.
+    ///
+    /// The run [`DrawOnce`] gave the frame's one value to, drawable by drawable.
+    pub drawn_once: usize,
 }
 
 /// Everything a frame reads that is not the batches.
@@ -180,6 +196,14 @@ pub struct Scene<'a, 'd> {
     pub joiner: &'a Joiner,
     /// Each tile's stencil assignment.
     pub partition: &'a Partition,
+    /// Which 3D run drew with the draw-once mask, from [`DrawOnce::of`].
+    ///
+    /// The caller's rather than this module's, because the caller builds the pipelines: a
+    /// drawable's scheme is baked state ([`crate::pipelines::Stencil`]) and the dynamic reference
+    /// set here has to agree with it. Both read [`DrawOnce::value_for`], so there is one answer.
+    ///
+    /// [`DrawOnce::default`] is a frame with no 3D run, which is every frame of a flat style.
+    pub draw_once: DrawOnce,
     /// The view being drawn.
     pub view: ViewId,
     /// How a layer's drawables are placed in the depth range, or `None` to place none.
@@ -320,20 +344,49 @@ pub fn content(
             record.viewport_in(scene.size.0, scene.size.1, near, far);
         }
 
+        // Per batch, because the scheme is baked in the pipeline the caller resolved: the flags
+        // are the batch's and so is the run.
+        let scheme = crate::pipelines::Stencil::of(
+            batch.key.draw_flags,
+            scene.draw_once.value_for(batch.key),
+        );
+
         for (geometry, slot) in batch.geometries.iter().zip(batch.ubo_indexes) {
             let (buffers, offsets) = scene.store.bindings(*geometry).ok_or(Error::NotResident {
                 geometry: *geometry,
             })?;
 
-            // Per drawable, because its tile is. Two drawables of one batch in different tiles is
-            // the ordinary case.
-            let (reference, compare) =
-                clipping(scene.joiner, scene.partition, scene.view, *geometry);
-            if compare == 0 {
-                counts.unclipped += 1;
-            }
+            // Per drawable, because its tile is -- two drawables of one batch in different tiles
+            // is the ordinary case -- except under the draw-once, whose value is the run's and is
+            // the same for every drawable of it. That is the point of it: a roof and the wall
+            // raised off it are two batches of one run and the second must see the first's mark.
+            let (reference, compare, write) = match scheme {
+                crate::pipelines::Stencil::DrawOnce => {
+                    counts.drawn_once += 1;
+                    // The field is one bit, so the value and the mask it is compared and written
+                    // through are the same number.
+                    (
+                        u32::from(DRAW_ONCE_BIT),
+                        u32::from(DRAW_ONCE_BIT),
+                        u32::from(DRAW_ONCE_BIT),
+                    )
+                }
+                crate::pipelines::Stencil::Clip => {
+                    let (reference, compare) =
+                        clipping(scene.joiner, scene.partition, scene.view, *geometry);
+                    if compare == 0 {
+                        counts.unclipped += 1;
+                    }
+                    (reference, compare, 0)
+                }
+                // The pipeline's test is off, so none of the three is read. Set anyway, because
+                // dynamic state is the command buffer's and not the pipeline's: a later draw that
+                // does test would otherwise inherit whatever this one left.
+                crate::pipelines::Stencil::Off => (0, 0, 0),
+            };
             record.stencil_reference(reference);
             record.stencil_compare_mask(compare);
+            record.stencil_write_mask(write);
 
             record.bind_vertex_buffers(0, buffers, offsets);
             if let Some(indexes) = scene.store.index_buffer(*geometry) {
@@ -494,6 +547,112 @@ fn layer_of(batch: &Batch<'_>) -> i32 {
     i32::try_from(batch.key.layer_index).unwrap_or(i32::MAX)
 }
 
+/// The bit a 3D run's draw-once mask is written over.
+///
+/// The top of the stencil byte, and a choice rather than a derivation: `stencil::partition` packs
+/// its clip fields from the low bits up, so the high bit is the one most likely to be free -- but
+/// that packing is "a choice, not a requirement" in its own words, so [`DrawOnce::of`] *checks*
+/// the assignments rather than relying on it.
+///
+/// One bit, so one run of a frame can have it. The sibling consumer reserves the same bit for the
+/// same reason and measured the cost of leaving the clip fields seven over 906 frames: no frame's
+/// fields needed the eighth.
+pub const DRAW_ONCE_BIT: u8 = 0x80;
+
+/// Which run of a frame drew with the 3D draw-once mask, and what it cost the rest.
+///
+/// mbgl allocates a fresh stencil id for every layer group with 3D features and repaints the clip
+/// masks afterwards (`vulkan/tile_layer_group.cpp`, `PaintParameters::stencilModeFor3D`). A
+/// consumer drawing the whole frame in one pass cannot repaint anything, so the value has to come
+/// out of a bit the clip masks are not using -- see [`DRAW_ONCE_BIT`] -- and there is one of those.
+///
+/// So: the first 3D run in paint order takes it, any other is drawn with no stencil at all, and
+/// [`Self::skipped`] counts those. That is a real difference from the oracle and is counted rather
+/// than hidden, which is the sibling consumer's arrangement too -- its `drawOnceSkipped` is this
+/// number.
+///
+/// # What a run is
+///
+/// `(layer_index, pass)`, which is mbgl's layer group: `TileLayerGroup::render` takes one mode for
+/// everything it draws, and it is called once per group per pass. A fill extrusion is two batches
+/// of one layer -- the roofs and the walls -- and they share the value, which is what makes a roof
+/// reject the wall that meets it rather than blending twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DrawOnce {
+    /// The value, and the run that took it as `(layer_index, pass)`.
+    taken: Option<(u8, (u32, u8))>,
+    /// How many other 3D runs wanted one and were drawn with no stencil instead.
+    pub skipped: usize,
+}
+
+impl DrawOnce {
+    /// What this frame can spend, from its batches and its clip assignments.
+    ///
+    /// `depth_orders` is [`Scene::depth`]`.is_some()`, because the answer depends on paint order
+    /// and the opaque pass is only reversed where there is no depth attachment to order it.
+    ///
+    /// Nothing is taken when no batch asks for one, and nothing is taken when the clip fields hold
+    /// [`DRAW_ONCE_BIT`] -- in `value`, in `write_mask` or in `read_mask`, because a mask writing
+    /// that bit or a drawable comparing it would read this scheme's marks as its own clip. The
+    /// fallback partition (`partitioned: false`) spends the whole byte on a value per tile, so it
+    /// leaves nothing either.
+    #[must_use]
+    pub fn of(batches: &Batches, partition: &Partition, depth_orders: bool) -> Self {
+        let free = partition.partitioned
+            && partition.tiles.values().all(|assignment| {
+                (assignment.value | assignment.read_mask | assignment.write_mask) & DRAW_ONCE_BIT
+                    == 0
+            });
+        let mut out = Self::default();
+        for at in painted(batches, depth_orders) {
+            let Some(batch) = batches.get(at) else {
+                continue;
+            };
+            if !wants_draw_once(batch.key.draw_flags) {
+                continue;
+            }
+            let run = (batch.key.layer_index, batch.key.pass);
+            // Another batch of the run that already took it is the ordinary case and costs
+            // nothing: an extrusion's roofs and its walls are two batches of one run, and the
+            // value being shared is what makes the roof reject the wall that meets it.
+            if out.taken.is_some_and(|(_, took)| took == run) {
+                continue;
+            }
+            // The first run takes the bit where the clip fields left one. Any other run, and every
+            // run in a frame whose fields took the bit, is drawn with no stencil and counted --
+            // there is one value and mbgl has as many as it needs.
+            if out.taken.is_none() && free {
+                out.taken = Some((DRAW_ONCE_BIT, run));
+            } else {
+                out.skipped += 1;
+            }
+        }
+        out
+    }
+
+    /// The value a batch draws its draw-once mask with, or `None` for one that has none.
+    ///
+    /// What [`crate::pipelines::Stencil::of`] takes, so the pipeline's scheme and the dynamic state
+    /// this module sets come from one answer rather than from two reads of the same rule.
+    #[must_use]
+    pub fn value_for(&self, key: &tessella_consume::batch::Key) -> Option<u8> {
+        let (value, run) = self.taken?;
+        (wants_draw_once(key.draw_flags) && run == (key.layer_index, key.pass)).then_some(value)
+    }
+}
+
+/// Whether a batch's flags are the pair mbgl reads for the 3D stencil.
+///
+/// `IS_3D` with `ENABLE_STENCIL`, which is `drawable.getIs3D()` and `getEnableStencil()` in
+/// `TileLayerGroup::render`. The asymmetry is required rather than incidental: an extrusion's depth
+/// prepass is `IS_3D` and carries no stencil bit, and a prepass that wrote the run's value would
+/// leave the color pass comparing `NOT_EQUAL` against its own mark at every pixel the building
+/// covers -- the layer would vanish.
+fn wants_draw_once(draw_flags: u8) -> bool {
+    const WANTED: u8 = DrawFlags::IS_3D.bits() | DrawFlags::ENABLE_STENCIL.bits();
+    draw_flags & WANTED == WANTED
+}
+
 /// A drawable's stencil reference and compare mask.
 ///
 /// `(0, 0)` when it has no mask, which is how unclipped is expressed -- see this module's own notes.
@@ -525,9 +684,9 @@ pub fn clipping(
 
 #[cfg(test)]
 mod tests {
-    use super::{DepthRange, painted};
+    use super::{DRAW_ONCE_BIT, DepthRange, DrawOnce, Partition, painted};
     use tessella_capture_abi::RenderPass;
-    use tessella_capture_abi::envelope::{GeometryId, OrderEntry};
+    use tessella_capture_abi::envelope::{DrawFlags, GeometryId, OrderEntry};
     use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
     use tessella_consume::batch::{Batches, Program, collapse_into};
 
@@ -559,6 +718,188 @@ mod tests {
             })
         });
         batches
+    }
+
+    /// Collapses with the flags each geometry's id asks for, which is what a 3D run needs.
+    ///
+    /// Every geometry is the same family, so what breaks a batch here is the flags and the layer:
+    /// `batch::Key` carries the whole byte for exactly that reason.
+    fn flagged(order: &[OrderEntry], flags: &dyn Fn(GeometryId) -> u8) -> Batches {
+        let mut batches = Batches::new();
+        collapse_into(order, &mut batches, |id| {
+            Some(Program {
+                builtin_shader: BuiltIn::FillExtrusionShader as i32,
+                permutation_key: 0,
+                draw_flags: flags(id),
+                texture_refs: &[],
+            })
+        });
+        batches
+    }
+
+    /// The flags an extrusion's color pass carries, which is the pair the draw-once reads.
+    const COLOR_3D: u8 = DrawFlags::IS_3D.bits()
+        | DrawFlags::ENABLE_STENCIL.bits()
+        | DrawFlags::ENABLE_DEPTH.bits()
+        | DrawFlags::ENABLE_COLOR.bits();
+
+    /// And its depth pass, which is 3D and asks for no stencil.
+    const DEPTH_3D: u8 = DrawFlags::IS_3D.bits() | DrawFlags::ENABLE_DEPTH.bits();
+
+    /// A partition with one tile, whose fields leave `DRAW_ONCE_BIT` alone.
+    fn partitioned(write_mask: u8) -> Partition {
+        use tessella_capture_abi::envelope::TileId;
+        use tessella_consume::stencil::Assignment;
+
+        let mut tiles = std::collections::BTreeMap::new();
+        tiles.insert(
+            TileId {
+                x: 1,
+                y: 1,
+                z: 14,
+                overscaled_z: 14,
+                wrap: 0,
+            },
+            Assignment {
+                value: 1,
+                read_mask: write_mask,
+                write_mask,
+            },
+        );
+        Partition {
+            partitioned: true,
+            tiles,
+        }
+    }
+
+    /// A frame with no 3D run spends nothing and skips nothing.
+    #[test]
+    fn a_flat_frame_takes_no_draw_once_value() {
+        let order = [entry(1, 0, RenderPass::TRANSLUCENT)];
+        let batches = flagged(&order, &|_| DrawFlags::ENABLE_STENCIL.bits());
+        let once = DrawOnce::of(&batches, &partitioned(0x0F), true);
+        assert_eq!(once, DrawOnce::default());
+        assert_eq!(
+            once.value_for(batches.get(0).expect("a batch").key),
+            None,
+            "a 2D drawable draws with its tile's clip mask, not with a run's value"
+        );
+    }
+
+    /// One run takes the bit, and every batch of that run draws with it.
+    ///
+    /// Two batches of one layer, which is what an extrusion is: the roofs and the walls. They have
+    /// to share the value -- that is what makes the wall meeting a roof fail the test rather than
+    /// blend over it -- so this is the case the whole scheme turns on.
+    #[test]
+    fn one_run_takes_the_bit_and_its_batches_share_it() {
+        let order = [
+            entry(1, 7, RenderPass::TRANSLUCENT),
+            entry(2, 7, RenderPass::TRANSLUCENT),
+        ];
+        // Two batches of one run: the flags break the run, as an extrusion's depth pass and its
+        // color pass do.
+        let batches = flagged(&order, &|id| {
+            if id.0 == 1 { DEPTH_3D } else { COLOR_3D }
+        });
+        assert_eq!(batches.len(), 2, "the flags did not break the run");
+
+        let once = DrawOnce::of(&batches, &partitioned(0x0F), true);
+        assert_eq!(once.skipped, 0);
+        let depth = batches.get(0).expect("a batch");
+        let color = batches.get(1).expect("a batch");
+        assert_eq!(
+            once.value_for(depth.key),
+            None,
+            "the depth pass asks for no stencil, and a prepass that marked the pixels would \
+             leave the color pass rejected everywhere"
+        );
+        assert_eq!(once.value_for(color.key), Some(DRAW_ONCE_BIT));
+
+        // A second color batch of the same layer and pass -- the walls beside the roofs -- draws
+        // with the same value.
+        let order = [
+            entry(3, 7, RenderPass::TRANSLUCENT),
+            entry(5, 7, RenderPass::TRANSLUCENT),
+        ];
+        let batches = flagged(&order, &|_| COLOR_3D);
+        let once = DrawOnce::of(&batches, &partitioned(0x0F), true);
+        assert_eq!(once.skipped, 0);
+        for at in 0..batches.len() {
+            assert_eq!(
+                once.value_for(batches.get(at).expect("a batch").key),
+                Some(DRAW_ONCE_BIT)
+            );
+        }
+    }
+
+    /// A second run gets nothing, and is counted rather than hidden.
+    ///
+    /// mbgl allocates a value per layer group and repaints the clip masks afterwards; one pass has
+    /// one spare bit, so the second 3D layer of a frame is drawn with no stencil at all. That is a
+    /// real difference from the oracle -- some of its pixels blend twice where its own surfaces
+    /// meet -- and the count is how a caller finds out rather than looking at the picture.
+    #[test]
+    fn a_second_run_is_skipped_and_counted() {
+        let order = [
+            entry(1, 2, RenderPass::TRANSLUCENT),
+            entry(2, 5, RenderPass::TRANSLUCENT),
+        ];
+        let batches = flagged(&order, &|_| COLOR_3D);
+        assert_eq!(batches.len(), 2, "two layers are two runs");
+
+        let once = DrawOnce::of(&batches, &partitioned(0x0F), true);
+        assert_eq!(once.skipped, 1);
+        let taken: Vec<Option<u8>> = (0..batches.len())
+            .map(|at| once.value_for(batches.get(at).expect("a batch").key))
+            .collect();
+        assert_eq!(
+            taken.iter().filter(|value| value.is_some()).count(),
+            1,
+            "two runs drew with the one value"
+        );
+    }
+
+    /// One layer in two passes is two runs, because mbgl's layer group is rendered once per pass.
+    #[test]
+    fn a_layers_two_passes_are_two_runs() {
+        let order = [
+            entry(1, 3, RenderPass::OPAQUE),
+            entry(2, 3, RenderPass::TRANSLUCENT),
+        ];
+        let batches = flagged(&order, &|_| COLOR_3D);
+        assert_eq!(batches.len(), 2, "the pass is part of the merge key");
+        let once = DrawOnce::of(&batches, &partitioned(0x0F), true);
+        assert_eq!(once.skipped, 1, "one layer, two passes, one value");
+    }
+
+    /// A frame whose clip fields hold the bit spends nothing on the draw-once.
+    ///
+    /// The clip masks come first: they are what keeps every other layer inside its tile, and a
+    /// draw-once writing over a field would erase the mask of every layer drawn after it. So a
+    /// frame whose fields reach the top bit draws its 3D run with no stencil and counts it.
+    #[test]
+    fn a_frame_whose_fields_take_the_bit_spends_nothing() {
+        let order = [entry(1, 0, RenderPass::TRANSLUCENT)];
+        let batches = flagged(&order, &|_| COLOR_3D);
+
+        for assignment in [DRAW_ONCE_BIT, DRAW_ONCE_BIT | 0x01] {
+            let once = DrawOnce::of(&batches, &partitioned(assignment), true);
+            assert_eq!(once.skipped, 1, "{assignment:#010b}");
+            assert_eq!(
+                once.value_for(batches.get(0).expect("a batch").key),
+                None,
+                "{assignment:#010b}"
+            );
+        }
+
+        // And the fallback partition, which spends the whole byte on a value per tile whatever the
+        // budget said -- so there is nothing left however its fields look.
+        let mut fallen = partitioned(0x0F);
+        fallen.partitioned = false;
+        let once = DrawOnce::of(&batches, &fallen, true);
+        assert_eq!(once.skipped, 1);
+        assert_eq!(once.value_for(batches.get(0).expect("a batch").key), None);
     }
 
     fn layers_of(batches: &Batches, order: &[usize]) -> Vec<u32> {

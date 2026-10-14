@@ -130,16 +130,30 @@ fn no_mask_is_the_whole_byte() {
 /// then compares no bits and the draw is clipped away, or writes no bits and the mask is missing.
 /// `0xFF` baked would compare every bit and draw everywhere -- a layer with no clipping, which is
 /// the failure that looks like working.
+///
+/// Every scheme, including the one that does write: what a draw-once writes is its run's value
+/// through a mask the *frame* decides, so the baked zero is as much of an answer there as it is for
+/// a content draw that writes nothing at all.
 #[test]
 fn the_pipelines_bake_no_mask() {
     use tessella_emblema::device::Attachment;
 
     for attachment in [Attachment::StencilOnly, Attachment::DepthStencil] {
-        let content =
-            pipelines::depth_stencil(attachment, pipelines::Depth::Write, pipelines::Enabled::ALL);
-        for face in [content.front, content.back] {
-            assert_eq!(face.compare_mask, 0, "a baked compare mask");
-            assert_eq!(face.write_mask, 0, "content never writes the stencil");
+        for scheme in [
+            pipelines::Stencil::Off,
+            pipelines::Stencil::Clip,
+            pipelines::Stencil::DrawOnce,
+        ] {
+            let content = pipelines::depth_stencil(
+                attachment,
+                pipelines::Depth::Write,
+                pipelines::Enabled::ALL,
+                scheme,
+            );
+            for face in [content.front, content.back] {
+                assert_eq!(face.compare_mask, 0, "{scheme:?} bakes a compare mask");
+                assert_eq!(face.write_mask, 0, "{scheme:?} bakes a write mask");
+            }
         }
     }
 
@@ -151,15 +165,23 @@ fn the_pipelines_bake_no_mask() {
     }
 }
 
-/// The content pipeline sets its compare mask per draw; the mask pipeline sets its write mask.
+/// Each pipeline declares every mask it sets, and both declare the write mask now.
 ///
-/// And neither sets the other's: a content draw that could set a write mask is a content draw that
-/// could erase the tile mask it is testing against, which is the failure `depth_stencil`'s zero
-/// write mask exists to make unreachable.
+/// # What moved, and what guards it instead
+///
+/// This asserted that a content pipeline must *not* declare the write mask, because "a content
+/// draw that could set a write mask is a content draw that could erase the tile mask it is testing
+/// against". One content draw writes: [`pipelines::Stencil::DrawOnce`] replaces its run's value
+/// where it passes, which is what makes the first surface at a pixel the only one that blends.
+///
+/// So the guarantee is no longer "the state cannot be set" but "the ops cannot write it", which is
+/// a property of the scheme rather than of the dynamic list --
+/// [`only_the_draw_once_scheme_can_write_the_stencil`] is it. That is the stronger place for it:
+/// the ops are per pipeline, so a clip draw cannot erase a mask however the dynamic mask is left.
 ///
 /// # Declared is the whole of it
 ///
-/// This asserted the opposite for the reference -- that a content pipeline must *not* declare it,
+/// This asserted the opposite for the reference too -- that a content pipeline must not declare it,
 /// because "a content draw's reference is set, but as part of the draw rather than declared here".
 /// `vkCmdSetStencilReference` is how dynamic state is set and is ignored for state a pipeline did
 /// not declare dynamic, so that sentence described a call with no effect. See
@@ -169,8 +191,8 @@ fn each_pipeline_declares_only_the_masks_it_sets() {
     let content = pipelines::CONTENT_DYNAMIC;
     assert!(content.contains(&vk::DynamicState::STENCIL_COMPARE_MASK));
     assert!(
-        !content.contains(&vk::DynamicState::STENCIL_WRITE_MASK),
-        "a content draw must not be able to write the stencil"
+        content.contains(&vk::DynamicState::STENCIL_WRITE_MASK),
+        "the draw-once writes its run's value, and which bit that is is the frame's answer"
     );
     assert!(
         content.contains(&vk::DynamicState::STENCIL_REFERENCE),
@@ -185,5 +207,92 @@ fn each_pipeline_declares_only_the_masks_it_sets() {
     for state in [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR] {
         assert!(content.contains(&state), "content misses {state:?}");
         assert!(mask.contains(&state), "the mask misses {state:?}");
+    }
+}
+
+/// Only the draw-once scheme can write the stencil, whatever the dynamic write mask says.
+///
+/// The guard that replaces "a content pipeline does not declare the write mask". A clip draw's ops
+/// are `KEEP` in all three directions, so the mask left in the command buffer cannot make it erase
+/// the tile mask it is comparing against -- which is the failure worth being unable to reach,
+/// because what it would erase is the clipping of every layer drawn after it.
+///
+/// And the draw-once writes on `pass` alone. `depthFail` matters as much as the two that are
+/// obvious: a fragment the depth test threw away was never drawn, so marking its pixel would
+/// reject the fragment that *is* drawn there and leave a hole in the building.
+#[test]
+fn only_the_draw_once_scheme_can_write_the_stencil() {
+    use tessella_emblema::device::Attachment;
+
+    for scheme in [pipelines::Stencil::Off, pipelines::Stencil::Clip] {
+        let state = pipelines::depth_stencil(
+            Attachment::DepthStencil,
+            pipelines::Depth::Write,
+            pipelines::Enabled::ALL,
+            scheme,
+        );
+        for face in [state.front, state.back] {
+            assert_eq!(
+                face.pass_op,
+                vk::StencilOp::KEEP,
+                "{scheme:?} writes on pass"
+            );
+            assert_eq!(
+                face.fail_op,
+                vk::StencilOp::KEEP,
+                "{scheme:?} writes on fail"
+            );
+            assert_eq!(
+                face.depth_fail_op,
+                vk::StencilOp::KEEP,
+                "{scheme:?} writes when the depth test fails"
+            );
+            assert_eq!(
+                face.compare_op,
+                vk::CompareOp::EQUAL,
+                "{scheme:?} compares something other than its tile's value"
+            );
+        }
+    }
+
+    let once = pipelines::depth_stencil(
+        Attachment::DepthStencil,
+        pipelines::Depth::Write,
+        pipelines::Enabled::ALL,
+        pipelines::Stencil::DrawOnce,
+    );
+    for face in [once.front, once.back] {
+        assert_eq!(
+            face.compare_op,
+            vk::CompareOp::NOT_EQUAL,
+            "the draw-once passes where the run has not marked the pixel"
+        );
+        assert_eq!(
+            face.pass_op,
+            vk::StencilOp::REPLACE,
+            "and marks it, which is what rejects the next fragment"
+        );
+        assert_eq!(face.fail_op, vk::StencilOp::KEEP);
+        assert_eq!(
+            face.depth_fail_op,
+            vk::StencilOp::KEEP,
+            "a fragment the depth test threw away must not mark the pixel it did not draw"
+        );
+    }
+
+    // And the test itself is off only for `Off`, which is how a 3D run with no value is drawn --
+    // not as a clip, which would cut a building at its tile's edge.
+    for (scheme, enabled) in [
+        (pipelines::Stencil::Off, vk::FALSE),
+        (pipelines::Stencil::Clip, vk::TRUE),
+        (pipelines::Stencil::DrawOnce, vk::TRUE),
+    ] {
+        let state = pipelines::depth_stencil(
+            Attachment::DepthStencil,
+            pipelines::Depth::Write,
+            pipelines::Enabled::ALL,
+            scheme,
+        );
+        assert_eq!(state.stencil_test_enable, enabled, "{scheme:?}");
     }
 }

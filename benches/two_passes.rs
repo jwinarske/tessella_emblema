@@ -240,6 +240,9 @@ fn draw(
             fill.blend(RenderPass::TRANSLUCENT.bits()),
             pipelines::Depth::TestOnly,
             pipelines::Enabled::ALL,
+            // Both of these fixtures' drawables carry `ENABLE_STENCIL` and neither is 3D, so
+            // both take their tile's clip mask.
+            pipelines::Stencil::Clip,
         );
         // Against the *child's* formats, which are its own: a pipeline names the formats it renders
         // into, and the child renders into its target rather than onto the screen. They happen to
@@ -287,6 +290,9 @@ fn draw(
             raster.blend(RenderPass::TRANSLUCENT.bits()),
             pipelines::Depth::TestOnly,
             pipelines::Enabled::ALL,
+            // Both of these fixtures' drawables carry `ENABLE_STENCIL` and neither is 3D, so
+            // both take their tile's clip mask.
+            pipelines::Stencil::Clip,
         );
         let pipeline = cache
             .pipeline(gpu, &key, &raster_bindings, &words, screen.targets)
@@ -451,6 +457,7 @@ fn pass(
                 sets,
                 joiner: host.joiner(),
                 partition,
+                draw_once: record::DrawOnce::default(),
                 view,
                 depth: None,
                 size: (attach.width, attach.height),

@@ -3846,6 +3846,10 @@ impl Probe<'_> {
                         // draws, not about where a tile's mask lets it.
                         record.stencil_compare_mask(0);
                         record.stencil_reference(0);
+                        // And writing nothing, which every case here wants: the write mask is
+                        // declared dynamic for the draw-once's sake, and a declared state that is
+                        // never set is undefined rather than defaulted.
+                        record.stencil_write_mask(0);
                         record.bind_vertex_buffers(0, bound.streams, bound.offsets);
                         match bound.instanced {
                             // `firstInstance` is the drawable's entry, which the body reads as
@@ -3959,6 +3963,10 @@ fn draw_case<'d>(
         // compare mask is zero -- so what this measures is the third: the one case that clears
         // `ENABLE_COLOR` reads the clear back.
         pipelines::Enabled::of(case.wire.draw_flags),
+        // No draw-once value: this probe draws one case with no masks, so a 3D drawable's stencil
+        // scheme is `Off` rather than the clip mask -- which is the right answer for a case drawn
+        // against an empty buffer, and the reason the extrusion cases read what they read.
+        pipelines::Stencil::of(case.wire.draw_flags, None),
     );
     let bindings = pipelines::bindings(found, surface);
 

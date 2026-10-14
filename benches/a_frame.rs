@@ -40,7 +40,7 @@ use std::collections::BTreeMap;
 
 use ash::vk;
 use tessella_capture_abi::RenderPass;
-use tessella_capture_abi::envelope::{GeometryId, Rect16, TileId};
+use tessella_capture_abi::envelope::{DrawFlags, GeometryId, Rect16, TileId};
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_consume::host::Host;
 use tessella_consume::upload::Upload;
@@ -453,6 +453,10 @@ fn draw(
         Ok(drawable.use_.draw_flags.bits())
     };
     let raster_state = pipelines::Enabled::of(flags_of(frame::SAMPLER)?);
+    // Read here because `flags_of` borrows the host and the plan below takes it mutably. What it
+    // is for is at the recording: these two cover the viewport rather than a tile, and the check
+    // there is that neither asks for a tile's mask.
+    let covering_flags = [flags_of(frame::ABOVE)?, flags_of(frame::SAMPLER)?];
 
     let mut cache = Cache::new();
     let fill = families::family(BuiltIn::FillShader).ok_or("no fill family")?;
@@ -502,6 +506,9 @@ fn draw(
                 fill.blend(pass.bits()),
                 pipelines::Depth::of(pass.bits(), flags),
                 pipelines::Enabled::of(flags),
+                // No 3D drawable in this fixture, so no run has a draw-once value and every
+                // drawable that asked for a stencil takes its tile's clip mask.
+                pipelines::Stencil::of(flags, None),
             );
             let pipeline = cache
                 .pipeline(gpu, &key, &bindings, &words, target.targets)
@@ -572,6 +579,7 @@ fn draw(
             raster.blend(pass.bits()),
             pipelines::Depth::of(pass.bits(), flags_of(frame::SAMPLER)?),
             raster_state,
+            pipelines::Stencil::of(flags_of(frame::SAMPLER)?, None),
         );
         let pipeline = cache
             .pipeline(gpu, &key, &raster_bindings, &words, target.targets)
@@ -693,6 +701,9 @@ fn draw(
                         sets: &sets,
                         joiner: found.joiner,
                         partition,
+                        // Nothing 3D here, which this asserts rather than assumes: a fixture that
+                        // gained an extrusion would want the run's value in the keys above too.
+                        draw_once: record::DrawOnce::default(),
                         view: frame::VIEW,
                         // The bands where the attachment has depth to put them in, which is what
                         // lets the opaque pass keep the order it arrived in. On a stencil-only
@@ -728,13 +739,27 @@ fn draw(
             counts.batches, counts.drawables, counts.draws
         ));
     }
-    // Two: the layer above and the sampling layer both cover the viewport rather than a tile, so
-    // neither has a mask. Three would mean a tile's mask went missing.
-    if counts.unclipped != 2 {
+    // None, and this wanted two until the stencil scheme split in three. The two are the layer
+    // above and the sampling layer, which cover the viewport rather than a tile -- they carry no
+    // stencil bit at all, so they are `Stencil::Off` and never ask for a mask. `unclipped` counts
+    // the drawables that *did* ask and had none, which is the case worth noticing, and anything
+    // above zero here means a tile's mask went missing.
+    if counts.unclipped != 0 {
         return Err(format!(
-            "{} drawables drew unclipped, wanted two -- the layers that cover the viewport",
+            "{} drawables asked for their tile's mask and had none",
             counts.unclipped
         ));
+    }
+    // The two that cover the viewport, pinned here rather than through the count that used to
+    // carry them: a fixture that started asking for a mask on either would clip a layer to a tile
+    // it does not belong to.
+    for (id, flags) in [frame::ABOVE, frame::SAMPLER].iter().zip(covering_flags) {
+        if flags & DrawFlags::ENABLE_STENCIL.bits() != 0 {
+            return Err(format!(
+                "geometry {} covers the viewport and asks for a tile's mask",
+                id.0
+            ));
+        }
     }
     println!(
         "  the recording         ok   {} batches, {} drawables, {} draws, {} unclipped",

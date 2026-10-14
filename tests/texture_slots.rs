@@ -7,6 +7,7 @@
 //!
 //! `tests/block_slots.rs` is the same check for the blocks.
 
+use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_capture_abi::generated::texture_slots;
 use tessella_emblema::families;
 use tessella_emblema::pipelines::{self, Kind};
@@ -119,7 +120,10 @@ fn every_texture_binding_carries_its_slot() {
 #[test]
 fn a_familys_slots_are_the_generated_tables() {
     for family in families::ALL {
-        let table = texture_slots::textures(family.shader);
+        let Some(shader) = BuiltIn::from_repr(family.shader) else {
+            continue;
+        };
+        let table = texture_slots::textures(shader);
         assert_eq!(
             family.textures.len(),
             table.len(),

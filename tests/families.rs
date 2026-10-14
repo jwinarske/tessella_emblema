@@ -16,7 +16,7 @@ fn every_family_is_keyed_by_a_distinct_shader() {
     let mut seen = BTreeSet::new();
     for entry in ALL {
         assert!(
-            seen.insert(entry.shader as i32),
+            seen.insert(entry.shader),
             "{:?} appears twice in the table",
             entry.shader
         );
@@ -36,7 +36,7 @@ fn every_family_has_a_distinct_name() {
 /// shrinking.
 #[test]
 fn drawn_and_undrawn_cover_the_enum_exactly() {
-    let drawn: BTreeSet<i32> = ALL.iter().map(|entry| entry.shader as i32).collect();
+    let drawn: BTreeSet<i32> = ALL.iter().map(|entry| entry.shader).collect();
     let undrawn: BTreeSet<i32> = UNDRAWN.iter().map(|(shader, _)| *shader as i32).collect();
     assert!(
         drawn.is_disjoint(&undrawn),
@@ -78,7 +78,7 @@ fn every_undrawn_shader_says_why() {
 #[test]
 fn the_wire_resolves_a_drawn_shader_and_skips_the_rest() {
     for entry in ALL {
-        let got = for_wire(entry.shader as i32).expect("a drawn shader resolves");
+        let got = for_wire(entry.shader).expect("a drawn shader resolves");
         assert_eq!(got.shader, entry.shader);
         assert_eq!(got.name, entry.name);
     }
@@ -167,4 +167,48 @@ fn only_the_walls_are_drawn_per_instance() {
         .filter_map(|attribute| attribute.shared_buffer)
         .collect();
     assert_eq!(shared, vec!["idFillExtrusionInstanced"; 2]);
+}
+
+/// A family is found by the id the wire carries, and the table can hold one mbgl has no name for.
+///
+/// `Family::shader` was a `BuiltIn` and is the `i32` the wire carries. For the twenty families here
+/// that is the same set of values -- every one of them is an mbgl shader and this checks it -- and
+/// what it buys is the one that is not: mbgl has no terrain, so the ground's id is tessella's own
+/// `BUILTIN_TERRAIN_SHADER`, which is 128 and past the enum's thirty-six. `BuiltIn::from_repr`
+/// answers `None` for it, so a lookup that decoded first could never find such a family however the
+/// table was written.
+///
+/// The ground is not in the table yet. What this pins is that the question can be *asked*: `for_wire`
+/// compares the id, so adding it is a table entry rather than a change to the lookup.
+#[test]
+fn a_family_is_found_by_the_id_the_wire_carries() {
+    use tessella_capture_abi::terrain_ubo::BUILTIN_TERRAIN_SHADER;
+
+    for entry in ALL {
+        let found = for_wire(entry.shader).unwrap_or_else(|| {
+            panic!(
+                "{} is in the table and {} does not find it",
+                entry.name, "for_wire"
+            )
+        });
+        assert_eq!(found.name, entry.name, "two families share an id");
+        let decoded = BuiltIn::from_repr(entry.shader)
+            .unwrap_or_else(|| panic!("{} is not one of mbgl's shaders", entry.name));
+        assert_eq!(
+            family(decoded).map(|found| found.name),
+            Some(entry.name),
+            "{} is not found by its own `BuiltIn`",
+            entry.name
+        );
+    }
+
+    assert!(
+        BuiltIn::from_repr(BUILTIN_TERRAIN_SHADER).is_none(),
+        "the ground's id is an mbgl shader after all, which would make it a `BuiltIn` family"
+    );
+    assert_eq!(
+        for_wire(BUILTIN_TERRAIN_SHADER).map(|found| found.name),
+        None,
+        "the ground is not in the table yet"
+    );
 }

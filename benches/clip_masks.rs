@@ -286,7 +286,7 @@ fn scene(device: &Open, matrix: [f32; 16]) -> Result<Scene<'_>, String> {
         .shader(&compile(FILL)?)
         .map_err(|why| format!("fill module: {why}"))?;
     let fill_key = pipelines::Key {
-        shader: BuiltIn::BackgroundShader,
+        shader: BuiltIn::BackgroundShader as i32,
         surface: tessella_emblema::surface::Surface::Plane,
         permutation: 0,
         layout: Vec::new(),

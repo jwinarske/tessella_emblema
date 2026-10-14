@@ -273,7 +273,7 @@ fn the_blend_mode_is_part_of_the_key() {
     use tessella_emblema::surface::Surface;
 
     let of = |blend| pipelines::Key {
-        shader: BuiltIn::FillShader,
+        shader: BuiltIn::FillShader as i32,
         surface: Surface::Plane,
         permutation: 0,
         layout: Vec::new(),
@@ -456,7 +456,7 @@ fn the_asked_for_state_is_part_of_the_key() {
     use tessella_emblema::surface::Surface;
 
     let of = |enabled| pipelines::Key {
-        shader: BuiltIn::FillShader,
+        shader: BuiltIn::FillShader as i32,
         surface: Surface::Plane,
         permutation: 0,
         layout: Vec::new(),

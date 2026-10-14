@@ -494,7 +494,7 @@ fn draw(
                 continue;
             }
             let key = pipelines::key(
-                BuiltIn::FillShader,
+                BuiltIn::FillShader as i32,
                 Surface::Plane,
                 plans
                     .get(&id)
@@ -509,7 +509,7 @@ fn draw(
             built.insert(flags, pipeline);
         }
         let layout = cache
-            .layout(gpu, BuiltIn::FillShader, Surface::Plane, &bindings)
+            .layout(gpu, BuiltIn::FillShader as i32, Surface::Plane, &bindings)
             .map_err(|why| format!("the fill layout: {why}"))?;
 
         // One set per layer, which is the shape `record::content` looks them up in: a batch's layer
@@ -564,7 +564,7 @@ fn draw(
                 .map_err(|why| format!("the raster does not assemble: {why:?}"))?,
         )?;
         let key = pipelines::key(
-            BuiltIn::RasterShader,
+            BuiltIn::RasterShader as i32,
             Surface::Plane,
             plans
                 .get(&frame::SAMPLER)
@@ -577,7 +577,12 @@ fn draw(
             .pipeline(gpu, &key, &raster_bindings, &words, target.targets)
             .map_err(|why| format!("the raster pipeline: {why}"))?;
         let layout = cache
-            .layout(gpu, BuiltIn::RasterShader, Surface::Plane, &raster_bindings)
+            .layout(
+                gpu,
+                BuiltIn::RasterShader as i32,
+                Surface::Plane,
+                &raster_bindings,
+            )
             .map_err(|why| format!("the raster layout: {why}"))?;
 
         // The textures it binds, as the stream named them: the `TextureRef` run straight through,

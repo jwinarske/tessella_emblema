@@ -302,7 +302,7 @@ fn measure(
             // Any family: the key's only effect on the built pipeline is its vertex layout, which
             // is empty here, so this names one rather than inventing a shader the tree does not
             // have.
-            shader: BuiltIn::FillShader,
+            shader: BuiltIn::FillShader as i32,
             surface: Surface::Plane,
             permutation: 0,
             layout: Vec::new(),

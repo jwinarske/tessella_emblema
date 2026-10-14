@@ -44,7 +44,7 @@ fn planned(stride: u32, offset: u32, source: SlabRef) -> Plan {
 #[test]
 fn the_same_drawable_twice_is_one_key() {
     let a = key(
-        BuiltIn::RasterShader,
+        BuiltIn::RasterShader as i32,
         Surface::Plane,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
@@ -52,7 +52,7 @@ fn the_same_drawable_twice_is_one_key() {
         Enabled::ALL,
     );
     let b = key(
-        BuiltIn::RasterShader,
+        BuiltIn::RasterShader as i32,
         Surface::Plane,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
@@ -66,7 +66,7 @@ fn the_same_drawable_twice_is_one_key() {
 #[test]
 fn a_different_stride_is_a_different_pipeline() {
     let a = key(
-        BuiltIn::RasterShader,
+        BuiltIn::RasterShader as i32,
         Surface::Plane,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
@@ -74,7 +74,7 @@ fn a_different_stride_is_a_different_pipeline() {
         Enabled::ALL,
     );
     let b = key(
-        BuiltIn::RasterShader,
+        BuiltIn::RasterShader as i32,
         Surface::Plane,
         &planned(16, 0, SOMEWHERE),
         Blend::Alpha,
@@ -90,7 +90,7 @@ fn a_different_stride_is_a_different_pipeline() {
 #[test]
 fn a_different_offset_within_a_vertex_is_a_different_pipeline() {
     let a = key(
-        BuiltIn::RasterShader,
+        BuiltIn::RasterShader as i32,
         Surface::Plane,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
@@ -98,7 +98,7 @@ fn a_different_offset_within_a_vertex_is_a_different_pipeline() {
         Enabled::ALL,
     );
     let b = key(
-        BuiltIn::RasterShader,
+        BuiltIn::RasterShader as i32,
         Surface::Plane,
         &planned(12, 4, SOMEWHERE),
         Blend::Alpha,
@@ -119,7 +119,7 @@ fn a_different_offset_within_a_vertex_is_a_different_pipeline() {
 fn the_surface_and_the_permutation_each_separate_a_key() {
     let base = planned(12, 0, SOMEWHERE);
     let flat = key(
-        BuiltIn::RasterShader,
+        BuiltIn::RasterShader as i32,
         Surface::Plane,
         &base,
         Blend::Alpha,
@@ -127,7 +127,7 @@ fn the_surface_and_the_permutation_each_separate_a_key() {
         Enabled::ALL,
     );
     let bent = key(
-        BuiltIn::RasterShader,
+        BuiltIn::RasterShader as i32,
         Surface::Globe,
         &base,
         Blend::Alpha,
@@ -146,7 +146,7 @@ fn the_surface_and_the_permutation_each_separate_a_key() {
         "the short plan must be short by exactly the popped attribute"
     );
     let varied = key(
-        BuiltIn::RasterShader,
+        BuiltIn::RasterShader as i32,
         Surface::Plane,
         &short,
         Blend::Alpha,
@@ -171,7 +171,7 @@ fn the_family_separates_a_key() {
     let base = planned(12, 0, SOMEWHERE);
     assert_ne!(
         key(
-            BuiltIn::RasterShader,
+            BuiltIn::RasterShader as i32,
             Surface::Plane,
             &base,
             Blend::Alpha,
@@ -179,7 +179,7 @@ fn the_family_separates_a_key() {
             Enabled::ALL
         ),
         key(
-            BuiltIn::HillshadeShader,
+            BuiltIn::HillshadeShader as i32,
             Surface::Plane,
             &base,
             Blend::Alpha,
@@ -200,7 +200,7 @@ fn where_the_bytes_live_does_not_separate_a_key() {
     };
     assert_eq!(
         key(
-            BuiltIn::RasterShader,
+            BuiltIn::RasterShader as i32,
             Surface::Plane,
             &planned(12, 0, SOMEWHERE),
             Blend::Alpha,
@@ -208,7 +208,7 @@ fn where_the_bytes_live_does_not_separate_a_key() {
             Enabled::ALL
         ),
         key(
-            BuiltIn::RasterShader,
+            BuiltIn::RasterShader as i32,
             Surface::Plane,
             &planned(12, 0, elsewhere),
             Blend::Alpha,
@@ -256,7 +256,7 @@ fn a_shorter_run_is_a_different_pipeline() {
     .expect("a partial run is not an error");
     assert_ne!(
         key(
-            BuiltIn::FillShader,
+            BuiltIn::FillShader as i32,
             Surface::Plane,
             &full,
             Blend::Alpha,
@@ -264,7 +264,7 @@ fn a_shorter_run_is_a_different_pipeline() {
             Enabled::ALL
         ),
         key(
-            BuiltIn::FillShader,
+            BuiltIn::FillShader as i32,
             Surface::Plane,
             &partial,
             Blend::Alpha,
@@ -279,7 +279,7 @@ fn a_shorter_run_is_a_different_pipeline() {
 fn the_key_caches() {
     let mut cache: HashMap<_, u32> = HashMap::new();
     let flat = key(
-        BuiltIn::RasterShader,
+        BuiltIn::RasterShader as i32,
         Surface::Plane,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
@@ -287,7 +287,7 @@ fn the_key_caches() {
         Enabled::ALL,
     );
     let strided = key(
-        BuiltIn::RasterShader,
+        BuiltIn::RasterShader as i32,
         Surface::Plane,
         &planned(16, 0, SOMEWHERE),
         Blend::Alpha,
@@ -300,7 +300,7 @@ fn the_key_caches() {
     assert_eq!(cache.get(&flat), Some(&1));
     // And looking up an equal key built separately finds the same entry.
     let again = key(
-        BuiltIn::RasterShader,
+        BuiltIn::RasterShader as i32,
         Surface::Plane,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
@@ -315,7 +315,7 @@ fn the_key_caches() {
 #[test]
 fn the_layout_records_the_format_the_table_declared() {
     let got = key(
-        BuiltIn::RasterShader,
+        BuiltIn::RasterShader as i32,
         Surface::Plane,
         &planned(12, 0, SOMEWHERE),
         Blend::Alpha,
@@ -344,7 +344,7 @@ fn the_input_rate_separates_a_key() {
     );
     assert_ne!(
         key(
-            BuiltIn::RasterShader,
+            BuiltIn::RasterShader as i32,
             Surface::Plane,
             &per_vertex,
             Blend::Alpha,
@@ -352,7 +352,7 @@ fn the_input_rate_separates_a_key() {
             Enabled::ALL
         ),
         key(
-            BuiltIn::RasterShader,
+            BuiltIn::RasterShader as i32,
             Surface::Plane,
             &per_instance,
             Blend::Alpha,

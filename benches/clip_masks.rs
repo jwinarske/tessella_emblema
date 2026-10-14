@@ -141,6 +141,30 @@ fn fragment_main() -> @location(0) vec4<f32> {
 }
 ";
 
+/// The same quad at half alpha, premultiplied, for counting blends.
+///
+/// `Blend::Alpha` is `src + dst * (1 - src.a)` over a premultiplied source, so one blend over a
+/// black clear reads 128 and two read 191. The gap is what says how many times a pixel was
+/// painted, which is the whole question the draw-once answers.
+const FILL_HALF: &str = r"
+@vertex
+fn vertex_main(@builtin(vertex_index) vertex: u32) -> @builtin(position) vec4<f32> {
+    var at = vec2<f32>(0.0, 0.0);
+    switch (vertex % 6u) {
+        case 0u, 3u: { at = vec2<f32>(-1.0, -1.0); }
+        case 1u: { at = vec2<f32>(1.0, -1.0); }
+        case 2u, 4u: { at = vec2<f32>(1.0, 1.0); }
+        default: { at = vec2<f32>(-1.0, 1.0); }
+    }
+    return vec4<f32>(at, 0.0, 1.0);
+}
+
+@fragment
+fn fragment_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.5, 0.5, 0.5, 0.5);
+}
+";
+
 fn compile(source: &str) -> Result<Vec<u32>, String> {
     let parsed = naga::front::wgsl::parse_str(source)
         .map_err(|why| format!("wgsl: {}", why.emit_to_string(source)))?;
@@ -236,6 +260,8 @@ fn placed(mut matrix: [f32; 16], x: f32, y: f32) -> [f32; 16] {
 
 struct Scene<'d> {
     depth: Depth<'d>,
+    /// The formats the pipelines were built against, so a case can build one of its own.
+    targets: Targets,
     mask_layout: pipelines::Layout<'d>,
     mask_pipeline: tessella_vk::Pipeline<'d>,
     fill_pipeline: tessella_vk::Pipeline<'d>,
@@ -295,6 +321,7 @@ fn scene(device: &Open, matrix: [f32; 16]) -> Result<Scene<'_>, String> {
         blend: pipelines::Blend::Unblended,
         depth: pipelines::Depth::Write,
         enabled: pipelines::Enabled::ALL,
+        stencil: pipelines::Stencil::Clip,
     };
     let fill_pipeline = pipelines::build(gpu, &fill_key, &mask_layout, &fill_module, targets)
         .map_err(|why| format!("fill pipeline: {why}"))?;
@@ -322,6 +349,7 @@ fn scene(device: &Open, matrix: [f32; 16]) -> Result<Scene<'_>, String> {
 
     Ok(Scene {
         depth,
+        targets,
         mask_layout,
         mask_pipeline,
         fill_pipeline,
@@ -417,6 +445,9 @@ fn mask_then_fill_masked(
                 record.bind_descriptor_set(scene.mask_layout.pipeline(), set);
                 record.stencil_reference(reference);
                 record.stencil_compare_mask(compare.unwrap_or(u32::from(given.read_mask)));
+                // A content draw writes nothing. Set rather than left, because the write mask is
+                // declared dynamic for the 3D draw-once and the mask draw above just set it.
+                record.stencil_write_mask(0);
                 record.draw(6, 1, 0);
             },
         );
@@ -584,6 +615,125 @@ fn the_mask_writes_no_color(device: &Open) -> Result<(), String> {
     Ok(())
 }
 
+/// A pixel a 3D run covers twice is blended once, and the same pixel without the scheme is not.
+///
+/// The mechanism `pipelines::Stencil::DrawOnce` is: `NOT_EQUAL` against the run's value with
+/// `REPLACE` on pass, so the first fragment at a pixel marks it and every later one of that run
+/// fails. That is what keeps a translucent building from blending where its own surfaces meet --
+/// a wall shared by two footprints, a roof meeting the wall raised off it -- which the depth
+/// buffer cannot do anything about, because those surfaces are at the *same* depth.
+///
+/// Drawn twice over a black clear at half alpha, premultiplied: one blend reads 128 and two read
+/// 191. Both arms are here, because the number on its own says nothing -- the control is the same
+/// two draws under `Stencil::Clip` with a compare mask of no bits, which is this bench's own
+/// spelling of "unclipped" and is what every extrusion drew with before.
+///
+/// The depth test is on and writing in both arms, which is the point of running it this way: the
+/// second draw is at the depth the first wrote, `LESS_OR_EQUAL` passes, and the stencil is the only
+/// thing that can tell them apart.
+///
+/// # What this case cannot reach
+///
+/// The third op. Both draws here pass the depth test, so a `depthFail` of `REPLACE` -- which would
+/// mark a pixel for a fragment that was never drawn and reject the one that is -- draws the same
+/// two numbers. `tests/stencil_masks.rs` asserts the ops field by field, and that is where that
+/// mutation is caught; this says the three of them together do what they are for.
+fn the_draw_once_blends_a_pixel_once(device: &Open) -> Result<(), String> {
+    use tessella_emblema::record::DRAW_ONCE_BIT;
+
+    let gpu = device.gpu();
+    let owned = Owned::new(gpu)?;
+    let scene = scene(device, whole())?;
+    let module = gpu
+        .shader(&compile(FILL_HALF)?)
+        .map_err(|why| format!("the half-alpha module: {why}"))?;
+
+    let key = |stencil| pipelines::Key {
+        shader: BuiltIn::BackgroundShader as i32,
+        surface: tessella_emblema::surface::Surface::Plane,
+        permutation: 0,
+        layout: Vec::new(),
+        blend: pipelines::Blend::Alpha,
+        depth: pipelines::Depth::Write,
+        enabled: pipelines::Enabled::ALL,
+        stencil,
+    };
+    let built = |stencil| {
+        pipelines::build(
+            gpu,
+            &key(stencil),
+            &scene.mask_layout,
+            &module,
+            scene.targets,
+        )
+        .map_err(|why| format!("the {stencil:?} pipeline: {why}"))
+    };
+    let once = built(pipelines::Stencil::DrawOnce)?;
+    let clip = built(pipelines::Stencil::Clip)?;
+
+    let set = scene
+        .sets
+        .get(scene.which, MASK_SHADER)
+        .ok_or("the descriptor set was not written")?;
+    let twice = |pipeline: &tessella_vk::Pipeline<'_>, reference: u32, mask: u32| {
+        device.submit(|record| {
+            target::frame(
+                record,
+                Host {
+                    image: &owned.image,
+                    view: &owned.view,
+                    width: SIDE,
+                    height: SIDE,
+                    layout: vk::ImageLayout::UNDEFINED,
+                },
+                &scene.depth,
+                Some([0.0, 0.0, 0.0, 1.0]),
+                |record| {
+                    record.bind_pipeline(pipeline.raw());
+                    record.bind_descriptor_set(scene.mask_layout.pipeline(), set);
+                    record.stencil_reference(reference);
+                    record.stencil_compare_mask(mask);
+                    record.stencil_write_mask(mask);
+                    // The same quad twice, which is what two surfaces of one building at one
+                    // pixel are: two draws of one run, not one draw of two instances.
+                    record.draw(6, 1, 0);
+                    record.draw(6, 1, 0);
+                },
+            );
+        })?;
+        read_back(device, &owned)
+    };
+
+    let marked = twice(&once, u32::from(DRAW_ONCE_BIT), u32::from(DRAW_ONCE_BIT))?;
+    // The control writes nothing and compares nothing, so both draws land.
+    let unmarked = twice(&clip, 0, 0)?;
+
+    // Both ends of the one blend, not just the upper one. A scheme that rejected *every* fragment
+    // -- `EQUAL` against a mark the run has not made yet, which is the obvious way to get the
+    // compare the wrong way round -- leaves the pixel at the clear, and a check that only asked
+    // for "fewer than two" would call that a pass. Measured: that mutation reads 0 here.
+    let blue = |found: &[u8]| i32::from(found.first().copied().unwrap_or(0));
+    if !(180..=200).contains(&blue(&unmarked)) {
+        return Err(format!(
+            "the control blended to {} where two blends are 191, so this case cannot tell one \
+             from two",
+            blue(&unmarked)
+        ));
+    }
+    if !(120..=140).contains(&blue(&marked)) {
+        return Err(format!(
+            "a pixel of the run blended to {} where one blend is 128 and two are 191",
+            blue(&marked)
+        ));
+    }
+    println!(
+        "  draw_once             ok   one blend reads {}, two read {}",
+        blue(&marked),
+        blue(&unmarked)
+    );
+    Ok(())
+}
+
 fn main() {
     let device = match Open::first() {
         Ok(device) => device,
@@ -601,6 +751,7 @@ fn main() {
         ("zero_compare", a_zero_compare_mask_draws_unclipped),
         ("whole_tile", a_whole_tile_mask_clips_nothing),
         ("no_color", the_mask_writes_no_color),
+        ("draw_once", the_draw_once_blends_a_pixel_once),
     ] {
         if let Err(why) = case(&device) {
             println!("  {name:<21} FAIL {why}");

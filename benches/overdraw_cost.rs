@@ -310,6 +310,7 @@ fn measure(
             // Every arm writes; the attachment is what turns the test off in `test-off`.
             depth: pipelines::Depth::Write,
             enabled: pipelines::Enabled::ALL,
+            stencil: pipelines::Stencil::Clip,
         };
         let pipeline = pipelines::build(gpu, &key, layout, module, targets)
             .map_err(|why| format!("{}: the pipeline: {why}", arm.name()))?;
@@ -375,6 +376,7 @@ fn draw(record: Recorder<'_>, pipeline: vk::Pipeline, arm: Arm, layers: u32) {
     // there are no clip masks here.
     record.stencil_reference(0);
     record.stencil_compare_mask(0);
+    record.stencil_write_mask(0);
     // Front to back, which is the order the opaque pass is sent in and the order the early-out
     // needs: the nearest layer first, so the ones behind it have something to be rejected by.
     for layer in 0..layers {

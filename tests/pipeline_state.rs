@@ -34,8 +34,12 @@ use tessella_emblema::pipelines;
 #[test]
 fn depth_is_tested_where_it_is_kept_and_written_by_the_opaque_pass() {
     for depth in [pipelines::Depth::Write, pipelines::Depth::TestOnly] {
-        let flat =
-            pipelines::depth_stencil(Attachment::StencilOnly, depth, pipelines::Enabled::ALL);
+        let flat = pipelines::depth_stencil(
+            Attachment::StencilOnly,
+            depth,
+            pipelines::Enabled::ALL,
+            pipelines::Stencil::Clip,
+        );
         assert_eq!(
             flat.depth_test_enable,
             vk::FALSE,
@@ -52,6 +56,7 @@ fn depth_is_tested_where_it_is_kept_and_written_by_the_opaque_pass() {
         Attachment::DepthStencil,
         pipelines::Depth::Write,
         pipelines::Enabled::ALL,
+        pipelines::Stencil::Clip,
     );
     assert_eq!(opaque.depth_test_enable, vk::TRUE);
     assert_eq!(
@@ -64,6 +69,7 @@ fn depth_is_tested_where_it_is_kept_and_written_by_the_opaque_pass() {
         Attachment::DepthStencil,
         pipelines::Depth::TestOnly,
         pipelines::Enabled::ALL,
+        pipelines::Stencil::Clip,
     );
     assert_eq!(
         translucent.depth_test_enable,
@@ -160,8 +166,12 @@ fn a_3d_drawable_writes_depth_in_either_pass() {
 #[test]
 fn the_stencil_test_is_always_on() {
     for attachment in [Attachment::StencilOnly, Attachment::DepthStencil] {
-        let state =
-            pipelines::depth_stencil(attachment, pipelines::Depth::Write, pipelines::Enabled::ALL);
+        let state = pipelines::depth_stencil(
+            attachment,
+            pipelines::Depth::Write,
+            pipelines::Enabled::ALL,
+            pipelines::Stencil::Clip,
+        );
         assert_eq!(
             state.stencil_test_enable,
             vk::TRUE,
@@ -178,8 +188,12 @@ fn the_stencil_test_is_always_on() {
 #[test]
 fn a_content_draw_does_not_write_the_stencil() {
     for attachment in [Attachment::StencilOnly, Attachment::DepthStencil] {
-        let state =
-            pipelines::depth_stencil(attachment, pipelines::Depth::Write, pipelines::Enabled::ALL);
+        let state = pipelines::depth_stencil(
+            attachment,
+            pipelines::Depth::Write,
+            pipelines::Enabled::ALL,
+            pipelines::Stencil::Clip,
+        );
         for (side, face) in [("front", state.front), ("back", state.back)] {
             assert_eq!(face.write_mask, 0, "{side} writes the mask");
             // The compare mask is dynamic now, set per draw from the tile's `read_mask`. See
@@ -273,6 +287,7 @@ fn the_blend_mode_is_part_of_the_key() {
     use tessella_emblema::surface::Surface;
 
     let of = |blend| pipelines::Key {
+        stencil: pipelines::Stencil::Clip,
         shader: BuiltIn::FillShader as i32,
         surface: Surface::Plane,
         permutation: 0,
@@ -346,16 +361,20 @@ fn dynamic_rendering_is_required() {
 /// paints its geometry over the layers under it.
 #[test]
 fn a_drawable_gets_only_the_tests_it_asked_for() {
-    let asked = |depth, stencil| pipelines::Enabled {
-        depth,
-        stencil,
-        color: true,
+    let asked = |depth| pipelines::Enabled { depth, color: true };
+    let scheme = |stencil: bool| {
+        if stencil {
+            pipelines::Stencil::Clip
+        } else {
+            pipelines::Stencil::Off
+        }
     };
 
     let none = pipelines::depth_stencil(
         Attachment::DepthStencil,
         pipelines::Depth::Write,
-        asked(false, false),
+        asked(false),
+        scheme(false),
     );
     assert_eq!(
         none.depth_test_enable,
@@ -377,7 +396,8 @@ fn a_drawable_gets_only_the_tests_it_asked_for() {
     let depth_only = pipelines::depth_stencil(
         Attachment::DepthStencil,
         pipelines::Depth::Write,
-        asked(true, false),
+        asked(true),
+        scheme(false),
     );
     assert_eq!(depth_only.depth_test_enable, vk::TRUE);
     assert_eq!(depth_only.stencil_test_enable, vk::FALSE);
@@ -385,7 +405,8 @@ fn a_drawable_gets_only_the_tests_it_asked_for() {
     let stencil_only = pipelines::depth_stencil(
         Attachment::DepthStencil,
         pipelines::Depth::Write,
-        asked(false, true),
+        asked(false),
+        scheme(true),
     );
     assert_eq!(stencil_only.depth_test_enable, vk::FALSE);
     assert_eq!(stencil_only.depth_write_enable, vk::FALSE);
@@ -397,6 +418,7 @@ fn a_drawable_gets_only_the_tests_it_asked_for() {
         Attachment::StencilOnly,
         pipelines::Depth::Write,
         pipelines::Enabled::ALL,
+        pipelines::Stencil::Clip,
     );
     assert_eq!(flat.depth_test_enable, vk::FALSE);
 }
@@ -424,7 +446,6 @@ fn a_draw_that_writes_no_color_has_an_empty_mask() {
             blend,
             pipelines::Enabled {
                 depth: true,
-                stencil: true,
                 color: false,
             },
         );
@@ -449,13 +470,18 @@ fn a_draw_that_writes_no_color_has_an_empty_mask() {
 /// the depth it leaves behind, and once with color. Keyed without this, the second draw of each
 /// would be handed the first's pipeline and either paint what should be invisible or leave invisible
 /// what should be painted.
+///
+/// The stencil scheme is in the key for the same reason and is checked here with them: all three of
+/// it are baked state, and two of them differ only in the compare op -- a key that could not tell
+/// `Clip` from `DrawOnce` would hand a building its tile's clip mask or a fill the draw-once's
+/// `NOT_EQUAL`, and the second of those draws nothing at all.
 #[test]
 fn the_asked_for_state_is_part_of_the_key() {
     use tessella_capture_abi::envelope::DrawFlags;
     use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
     use tessella_emblema::surface::Surface;
 
-    let of = |enabled| pipelines::Key {
+    let of = |enabled, stencil| pipelines::Key {
         shader: BuiltIn::FillShader as i32,
         surface: Surface::Plane,
         permutation: 0,
@@ -463,15 +489,12 @@ fn the_asked_for_state_is_part_of_the_key() {
         blend: pipelines::Blend::Alpha,
         depth: pipelines::Depth::Write,
         enabled,
+        stencil,
     };
-    let all = of(pipelines::Enabled::ALL);
+    let all = of(pipelines::Enabled::ALL, pipelines::Stencil::Clip);
     for one in [
         pipelines::Enabled {
             color: false,
-            ..pipelines::Enabled::ALL
-        },
-        pipelines::Enabled {
-            stencil: false,
             ..pipelines::Enabled::ALL
         },
         pipelines::Enabled {
@@ -479,27 +502,38 @@ fn the_asked_for_state_is_part_of_the_key() {
             ..pipelines::Enabled::ALL
         },
     ] {
-        assert_ne!(of(one), all, "{one:?} and all three must be two keys");
+        assert_ne!(
+            of(one, pipelines::Stencil::Clip),
+            all,
+            "{one:?} and both bits must be two keys"
+        );
+    }
+    for scheme in [pipelines::Stencil::Off, pipelines::Stencil::DrawOnce] {
+        assert_ne!(
+            of(pipelines::Enabled::ALL, scheme),
+            all,
+            "{scheme:?} and the clip mask must be two keys"
+        );
     }
     assert_eq!(
-        of(pipelines::Enabled::of(
-            DrawFlags::ENABLE_DEPTH.bits()
-                | DrawFlags::ENABLE_STENCIL.bits()
-                | DrawFlags::ENABLE_COLOR.bits()
-        )),
+        of(
+            pipelines::Enabled::of(DrawFlags::ENABLE_DEPTH.bits() | DrawFlags::ENABLE_COLOR.bits()),
+            pipelines::Stencil::Clip
+        ),
         all,
-        "and the three bits together are what `Enabled::ALL` is"
+        "and the two bits together are what `Enabled::ALL` is"
     );
 }
 
-/// `Enabled::of` reads its three bits out of the byte, and reads no others.
+/// `Enabled::of` reads its two bits out of the byte, and reads no others.
 ///
-/// The byte carries five, and the two that are left are not render state: `ON_TERRAIN` is a surface
-/// and `IS_3D` is the pass a drawable belongs to. A reading that took the wrong bit would turn a
-/// test off wherever a style has terrain, or write no color wherever an extrusion is drawn -- both
-/// of which draw rather than fail.
+/// The byte carries five. `ON_TERRAIN` is a surface, and `IS_3D` and `ENABLE_STENCIL` are
+/// [`pipelines::Stencil`]'s -- which is the pair that decides the stencil side and is checked in
+/// [`the_stencil_scheme_is_the_two_bits_and_the_frames_value`]. A reading that took the wrong bit
+/// would turn a test off wherever a style has terrain, or write no color wherever an extrusion is
+/// drawn -- both of which draw rather than fail.
 #[test]
-fn the_state_is_the_three_bits_and_no_others() {
+fn the_state_is_the_two_bits_and_no_others() {
     use tessella_capture_abi::envelope::DrawFlags;
 
     for byte in 0..=u8::MAX {
@@ -507,20 +541,78 @@ fn the_state_is_the_three_bits_and_no_others() {
             pipelines::Enabled::of(byte),
             pipelines::Enabled {
                 depth: byte & DrawFlags::ENABLE_DEPTH.bits() != 0,
-                stencil: byte & DrawFlags::ENABLE_STENCIL.bits() != 0,
                 color: byte & DrawFlags::ENABLE_COLOR.bits() != 0,
             },
             "{byte:#010b}"
         );
     }
 
-    // And the other two bits move nothing, whichever way the three are set.
+    // And the other three bits move nothing, whichever way the two are set.
     for byte in 0..=u8::MAX {
-        for other in [DrawFlags::IS_3D, DrawFlags::ON_TERRAIN] {
+        for other in [
+            DrawFlags::IS_3D,
+            DrawFlags::ON_TERRAIN,
+            DrawFlags::ENABLE_STENCIL,
+        ] {
             assert_eq!(
                 pipelines::Enabled::of(byte),
                 pipelines::Enabled::of(byte | other.bits()),
                 "{other:?} changed the state of {byte:#010b}"
+            );
+        }
+    }
+}
+
+/// `Stencil::of` reads the stencil bit and `IS_3D`, and the frame's answer for a 3D run.
+///
+/// The three states and nothing else, over every byte: a 2D drawable that asked gets its tile's
+/// clip mask, a 3D one that asked gets the draw-once where the frame had a value for its run and
+/// *nothing* where it did not, and a drawable that did not ask gets nothing whatever else it
+/// carries.
+///
+/// The last of those is the one worth a test of its own. A 3D run with no value must not fall back
+/// to [`pipelines::Stencil::Clip`]: a building's geometry runs past the tile that owns its
+/// footprint and the clip cuts the overhang off, which nothing else paints.
+#[test]
+fn the_stencil_scheme_is_the_two_bits_and_the_frames_value() {
+    use tessella_capture_abi::envelope::DrawFlags;
+    use tessella_emblema::pipelines::Stencil;
+
+    for byte in 0..=u8::MAX {
+        let asked = byte & DrawFlags::ENABLE_STENCIL.bits() != 0;
+        let three_d = byte & DrawFlags::IS_3D.bits() != 0;
+        for value in [None, Some(0x80)] {
+            // Written as the three questions in the order `Stencil::of` asks them, rather than as
+            // four arms: two of those arms are the same answer for different reasons -- a drawable
+            // that asked for nothing, and a 3D run the frame had nothing to give.
+            let want = if !asked {
+                Stencil::Off
+            } else if !three_d {
+                Stencil::Clip
+            } else if value.is_some() {
+                Stencil::DrawOnce
+            } else {
+                Stencil::Off
+            };
+            assert_eq!(
+                Stencil::of(byte, value),
+                want,
+                "{byte:#010b} with {value:?}"
+            );
+        }
+    }
+
+    // And the bits that are not these two move nothing.
+    for byte in 0..=u8::MAX {
+        for other in [
+            DrawFlags::ENABLE_DEPTH,
+            DrawFlags::ENABLE_COLOR,
+            DrawFlags::ON_TERRAIN,
+        ] {
+            assert_eq!(
+                Stencil::of(byte, Some(0x80)),
+                Stencil::of(byte | other.bits(), Some(0x80)),
+                "{other:?} changed the scheme of {byte:#010b}"
             );
         }
     }

@@ -127,6 +127,32 @@
 //! `terrain` reads a pixel that only the right elevation covers, and `terrain_skirt` one that only
 //! the right curtain does.
 //!
+//! # The 3D stencil, and what it moved
+//!
+//! An extrusion is drawn with mbgl's 3D scheme rather than with a tile's clip mask: no clip at all,
+//! and one `pipelines::Stencil::DrawOnce` value for the layer group, so the first surface at a
+//! pixel is the only one that blends. `record::DrawOnce` is where the frame's one value is
+//! allocated and the line above is what it reports.
+//!
+//! What it moved, measured on the three captures by reading the frame back both ways:
+//!
+//! ```text
+//! capture   no clip for 3D   and the draw-once over it   both, against the clip mask
+//! flat                                                   21,413 of 786,432 (2.7%)
+//! pitched            1,688                        1,910   3,450 (0.44%)
+//! raised             3,867                          229   3,994 (0.51%)
+//! ```
+//!
+//! The first column is one-sided -- every one of those pixels is darker, which is a building
+//! drawing where the clip was cutting it off -- and the second is not, because a pixel painted once
+//! by the surface in front is not the same color as one painted twice by both. The largest change
+//! is the flat frame, where the walls are seen edge-on and almost all of it is the draw-once: the
+//! mottling inside a city block where two footprints share a wall is gone, and the per-pixel
+//! difference is at most 41 of 255, which is one more blend of a 0.6-opacity building.
+//!
+//! No oracle here says which is right; mbgl's own scheme does, and the sibling consumer measured
+//! the clip against it -- 8 gross pixels unclipped against 161 clipped.
+//!
 //! The tile is the parity harness's own, off `serve.sh` on 8080, and has to be decompressed: the
 //! server sends it gzipped and the decoder refuses that with "wire type 7 at byte 0 is a group".
 //! `--tile-at` and `--source` are what place it; without them the tool draws the style's background
@@ -308,17 +334,22 @@ fn stage<'d>(
 
 /// A render state, as the flags it is made of.
 ///
-/// Named rather than printed through `Debug`, which is three fields of `true` and `false` in an
-/// order a reader has to look up.
-fn state(enabled: pipelines::Enabled) -> String {
+/// Named rather than printed through `Debug`, which is fields of `true` and `false` in an order a
+/// reader has to look up.
+///
+/// Off the flags byte rather than off [`pipelines::Enabled`], which carries two of the three: what
+/// the stencil bit *means* depends on `IS_3D` and on whether the frame had a value for the
+/// drawable's run, and this line is about what the producer asked for.
+fn state(draw_flags: u8) -> String {
+    let asked = |flag: DrawFlags| draw_flags & flag.bits() != 0;
     let mut parts = Vec::new();
-    if enabled.depth {
+    if asked(DrawFlags::ENABLE_DEPTH) {
         parts.push("depth");
     }
-    if enabled.stencil {
+    if asked(DrawFlags::ENABLE_STENCIL) {
         parts.push("stencil");
     }
-    if enabled.color {
+    if asked(DrawFlags::ENABLE_COLOR) {
         parts.push("color");
     }
     if parts.is_empty() {
@@ -482,9 +513,7 @@ fn run(path: &str) -> Result<(), String> {
     // answer in one frame is the whole reason it is in the key, and this frame has three.
     let mut states: BTreeMap<String, usize> = BTreeMap::new();
     for batch in frame.batches.iter() {
-        *states
-            .entry(state(pipelines::Enabled::of(batch.key.draw_flags)))
-            .or_default() += 1;
+        *states.entry(state(batch.key.draw_flags)).or_default() += 1;
     }
 
     // And how each batch composites, which is the last thing a draw needs that nothing on the wire
@@ -901,6 +930,15 @@ fn run(path: &str) -> Result<(), String> {
         .ok_or_else(|| format!("view {} planned nothing the second time", view.0))?;
     let partition = frame.clips.partition();
 
+    // Which 3D run gets the draw-once mask, which is a property of the frame and not of a batch:
+    // one bit of the stencil byte is left over when the clip fields do not need it, and the first
+    // run in paint order takes it. Computed once and read twice -- here for the keys and below for
+    // the dynamic state -- because the two have to agree about which batch is drawing with it.
+    // `true` because this bench always draws with depth bands -- `Scene::depth` below is
+    // `Some(bands)` or the run fails -- and the two have to agree: the order the batches are
+    // painted in is what decides which run is first.
+    let draw_once = record::DrawOnce::of(frame.batches, partition, true);
+
     // One program per batch key: the pipeline that batch's own state asks for, and the layout its
     // set binds through. Built here and not inside the resolver, which `record::content` takes as a
     // `&dyn Fn` and so cannot hold the device mutably.
@@ -951,6 +989,7 @@ fn run(path: &str) -> Result<(), String> {
             family.blend(batch.key.pass),
             pipelines::Depth::of(batch.key.pass, batch.key.draw_flags),
             pipelines::Enabled::of(batch.key.draw_flags),
+            pipelines::Stencil::of(batch.key.draw_flags, draw_once.value_for(batch.key)),
         );
         let module = match modules.entry((batch.key.builtin_shader, key.permutation)) {
             std::collections::btree_map::Entry::Occupied(had) => had.into_mut(),
@@ -1069,6 +1108,7 @@ fn run(path: &str) -> Result<(), String> {
                             sets: &sets,
                             joiner: frame.joiner,
                             partition,
+                            draw_once,
                             view,
                             depth: Some(bands),
                             size: (WIDTH, HEIGHT),
@@ -1106,6 +1146,19 @@ fn run(path: &str) -> Result<(), String> {
         counts.draws,
         counts.undrawn,
         counts.unclipped
+    );
+    // The 3D stencil, which is a property of the frame rather than of a batch: how many drawables
+    // drew with the one draw-once value, and how many runs wanted it and had none. A frame with no
+    // extrusion reports nothing on either count.
+    println!(
+        "  the draw-once         {}   {} drawables marked, {} runs skipped",
+        if draw_once.skipped == 0 {
+            "ok  "
+        } else {
+            "WARN"
+        },
+        counts.drawn_once,
+        draw_once.skipped
     );
     // Every batch this crate has a program for, and the ones it has none for accounted for rather
     // than ignored. A raised capture carries the ground itself -- `BUILTIN_TERRAIN_SHADER`, which

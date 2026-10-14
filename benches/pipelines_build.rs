@@ -87,6 +87,7 @@ fn key_for(family: &families::Family, surface: Surface) -> Result<Key, String> {
         blend: pipelines::Blend::Alpha,
         depth: pipelines::Depth::Write,
         enabled: pipelines::Enabled::ALL,
+        stencil: pipelines::Stencil::Clip,
     })
 }
 

@@ -96,14 +96,31 @@ pub struct Key {
     /// twelve batches carry three different values of it, and five of them ask for something other
     /// than all three.
     pub enabled: Enabled,
+    /// What the draw does with the stencil buffer: nothing, test its tile's clip mask, or the 3D
+    /// draw-once.
+    ///
+    /// In the key because all three are baked state -- the compare op, the ops and whether the
+    /// test runs at all. Derived by [`Stencil::of`] from the drawable's flags and from whether the
+    /// frame had a value to spend on its run, which is why it is a field here rather than a bit of
+    /// [`Enabled`].
+    pub stencil: Stencil,
 }
 
-/// The two tests and the color write a drawable's own flags ask for.
+/// The depth test and the color write a drawable's own flags ask for.
 ///
-/// Three of `DrawFlags`'s five bits, which travel on `ViewUse` beside the render pass and reach
+/// Two of `DrawFlags`'s five bits, which travel on `ViewUse` beside the render pass and reach
 /// here as `batch::Key::draw_flags`. They are not a property of the family or of the pass: mbgl
 /// sets them per drawable, and tessella#379 put the whole byte in the merge key because each one
 /// is pipeline state that cannot be shared across a batch boundary.
+///
+/// # The third bit is [`Stencil`]'s
+///
+/// `ENABLE_STENCIL` was a bool here, which was right while a stencil test meant one thing. It
+/// means three: mbgl reads that bit *with* `IS_3D` -- a 3D drawable asking for a stencil gets
+/// `stencilModeFor3D` and not its tile's clip mask -- and the third state is a 3D run this frame
+/// had no value left for, which tests nothing at all. One bool cannot say which, and two things
+/// deciding one piece of state is how they drift, so the whole stencil side is [`Stencil::of`]'s
+/// answer and this struct no longer carries the bit.
 ///
 /// # mbgl's three arms
 ///
@@ -123,24 +140,10 @@ pub struct Key {
 /// # The two bits that are not here
 ///
 /// `ON_TERRAIN` is a surface and is read by [`crate::surface::Surface::of`]. `IS_3D` is pipeline
-/// state in mbgl too, and it is read by [`Depth::of`] rather than here, because what it decides is
-/// the depth *write*: `vulkan/tile_layer_group.cpp:80` hands every 3D drawable in a layer group
-/// `depthModeFor3D()`, which is `{LessEqual, ReadWrite}` whatever the pass.
-///
-/// What is still **not transcribed** is that group's stencil. mbgl draws no tile clip masks for a
-/// layer group with 3D features at all; it takes one `stencilModeFor3D()` for the whole group --
-/// `NotEqual{0b11111111}` against a freshly allocated id, with a write mask of `0b11111111` and
-/// `pass: Replace`, so the first fragment at a pixel writes the id and every later one in that
-/// group is rejected. That is how a translucent building blends once where its walls overlap, and
-/// the id comes from the same counter the clip masks use, which is why mbgl says it is
-/// "potentially destroying the stencil clipping mask" and clears `tileClippingMaskIDs` so the next
-/// group redraws its own.
-///
-/// Three things here would have to move for that: a compare op and ops this crate bakes
-/// ([`depth_stencil`] is `EQUAL` with a write mask of zero), an id allocated per layer group and
-/// per pass, and the masks redrawn after such a group -- which this crate draws once before all
-/// content. It is a scheme rather than a field, and the captured frame's four extrusion batches
-/// are what will measure it.
+/// state in mbgl too, and it is read twice elsewhere: by [`Depth::of`], because it decides the
+/// depth *write* -- `vulkan/tile_layer_group.cpp:80` hands every 3D drawable in a layer group
+/// `depthModeFor3D()`, which is `{LessEqual, ReadWrite}` whatever the pass -- and by
+/// [`Stencil::of`], because it decides which stencil scheme the drawable is drawn with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Enabled {
     /// `DrawFlags::ENABLE_DEPTH`: whether the draw tests depth at all.
@@ -148,15 +151,6 @@ pub struct Enabled {
     /// [`Key::depth`] is the other half and says whether it *writes* what it tests against. This
     /// one gates both: mbgl's other arm is `DepthMode::disabled()`, which neither tests nor writes.
     pub depth: bool,
-    /// `DrawFlags::ENABLE_STENCIL`: whether the draw tests its tile's clip mask.
-    ///
-    /// Asked for rather than assumed, which is the part worth stating. mbgl's default is false and
-    /// three layers set it: the fill and the line unconditionally
-    /// (`render_fill_layer.cpp:181`, `render_line_layer.cpp:279`), and the extrusion's color pass
-    /// only where it has a depth pass to test against (`render_fill_extrusion_layer.cpp:374`). So
-    /// the captured frame's background and circle batches carry no stencil bit, and a baked test
-    /// would hold them against whichever tile's value last reached the texel.
-    pub stencil: bool,
     /// `DrawFlags::ENABLE_COLOR`: whether the draw writes color.
     ///
     /// Cleared for a draw that is there for its depth. The captured frame has two:
@@ -169,26 +163,104 @@ pub struct Enabled {
 }
 
 impl Enabled {
-    /// All three, which is what a caller with nothing to say about them means.
+    /// Both, which is what a caller with nothing to say about them means.
     ///
     /// Not a [`Default`], deliberately: `DrawFlags::NONE` is the opposite answer from the same
     /// absence of information, and the two spellings would disagree.
     pub const ALL: Self = Self {
         depth: true,
-        stencil: true,
         color: true,
     };
 
     /// What a drawable's `draw_flags` ask for.
     ///
     /// The byte whole, as `batch::Key::draw_flags` carries it. Bits this does not name are not
-    /// read: `ON_TERRAIN` is a surface, and `IS_3D` has no arm here yet.
+    /// read: `ON_TERRAIN` is a surface, `IS_3D` is [`Depth::of`]'s and [`Stencil::of`]'s, and
+    /// `ENABLE_STENCIL` is [`Stencil::of`]'s.
     #[must_use]
     pub const fn of(draw_flags: u8) -> Self {
         Self {
             depth: draw_flags & DrawFlags::ENABLE_DEPTH.bits() != 0,
-            stencil: draw_flags & DrawFlags::ENABLE_STENCIL.bits() != 0,
             color: draw_flags & DrawFlags::ENABLE_COLOR.bits() != 0,
+        }
+    }
+}
+
+/// What a draw does with the stencil buffer.
+///
+/// Three states and not two, which is mbgl's shape rather than this crate's: the stencil bit on
+/// the wire says a drawable wants the buffer, and `IS_3D` says which of the two schemes it wants.
+///
+/// # The clip mask, which is the 2D scheme
+///
+/// mbgl's default is no stencil at all and three layers ask for one: the fill and the line
+/// unconditionally (`render_fill_layer.cpp:181`, `render_line_layer.cpp:279`), and the extrusion's
+/// color pass where it has a depth pass (`render_fill_extrusion_layer.cpp:374`). A 2D drawable that
+/// asked gets `stencilModeForClipping` -- `Equal{0b11111111}` against its tile's id, write mask
+/// zero -- so the captured frame's background and circle batches, which carry no stencil bit, are
+/// not held against whichever tile's value last reached the texel.
+///
+/// # The draw-once, which is the 3D scheme
+///
+/// mbgl draws **no** tile clip masks for a layer group with 3D features
+/// (`vulkan/tile_layer_group.cpp:59-85`): it takes one `stencilModeFor3D()` for the whole group --
+/// `NotEqual{0b11111111}` against a freshly allocated id, write mask `0b11111111`, `pass: Replace`
+/// -- so the first fragment to reach a pixel writes the id and every later one in that group is
+/// rejected. One blend per pixel, which is what a translucent building needs where its surfaces
+/// meet, and it is a different thing from the clip mask in both directions:
+///
+/// * **A 3D drawable is not clipped to its tile.** A building's geometry runs past the edge of the
+///   tile that owns its footprint by design, and nothing else paints what the clip cuts -- the
+///   neighboring tile carries no copy of that building. The sibling consumer measured it against
+///   the oracle: 8 gross pixels unclipped against 161 clipped, and 1 against 64 in the worst
+///   region.
+/// * **The depth buffer cannot do this job.** It does most of it: the extrusion's depth prepass
+///   writes the nearest surface and the color pass tests `LessEqual`, which is why this crate drew
+///   buildings correctly without the draw-once at all. What is left is the surfaces depth cannot
+///   separate because they are at the *same* depth -- a wall shared by two footprints, a roof
+///   meeting the wall raised off it -- and those blend twice. Measured here: taking the clip off
+///   the captured pitched frame's extrusions moves 1,688 pixels, and the draw-once over that moves
+///   1,910 more.
+///
+/// # Why the id is one bit here and the whole byte there
+///
+/// mbgl repaints the stencil before each layer group, so it can spend every bit on the group it is
+/// drawing and clears `tileClippingMaskIDs` to say the clip masks are gone. This crate draws every
+/// mask once before all content -- one pass, no repaint -- so a value written over the clip fields
+/// would destroy the masks of every layer after it. [`crate::record::DrawOnce`] takes a bit the
+/// clip fields left alone instead, which is one run of one frame; a second 3D run tests nothing and
+/// is counted. The sibling consumer reserves the same bit for the same reason and measured the
+/// cost over 906 frames: no frame's clip fields needed the eighth bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Stencil {
+    /// No test and no write: the drawable asked for none, or is a 3D run with no value to spend.
+    #[default]
+    Off,
+    /// Its tile's clip mask: `EQUAL` against the tile's value, writing nothing.
+    Clip,
+    /// The 3D draw-once: `NOT_EQUAL` against the run's own value, replacing it where it passes.
+    DrawOnce,
+}
+
+impl Stencil {
+    /// Which scheme a drawable's flags and its frame's spare value ask for.
+    ///
+    /// `draw_flags` is `batch::Key::draw_flags`, the byte whole. `draw_once` is the value this
+    /// frame allocated for this drawable's run, from [`crate::record::DrawOnce::value_for`], and
+    /// `None` is both "not a 3D run" and "a 3D run this frame had no value for" -- a 3D drawable
+    /// gets [`Self::Off`] either way, because what it must not get is its tile's clip mask.
+    #[must_use]
+    pub const fn of(draw_flags: u8, draw_once: Option<u8>) -> Self {
+        if draw_flags & DrawFlags::ENABLE_STENCIL.bits() == 0 {
+            return Self::Off;
+        }
+        if draw_flags & DrawFlags::IS_3D.bits() != 0 {
+            match draw_once {
+                Some(_) => Self::DrawOnce,
+                None => Self::Off,
+            }
+        } else {
+            Self::Clip
         }
     }
 }
@@ -262,6 +334,7 @@ pub fn key(
     blend: Blend,
     depth: Depth,
     enabled: Enabled,
+    stencil: Stencil,
 ) -> Key {
     Key {
         shader,
@@ -270,6 +343,7 @@ pub fn key(
         blend,
         depth,
         enabled,
+        stencil,
         layout: plan
             .bound
             .iter()
@@ -702,13 +776,22 @@ pub struct Targets {
 /// agreeing, and this is the same shape as `maxPerStageDescriptor*` -- invalid usage that no driver
 /// has to report. The declaration is the fix; the bench cannot be.
 ///
-/// The *write* mask is not here. A content draw never writes the stencil, so zero is baked and
-/// cannot be set wrong at a call site.
-pub const CONTENT_DYNAMIC: [vk::DynamicState; 4] = [
+/// # And the write mask, which one scheme uses and the other does not
+///
+/// It was not here, because "a content draw never writes the stencil, so zero is baked and cannot
+/// be set wrong at a call site". One does: [`Stencil::DrawOnce`] replaces its run's value where it
+/// passes, over the one bit the clip fields left alone -- and which bit that is is a property of
+/// the *frame*'s partition, not of the pipeline. Baked, it would be a pipeline per frame whose
+/// fields moved; declared, it is one `vkCmdSetStencilWriteMask` a batch beside the two calls that
+/// are already made per drawable.
+///
+/// A [`Stencil::Clip`] draw sets it to zero, which is the same statement the baked zero made.
+pub const CONTENT_DYNAMIC: [vk::DynamicState; 5] = [
     vk::DynamicState::VIEWPORT,
     vk::DynamicState::SCISSOR,
     vk::DynamicState::STENCIL_COMPARE_MASK,
     vk::DynamicState::STENCIL_REFERENCE,
+    vk::DynamicState::STENCIL_WRITE_MASK,
 ];
 
 /// The depth and stencil state a content draw gets.
@@ -721,22 +804,39 @@ pub const CONTENT_DYNAMIC: [vk::DynamicState; 4] = [
 /// the stencil buffer is for, and a drawable that covers the viewport rather than a tile has no
 /// mask of its own to test.
 ///
-/// `KEEP` on every stencil op and `EQUAL` as the compare: a content draw reads the mask and does not
-/// write it. Whoever draws the masks sets its own stencil state, which is a later slice -- this is
-/// the state the *content* pipelines want.
+/// And the **scheme** ([`Stencil`]), which is the stencil side whole: whether the test runs, what
+/// it compares with, and whether it writes. A clip draw reads its tile's mask and does not write
+/// it -- `EQUAL` with `KEEP` on every op -- and the 3D draw-once compares `NOT_EQUAL` against its
+/// run's value and `REPLACE`s it where it passes, which is what makes the first fragment at a pixel
+/// the only one. Whoever draws the masks sets its own state; see [`depth_stencil_write`].
 pub fn depth_stencil(
     attachment: Attachment,
     depth: Depth,
     enabled: Enabled,
+    stencil: Stencil,
 ) -> vk::PipelineDepthStencilStateCreateInfo<'static> {
+    let once = matches!(stencil, Stencil::DrawOnce);
     let keep = vk::StencilOpState {
         fail_op: vk::StencilOp::KEEP,
-        pass_op: vk::StencilOp::KEEP,
+        // The draw-once writes its run's value where the fragment passes both tests, and that
+        // write is the whole mechanism: the next fragment at the same pixel compares equal and is
+        // rejected. `depth_fail_op` stays `KEEP` with it -- a fragment the depth test threw away
+        // was never drawn, and marking the pixel for it would reject the one that is.
+        pass_op: if once {
+            vk::StencilOp::REPLACE
+        } else {
+            vk::StencilOp::KEEP
+        },
         depth_fail_op: vk::StencilOp::KEEP,
-        compare_op: vk::CompareOp::EQUAL,
+        compare_op: if once {
+            vk::CompareOp::NOT_EQUAL
+        } else {
+            vk::CompareOp::EQUAL
+        },
         compare_mask: CONTENT_COMPARE_MASK,
-        // A content draw never writes, so this is baked rather than dynamic: zero at a call site
-        // that cannot set it is one fewer thing to get wrong.
+        // Dynamic, because which bit a draw-once writes is the frame's partition's answer rather
+        // than the pipeline's. Zero baked for the reason it was baked when nothing wrote at all:
+        // a draw that never sets it writes nothing.
         write_mask: 0,
         reference: 0,
     };
@@ -753,10 +853,16 @@ pub fn depth_stencil(
         // writing, so a translucent layer does not occlude the one painted in front of it.
         .depth_write_enable(kept && matches!(depth, Depth::Write))
         .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
-        // And the mask is tested only by a draw that is clipped to a tile. A drawable covering the
-        // viewport carries no `ENABLE_STENCIL` and has no mask of its own, so a baked test would
-        // hold it against whichever tile's value last reached the texel.
-        .stencil_test_enable(enabled.stencil)
+        // And the test runs only for a draw that asked for one. A drawable covering the viewport
+        // carries no `ENABLE_STENCIL` and has no mask of its own, so a baked test would hold it
+        // against whichever tile's value last reached the texel -- and a 3D run with no value to
+        // spend is the other way the scheme is `Off`, which must not fall back to the clip mask.
+        //
+        // `NOT_EQUAL` is why that one cannot be expressed as a compare mask of zero the way an
+        // unassigned tile is: a mask of zero makes both sides zero, which `EQUAL` passes
+        // everywhere and `NOT_EQUAL` fails everywhere. The layer would vanish rather than draw
+        // unclipped.
+        .stencil_test_enable(!matches!(stencil, Stencil::Off))
         .front(keep)
         .back(keep)
 }
@@ -925,7 +1031,7 @@ pub fn build<'d>(
     let raster = rasterization();
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-    let depth = depth_stencil(targets.attachment, key.depth, key.enabled);
+    let depth = depth_stencil(targets.attachment, key.depth, key.enabled, key.stencil);
     let attachments = [color_attachment(key.blend, key.enabled)];
     let blending = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
 

@@ -40,10 +40,10 @@
 //! capture stream through `Joiner` and `Batches` and draws them through `record::content`. So this
 //! says a family draws right when it is set up right, and not that a stream sets it up right.
 //!
-//! And one driver quirk is lost with the probe's own pipeline: it compiled the SPIR-V into a module
-//! per stage, because Adreno rejects a module with two entry points. `pipelines::build` uses one
-//! module for both, so this no longer runs on the sa8155p -- which is the library's gap rather than
-//! the bench's, and is tracked as #85.
+//! One driver quirk the probe used to carry by hand is the library's now: it compiled the SPIR-V
+//! into a module per stage, because Adreno refuses a pipeline whose two stages name one module.
+//! `pipelines::Stages` is where that lives, so this runs on the sa8155p again without a workaround
+//! of its own -- #85.
 //!
 //! # A case has to be sensitive to what it claims to read
 //!
@@ -817,7 +817,7 @@ fn run() -> Result<usize, String> {
         println!("  {:<18} {drawn:?}", case.name);
     }
     println!(
-        "  through the library: {} pipelines from {} modules, {} binds",
+        "  through the library: {} pipelines from {} module handles, {} binds",
         cache.built(),
         cache.modules(),
         cache.bound()

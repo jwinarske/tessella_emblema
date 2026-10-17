@@ -11,7 +11,7 @@ use tessella_capture_abi::envelope::Topology;
 use tessella_capture_abi::envelope::{AttributeDesc, SlabRef};
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_capture_abi::generated::shader_attributes::{FILL_SHADER, RASTER_SHADER};
-use tessella_emblema::pipelines::{Blend, Depth, Enabled, Stencil, key};
+use tessella_emblema::pipelines::{Blend, Depth, Enabled, Stages, Stencil, key, stage_infos};
 use tessella_emblema::surface::Surface;
 use tessella_emblema::vertices::{Plan, plan, plan_instanced};
 
@@ -440,5 +440,42 @@ fn the_input_rate_separates_a_key() {
             Stencil::Clip,
         ),
         "one advances per vertex and one per instance"
+    );
+}
+
+/// Each stage names its own module, and the right one.
+///
+/// A pipeline whose two stages name one module builds nowhere on the sa8155p -- #85 -- and the
+/// arrangement that gets past it is a handle per stage. Nothing in a frame can show which handle
+/// a stage was given: every other device takes either, so a builder that named the vertex module
+/// twice would draw correctly here and build no pipeline at all there.
+///
+/// So the check is on the stage descriptions rather than on a pipeline, from two handles invented
+/// for the purpose -- which is also why it needs no device.
+#[test]
+fn each_stage_names_its_own_module() {
+    use ash::vk::Handle as _;
+
+    let stages = Stages {
+        vertex: ash::vk::ShaderModule::from_raw(0x5e1f),
+        fragment: ash::vk::ShaderModule::from_raw(0xf00d),
+    };
+    let infos = stage_infos(stages);
+
+    assert_eq!(infos[0].stage, ash::vk::ShaderStageFlags::VERTEX);
+    assert_eq!(
+        infos[0].module.as_raw(),
+        0x5e1f,
+        "the vertex stage was handed the other module"
+    );
+    assert_eq!(infos[1].stage, ash::vk::ShaderStageFlags::FRAGMENT);
+    assert_eq!(
+        infos[1].module.as_raw(),
+        0xf00d,
+        "the fragment stage was handed the other module"
+    );
+    assert_ne!(
+        infos[0].module, infos[1].module,
+        "both stages named one module, which is the defect itself"
     );
 }

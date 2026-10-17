@@ -1073,10 +1073,86 @@ pub fn rasterization() -> vk::PipelineRasterizationStateCreateInfo<'static> {
 const VERTEX_ENTRY: &core::ffi::CStr = c"vertex_main";
 const FRAGMENT_ENTRY: &core::ffi::CStr = c"fragment_main";
 
+/// The modules a pipeline's two stages are taken from.
+///
+/// Two handles rather than one, and they may be the same words: `crate::shaders::module` emits one
+/// text with both entry points, so a caller compiles once and creates the module twice.
+///
+/// Why two: on the sa8155p's Adreno 640 no pipeline builds when both stages name one module, and
+/// `benches/first_pixel.rs` compiled the SPIR-V into a module per stage to get past that, with the
+/// reason beside it, until the pipelines moved here. Which half the driver objects to -- the shared
+/// handle or the two entry points in the words -- is not established; what was measured is that a
+/// module per stage builds where one named twice does not. #85.
+///
+/// Nothing is paid for it at run time: the second `vkCreateShaderModule` is once per family,
+/// surface and permutation, and the pipeline it builds is the same pipeline. RADV and V3D take
+/// either arrangement, and the benches read the same pixels after this as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stages {
+    /// Where the vertex stage's `vertex_main` is read from.
+    pub vertex: vk::ShaderModule,
+    /// Where the fragment stage's `fragment_main` is read from.
+    pub fragment: vk::ShaderModule,
+}
+
+impl Stages {
+    /// The pair [`stage_modules`] made, in the order it made them.
+    ///
+    /// Handles rather than the modules themselves, because that is all a pipeline's stage takes
+    /// and a pipeline keeps no reference to a module once it is built. The caller holding the pair
+    /// is what keeps them alive for the call.
+    #[must_use]
+    pub fn of(held: &[tessella_vk::ShaderModule<'_>; 2]) -> Self {
+        Self {
+            vertex: held[0].raw(),
+            fragment: held[1].raw(),
+        }
+    }
+}
+
+/// The two stage descriptions a pipeline is built from, each naming its own module.
+///
+/// Its own, which is the whole of [`Stages`]: a pipeline whose stages name one module builds
+/// nowhere on the sa8155p. Separated from [`build`] because that is what lets it be checked
+/// without a device -- `tests/pipelines.rs` reads the pair back from two handles it invents, and a
+/// builder that named one of them twice would fail there rather than on a board.
+pub fn stage_infos(stages: Stages) -> [vk::PipelineShaderStageCreateInfo<'static>; 2] {
+    [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(stages.vertex)
+            .name(VERTEX_ENTRY),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(stages.fragment)
+            .name(FRAGMENT_ENTRY),
+    ]
+}
+
+/// One module per stage, from one compile.
+///
+/// The words are the same words twice: see [`Stages`] for why there are two handles at all. A
+/// caller that holds its own modules -- a bench, or a cache of its own -- keeps the pair this
+/// returns and hands it over with [`Stages::of`].
+///
+/// # Errors
+///
+/// [`Error::Device`] when the device refuses the module. Both are created here, so a device that
+/// refused the second leaves neither behind.
+pub fn stage_modules<'d>(
+    gpu: Gpu<'d>,
+    words: &[u32],
+) -> Result<[tessella_vk::ShaderModule<'d>; 2], Error> {
+    let vertex = gpu.shader(words)?;
+    let fragment = gpu.shader(words)?;
+    Ok([vertex, fragment])
+}
+
 /// Builds the pipeline a key describes, against the targets given.
 ///
-/// Both stages come from one module, which is what `shaders::module` assembles: one text, two entry
-/// points. The same handle is named twice rather than compiled twice.
+/// Both stages come from one *text*, which is what `shaders::module` assembles: one module source
+/// with two entry points. They are given two module handles rather than one, for the reason
+/// [`Stages`] records -- Adreno refuses a pipeline whose stages name the same module.
 ///
 /// Everything not derived from the key is a decision with a reason beside it --
 /// [`depth_stencil`], [`Blend::attachment`], [`rasterization`], and the dynamic viewport and
@@ -1111,7 +1187,7 @@ pub fn build<'d>(
     gpu: Gpu<'d>,
     key: &Key,
     layout: &Layout<'_>,
-    module: &tessella_vk::ShaderModule<'_>,
+    stages_from: Stages,
     targets: Targets,
 ) -> Result<tessella_vk::Pipeline<'d>, Error> {
     let input = vertex_input(key)?;
@@ -1119,16 +1195,7 @@ pub fn build<'d>(
         .vertex_binding_descriptions(&input.bindings)
         .vertex_attribute_descriptions(&input.attributes);
 
-    let stages = [
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(module.raw())
-            .name(VERTEX_ENTRY),
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(module.raw())
-            .name(FRAGMENT_ENTRY),
-    ];
+    let stages = stage_infos(stages_from);
     let assembly =
         vk::PipelineInputAssemblyStateCreateInfo::default().topology(topology(key.topology));
     // Counts without pointers: the values are set per draw, so only the counts are baked.
@@ -1295,20 +1362,11 @@ pub const MASK_DYNAMIC: [vk::DynamicState; 4] = [
 pub fn build_mask<'d>(
     gpu: Gpu<'d>,
     layout: &Layout<'_>,
-    module: &tessella_vk::ShaderModule<'_>,
+    stages_from: Stages,
     targets: Targets,
 ) -> Result<tessella_vk::Pipeline<'d>, Error> {
     let empty = vk::PipelineVertexInputStateCreateInfo::default();
-    let stages = [
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(module.raw())
-            .name(VERTEX_ENTRY),
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(module.raw())
-            .name(FRAGMENT_ENTRY),
-    ];
+    let stages = stage_infos(stages_from);
     let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
     let viewport = vk::PipelineViewportStateCreateInfo::default()
@@ -1370,7 +1428,8 @@ pub fn build_mask<'d>(
 /// the style's own size and stops, and [`Cache::len`] is what a caller watches to find out it was
 /// wrong about that.
 pub struct Cache<'d> {
-    modules: HashMap<(i32, Surface, u64), tessella_vk::ShaderModule<'d>>,
+    /// Two modules per text, one for each stage to name, for the reason [`Stages`] records.
+    modules: HashMap<(i32, Surface, u64), [tessella_vk::ShaderModule<'d>; 2]>,
     layouts: HashMap<(i32, Surface), Layout<'d>>,
     pipelines: HashMap<Key, tessella_vk::Pipeline<'d>>,
     built: usize,
@@ -1419,10 +1478,15 @@ impl<'d> Cache<'d> {
         self.pipelines.is_empty()
     }
 
-    /// How many modules are held, which is at most one per family, surface and permutation.
+    /// How many module *handles* are held, which is two per family, surface and permutation.
+    ///
+    /// Two because a pipeline's stages may not name the same module on every driver -- [`Stages`]
+    /// says which and why. Counting handles rather than texts is what makes that visible from
+    /// outside: a cache that had gone back to one module for both stages would report half of
+    /// this, and `benches/pipelines_build.rs` reads the number.
     #[must_use]
     pub fn modules(&self) -> usize {
-        self.modules.len()
+        self.modules.len() * 2
     }
 
     /// How many pipelines have been built, across the cache's life.
@@ -1494,12 +1558,13 @@ impl<'d> Cache<'d> {
         let text = (key.shader, key.surface, key.permutation);
         let at = (key.shader, key.surface);
         if let std::collections::hash_map::Entry::Vacant(slot) = self.modules.entry(text) {
-            slot.insert(gpu.shader(words)?);
+            slot.insert(stage_modules(gpu, words)?);
         }
         if let std::collections::hash_map::Entry::Vacant(slot) = self.layouts.entry(at) {
             slot.insert(layout(gpu, bindings)?);
         }
-        let pipeline = build(gpu, key, &self.layouts[&at], &self.modules[&text], targets)?;
+        let stages = Stages::of(&self.modules[&text]);
+        let pipeline = build(gpu, key, &self.layouts[&at], stages, targets)?;
         let raw = pipeline.raw();
         self.pipelines.insert(key.clone(), pipeline);
         self.built += 1;

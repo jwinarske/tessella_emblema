@@ -261,10 +261,9 @@ fn run(open: &Open) -> Result<(), String> {
     for (work, repeats) in WORK {
         println!("fragment work: {work} rounds, {repeats} frames a submission");
         let words = compile(work).map_err(|why| format!("the module: {why}"))?;
-        let module = gpu
-            .shader(&words)
+        let modules = pipelines::stage_modules(gpu, &words)
             .map_err(|why| format!("the shader module: {why}"))?;
-        let rows = measure(open, gpu, &image, &view, &layout, &module, repeats)?;
+        let rows = measure(open, gpu, &image, &view, &layout, &modules, repeats)?;
         report(&rows, repeats);
         println!();
     }
@@ -278,7 +277,7 @@ fn measure(
     image: &tessella_vk::Image<'_>,
     view: &tessella_vk::ImageView<'_>,
     layout: &pipelines::Layout<'_>,
-    module: &tessella_vk::ShaderModule<'_>,
+    modules: &[tessella_vk::ShaderModule<'_>; 2],
     repeats: u32,
 ) -> Result<Vec<(Arm, u32, Duration)>, String> {
     // Every arm's state built up front, because the sample loop interleaves them. Measuring one
@@ -314,7 +313,7 @@ fn measure(
             enabled: pipelines::Enabled::ALL,
             stencil: pipelines::Stencil::Clip,
         };
-        let pipeline = pipelines::build(gpu, &key, layout, module, targets)
+        let pipeline = pipelines::build(gpu, &key, layout, pipelines::Stages::of(modules), targets)
             .map_err(|why| format!("{}: the pipeline: {why}", arm.name()))?;
         built.push((arm, depth, pipeline));
     }

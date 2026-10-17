@@ -655,11 +655,15 @@ fn draw(
     }];
     let mask_layout =
         pipelines::layout(gpu, &mask_bindings).map_err(|why| format!("the mask layout: {why}"))?;
-    let mask_module = gpu
-        .shader(&compile(masks::BODY)?)
+    let mask_modules = pipelines::stage_modules(gpu, &compile(masks::BODY)?)
         .map_err(|why| format!("the mask module: {why}"))?;
-    let mask_pipeline = pipelines::build_mask(gpu, &mask_layout, &mask_module, target.targets)
-        .map_err(|why| format!("the mask pipeline: {why}"))?;
+    let mask_pipeline = pipelines::build_mask(
+        gpu,
+        &mask_layout,
+        pipelines::Stages::of(&mask_modules),
+        target.targets,
+    )
+    .map_err(|why| format!("the mask pipeline: {why}"))?;
     let mask_set = sets
         .write(
             &mask_layout,

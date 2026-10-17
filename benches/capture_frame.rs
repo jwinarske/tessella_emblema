@@ -993,11 +993,15 @@ fn run(path: &str) -> Result<(), String> {
     }];
     let mask_layout =
         pipelines::layout(gpu, &mask_bindings).map_err(|why| format!("the mask layout: {why}"))?;
-    let mask_module = gpu
-        .shader(&compile(masks::BODY)?)
+    let mask_modules = pipelines::stage_modules(gpu, &compile(masks::BODY)?)
         .map_err(|why| format!("the mask module: {why}"))?;
-    let mask_pipeline = pipelines::build_mask(gpu, &mask_layout, &mask_module, screen.targets)
-        .map_err(|why| format!("the mask pipeline: {why}"))?;
+    let mask_pipeline = pipelines::build_mask(
+        gpu,
+        &mask_layout,
+        pipelines::Stages::of(&mask_modules),
+        screen.targets,
+    )
+    .map_err(|why| format!("the mask pipeline: {why}"))?;
     let mask_set = sets
         .write(
             &mask_layout,
@@ -1033,7 +1037,7 @@ fn run(path: &str) -> Result<(), String> {
     // constant in different places read different uniforms and are different text. The pipeline is
     // per key on top of that, which is where the surface, the blend, the pass and the drawable's own
     // state come in.
-    let mut modules: BTreeMap<(i32, u64), tessella_vk::ShaderModule<'_>> = BTreeMap::new();
+    let mut modules: BTreeMap<(i32, u64), [tessella_vk::ShaderModule<'_>; 2]> = BTreeMap::new();
     let mut built: Vec<tessella_vk::Pipeline<'_>> = Vec::new();
     let mut resolved: BTreeMap<ProgramKey, record::Program> = BTreeMap::new();
     let mut undrawable = Vec::new();
@@ -1084,14 +1088,19 @@ fn run(path: &str) -> Result<(), String> {
                 let source = family
                     .module(*surface, &plan.absent)
                     .map_err(|why| format!("{} does not assemble: {why:?}", family.name))?;
-                let module = gpu
-                    .shader(&compile(&source)?)
+                let module = pipelines::stage_modules(gpu, &compile(&source)?)
                     .map_err(|why| format!("{}: the module: {why}", family.name))?;
                 empty.insert(module)
             }
         };
-        let pipeline = pipelines::build(gpu, &key, layout, module, screen.targets)
-            .map_err(|why| format!("{} on layer {layer}: the pipeline: {why}", family.name))?;
+        let pipeline = pipelines::build(
+            gpu,
+            &key,
+            layout,
+            pipelines::Stages::of(module),
+            screen.targets,
+        )
+        .map_err(|why| format!("{} on layer {layer}: the pipeline: {why}", family.name))?;
 
         // And the group-one set per drawable, for the one family whose attributes advance per
         // instance: its slot cannot ride `firstInstance`, which also addresses the instance-rate

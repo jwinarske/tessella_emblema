@@ -1315,11 +1315,28 @@ impl<'c> Recorder<'c> {
     ///
     /// `UINT16`, because that is what the producer sends: a bucket's indices address one tile's
     /// vertices and `EXTENT` is 8192, so sixteen bits is more than the range needs.
+    ///
+    /// An authored mesh is the exception -- its indices are the asset's and address its own
+    /// vertices, of which there may be more than 65,536 -- and [`Self::bind_index_buffer_32`] is
+    /// what binds those. Two methods rather than an argument, so the ordinary call cannot pass the
+    /// wrong width by passing nothing.
     pub fn bind_index_buffer(&self, buffer: vk::Buffer) {
         // SAFETY: the command buffer is recording and the buffer belongs to this device.
         unsafe {
             self.device
                 .cmd_bind_index_buffer(self.raw, buffer, 0, vk::IndexType::UINT16);
+        }
+    }
+
+    /// Binds the index buffer, as 32-bit indices.
+    ///
+    /// For an authored mesh, whose indices are the asset's: see [`Self::bind_index_buffer`] for
+    /// why everything else is sixteen bits.
+    pub fn bind_index_buffer_32(&self, buffer: vk::Buffer) {
+        // SAFETY: the command buffer is recording and the buffer belongs to this device.
+        unsafe {
+            self.device
+                .cmd_bind_index_buffer(self.raw, buffer, 0, vk::IndexType::UINT32);
         }
     }
 

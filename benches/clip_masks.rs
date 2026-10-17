@@ -302,15 +302,18 @@ fn scene(device: &Open, matrix: [f32; 16]) -> Result<Scene<'_>, String> {
     }];
     let mask_layout = pipelines::layout(gpu, &bindings).map_err(|why| format!("layout: {why}"))?;
 
-    let mask_module = gpu
-        .shader(&compile(tessella_emblema::masks::BODY)?)
+    let mask_modules = pipelines::stage_modules(gpu, &compile(tessella_emblema::masks::BODY)?)
         .map_err(|why| format!("mask module: {why}"))?;
-    let mask_pipeline = pipelines::build_mask(gpu, &mask_layout, &mask_module, targets)
-        .map_err(|why| format!("mask pipeline: {why}"))?;
+    let mask_pipeline = pipelines::build_mask(
+        gpu,
+        &mask_layout,
+        pipelines::Stages::of(&mask_modules),
+        targets,
+    )
+    .map_err(|why| format!("mask pipeline: {why}"))?;
 
     // The content pipeline: the key carries no vertex input, because the fill builds its own quad.
-    let fill_module = gpu
-        .shader(&compile(FILL)?)
+    let fill_modules = pipelines::stage_modules(gpu, &compile(FILL)?)
         .map_err(|why| format!("fill module: {why}"))?;
     let fill_key = pipelines::Key {
         shader: BuiltIn::BackgroundShader as i32,
@@ -325,8 +328,14 @@ fn scene(device: &Open, matrix: [f32; 16]) -> Result<Scene<'_>, String> {
         enabled: pipelines::Enabled::ALL,
         stencil: pipelines::Stencil::Clip,
     };
-    let fill_pipeline = pipelines::build(gpu, &fill_key, &mask_layout, &fill_module, targets)
-        .map_err(|why| format!("fill pipeline: {why}"))?;
+    let fill_pipeline = pipelines::build(
+        gpu,
+        &fill_key,
+        &mask_layout,
+        pipelines::Stages::of(&fill_modules),
+        targets,
+    )
+    .map_err(|why| format!("fill pipeline: {why}"))?;
 
     // One matrix, in a block the mask indexes by instance.
     let which = Which {
@@ -646,8 +655,7 @@ fn the_draw_once_blends_a_pixel_once(device: &Open) -> Result<(), String> {
     let gpu = device.gpu();
     let owned = Owned::new(gpu)?;
     let scene = scene(device, whole())?;
-    let module = gpu
-        .shader(&compile(FILL_HALF)?)
+    let modules = pipelines::stage_modules(gpu, &compile(FILL_HALF)?)
         .map_err(|why| format!("the half-alpha module: {why}"))?;
 
     let key = |stencil| pipelines::Key {
@@ -666,7 +674,7 @@ fn the_draw_once_blends_a_pixel_once(device: &Open) -> Result<(), String> {
             gpu,
             &key(stencil),
             &scene.mask_layout,
-            &module,
+            pipelines::Stages::of(&modules),
             scene.targets,
         )
         .map_err(|why| format!("the {stencil:?} pipeline: {why}"))

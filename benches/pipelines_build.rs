@@ -25,7 +25,7 @@ use tessella_capture_abi::envelope::Topology;
 use tessella_capture_abi::generated::mbgl_enums::BuiltIn;
 use tessella_emblema::device::{self, Attachment, stride_of};
 use tessella_emblema::families;
-use tessella_emblema::pipelines::{self, Key, Slot, Targets};
+use tessella_emblema::pipelines::{self, Key, Slot, Stages, Targets};
 use tessella_emblema::surface::Surface;
 
 use common::Open;
@@ -120,9 +120,7 @@ fn every_pipeline_builds(device: &Open) -> Result<(), String> {
                 .map_err(|why| format!("{who} does not assemble: {why:?}"))?;
             let words = compile(&text).map_err(|why| format!("{who}: {why}"))?;
 
-            let module = device
-                .gpu()
-                .shader(&words)
+            let modules = pipelines::stage_modules(device.gpu(), &words)
                 .map_err(|why| format!("{who}: {why}"))?;
             let layout = pipelines::layout(device.gpu(), &pipelines::bindings(family, surface))
                 .map_err(|why| format!("{who}: {why}"))?;
@@ -134,18 +132,19 @@ fn every_pipeline_builds(device: &Open) -> Result<(), String> {
                     depth_stencil,
                     attachment,
                 };
-                let pipeline = pipelines::build(device.gpu(), &key, &layout, &module, targets)
-                    .map_err(|why| format!("{who} with {attachment:?}: {why}"))?;
+                let pipeline =
+                    pipelines::build(device.gpu(), &key, &layout, Stages::of(&modules), targets)
+                        .map_err(|why| format!("{who} with {attachment:?}: {why}"))?;
                 if pipeline.raw() == vk::Pipeline::null() {
                     return Err(format!("{who}: a null pipeline"));
                 }
                 held.push(pipeline);
                 built += 1;
             }
-            // The layout and the module outlive the pipelines built from them here, which Vulkan
+            // The layout and the modules outlive the pipelines built from them here, which Vulkan
             // allows -- a pipeline keeps no reference to either once created.
             drop(layout);
-            drop(module);
+            drop(modules);
         }
     }
     if built != 168 {
@@ -186,7 +185,7 @@ fn a_bogus_location_is_reported(device: &Open) -> Result<(), String> {
         .module(surface, &[])
         .map_err(|why| format!("assemble: {why:?}"))?;
     let words = compile(&text)?;
-    let module = device.gpu().shader(&words).map_err(|why| why.to_string())?;
+    let modules = pipelines::stage_modules(device.gpu(), &words).map_err(|why| why.to_string())?;
     let layout = pipelines::layout(device.gpu(), &pipelines::bindings(family, surface))
         .map_err(|why| why.to_string())?;
 
@@ -204,7 +203,8 @@ fn a_bogus_location_is_reported(device: &Open) -> Result<(), String> {
         depth_stencil,
         attachment: Attachment::DepthStencil,
     };
-    let verdict = match pipelines::build(device.gpu(), &key, &layout, &module, targets) {
+    let verdict = match pipelines::build(device.gpu(), &key, &layout, Stages::of(&modules), targets)
+    {
         Ok(_) => "accepted, so nothing enforces it",
         Err(_) => "refused",
     };
@@ -213,10 +213,11 @@ fn a_bogus_location_is_reported(device: &Open) -> Result<(), String> {
     // And the other way: the module declares `@location(0)` and the key binds nothing at all.
     let mut bare = key_for(family, surface)?;
     bare.layout.clear();
-    let verdict = match pipelines::build(device.gpu(), &bare, &layout, &module, targets) {
-        Ok(_) => "accepted, so the fetch is from nowhere",
-        Err(_) => "refused",
-    };
+    let verdict =
+        match pipelines::build(device.gpu(), &bare, &layout, Stages::of(&modules), targets) {
+            Ok(_) => "accepted, so the fetch is from nowhere",
+            Err(_) => "refused",
+        };
     println!("  an unbound input      ok   a module input with no description was {verdict}");
     Ok(())
 }
@@ -281,9 +282,12 @@ fn the_cache_reuses(device: &Open) -> Result<(), String> {
             cache.built()
         ));
     }
-    if cache.len() != 84 || cache.modules() != 84 {
+    // 168 handles for 84 texts, because a stage may not share a module with the other one -- see
+    // `pipelines::Stages`. Reading 84 here is what a cache that went back to one would report, so
+    // this is where that regression shows.
+    if cache.len() != 84 || cache.modules() != 168 {
         return Err(format!(
-            "{} pipelines and {} modules held, wanted 84 of each",
+            "{} pipelines and {} module handles held, wanted 84 and 168",
             cache.len(),
             cache.modules()
         ));
@@ -349,14 +353,43 @@ fn a_stride_is_a_different_pipeline(device: &Open) -> Result<(), String> {
     if cache.built() != 2 {
         return Err(format!("{} built for two strides", cache.built()));
     }
-    // And one module serves both, which is the other half of the two-level split.
-    if cache.modules() != 1 {
+    // And one text serves both, which is the other half of the two-level split: two handles of
+    // the same words, not four.
+    if cache.modules() != 2 {
         return Err(format!(
-            "{} modules for one family: the text was compiled per stride",
+            "{} module handles for one family: the text was compiled per stride",
             cache.modules()
         ));
     }
-    println!("  a stride differs      ok   two pipelines, one module");
+    println!("  a stride differs      ok   two pipelines, one text");
+    Ok(())
+}
+
+/// The pair goes to the two stages, one each and in order.
+///
+/// `tests/pipelines.rs` checks what [`pipelines::stage_infos`] does with a `Stages`; this checks
+/// what `Stages::of` puts in one, which needs a device to have a pair of real handles. Both
+/// halves are the same defect seen from two sides: a pipeline whose stages name one module builds
+/// here and nowhere on the sa8155p -- #85 -- so nothing in a pixel can tell the two apart.
+fn a_handle_per_stage(device: &Open) -> Result<(), String> {
+    let family = families::ALL
+        .iter()
+        .find(|family| family.shader == BuiltIn::BackgroundShader as i32)
+        .ok_or("a background family")?;
+    let text = family
+        .module(Surface::Plane, &[])
+        .map_err(|why| format!("assemble: {why:?}"))?;
+    let modules =
+        pipelines::stage_modules(device.gpu(), &compile(&text)?).map_err(|why| why.to_string())?;
+    let stages = Stages::of(&modules);
+
+    if stages.vertex == stages.fragment {
+        return Err("both stages name one module, which builds no pipeline on Adreno".into());
+    }
+    if stages.vertex != modules[0].raw() || stages.fragment != modules[1].raw() {
+        return Err("the pair reached the stages out of order".into());
+    }
+    println!("  a handle per stage    ok   two handles, vertex then fragment");
     Ok(())
 }
 
@@ -376,6 +409,7 @@ fn main() {
         ("bogus_location", a_bogus_location_is_reported),
         ("cache_reuses", the_cache_reuses),
         ("stride_differs", a_stride_is_a_different_pipeline),
+        ("handle_per_stage", a_handle_per_stage),
     ] {
         if let Err(why) = case(&device) {
             println!("  {name:<21} FAIL {why}");

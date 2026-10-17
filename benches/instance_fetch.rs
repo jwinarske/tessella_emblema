@@ -410,9 +410,8 @@ fn pipeline<'d>(
 ) -> Result<(tessella_vk::Pipeline<'d>, pipelines::Layout<'d>), String> {
     let gpu = open.gpu();
     let words = compile(source)?;
-    let module = gpu
-        .shader(&words)
-        .map_err(|why| format!("shader module: {why}"))?;
+    let modules =
+        pipelines::stage_modules(gpu, &words).map_err(|why| format!("shader module: {why}"))?;
     // No descriptors at all: this measures an address, and a block would only add a resource whose
     // own binding could be wrong instead.
     let layout = pipelines::layout(gpu, &[]).map_err(|why| format!("layout: {why}"))?;
@@ -427,8 +426,14 @@ fn pipeline<'d>(
         enabled: pipelines::Enabled::ALL,
         stencil: pipelines::Stencil::Clip,
     };
-    let built = pipelines::build(gpu, &key, &layout, &module, rig.targets)
-        .map_err(|why| format!("pipeline: {why:?}"))?;
+    let built = pipelines::build(
+        gpu,
+        &key,
+        &layout,
+        pipelines::Stages::of(&modules),
+        rig.targets,
+    )
+    .map_err(|why| format!("pipeline: {why:?}"))?;
     Ok((built, layout))
 }
 

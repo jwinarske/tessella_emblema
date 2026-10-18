@@ -277,6 +277,13 @@ impl DepthRange {
     /// `tessella_capture_abi::envelope::depth_slot` counts in -- so a band's `near` grows with the
     /// slot and the opaque pass, drawn front to back, rejects what is behind it.
     ///
+    /// The argument is a layer *index*, and `depth_slot` inverts it: the style's first layer is
+    /// the furthest back and takes the highest slot. So of two layers this answers the far half
+    /// for index 0 and the near half for index 1, which is the direction a map needs -- a later
+    /// layer paints over an earlier one. Spelled out because reading "slot zero is nearest" as
+    /// "layer zero is nearest" is one sentence away, and `benches/depth_bands.rs` was written
+    /// that way first.
+    ///
     /// A vertex stage emitting clip-space `z` of zero lands exactly on `near`, which is what gives
     /// a layer a depth without any shader knowing which layer it is in.
     #[must_use]

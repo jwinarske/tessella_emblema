@@ -67,6 +67,10 @@ name = "a_mesh"
 harness = false
 
 [[bench]]
+name = "depth_bands"
+harness = false
+
+[[bench]]
 name = "hand_off"
 harness = false
 

@@ -433,3 +433,100 @@
 # way, and a rule against building a vector out of a block's scalar would be churn for one
 # driver. What this buys is that the seven are explained and attributed, and that a body
 # written the longer way on purpose would now be recognized rather than investigated.
+
+# # "Nothing drawn" was one pixel's word for it, and the rest is one defect too
+#
+# Re-measured 2026-10-20, emblema `7024dcb` against tessella `be402e4`, same board, same
+# layer, 49 cases one process each. The probe reads **one** pixel, which cannot tell a draw
+# that produced no fragment from one that landed somewhere else -- so this run reads the
+# whole 32x32 target per case as well.
+#
+# The sixteen cases the section above lists as "nothing drawn" are not one group:
+#
+#   twelve wrote no pixel anywhere     both_as_glyph, both_as_icon, circle, extrusion_wall,
+#                                      extrusion_wall_dim, heatmap, line_gradient,
+#                                      line_pattern, line_sdf, symbol_below, symbol_icon,
+#                                      symbol_sdf
+#   four drew, somewhere else          terrain and terrain_skirt, 190 of 1024 pixels, in
+#                                      **exactly** the expected color; fill_raised and
+#                                      fill_extrusion_raised, 78 pixels, in the wrong one
+#
+# `terrain` is the sharpest row on this board: `[51, 153, 204, 255]` is the pixel the case
+# wants, and the geometry carrying it is a wedge in the upper left instead of the surface.
+# Right color, wrong place -- which says the fragment stage and its block reads are fine and
+# the position arithmetic is not.
+#
+# And `fill_no_color` passes here while writing no pixel anywhere, because the pixel it
+# expects *is* the clear. That is the case's design -- the color write mask is off -- but on
+# this board the pass is not evidence, since a collapsed draw reads the same. Its sibling
+# `fill_near_half` is what says these inputs draw.
+#
+# # The mechanism: VIV-2, with the condition on the second read
+#
+# Fourteen more cases drew a transparent black, `[0, 0, 0, 0]`, over their whole geometry:
+# drawable_at_one, fill, fill_anchored, fill_near_half, fill_on_globe, fill_outline,
+# fill_outline_at_two, fill_outline_feathered, fill_outline_pattern, fill_past_a_gap,
+# fill_pattern, fill_pattern_at_one, fill_pattern_constant, fill_raised. One color for
+# fourteen cases is one defect, not fourteen.
+#
+# It is VIV-2, whose entry in the crash repository said "every `OpCompositeExtract` from the
+# struct the entry point reconstructs returns member 0". That is the result, not the
+# condition. **A member read out of the struct and used whole is exactly right on this part.
+# What answers member 0 is a second composite read -- a component or a swizzle -- whose
+# operand is the first.** `member/README.md` there is the eighteen-module ladder; the short
+# form is
+#
+#   let drawable = fill_drawable_ubo[ubo_index];   // or `in`, rebuilt from the inputs
+#   drawable.matrix                                // a member, used whole: right
+#   drawable.params.x                              // a component of one: member 0's value
+#
+# Member 0 of the rebuilt `In` is `@builtin(instance_index)`, which is zero on these draws.
+# So every component read of an attribute is zero here, and that is the whole of it:
+#
+#   - a circle's radius, a line's extrusion, a symbol's offset and a wall's outline position
+#     are all components of attributes, so twelve geometries collapse to a point;
+#   - a packed paint color is read as `packed.x` and `packed.y` in `mix_value` and
+#     `unpack_color`, so fourteen colors come out zero;
+#   - `terrain`'s color is `ground.color`, a block member used whole, and arrives; its height
+#     is `ground.params.x`, `ground.unpack.rgb` and `ground.skirt.y`, and does not.
+#
+# # Measured against the shaders, one change at a time
+#
+# Each row is `src/shaders.rs` mutated, cross-built, run on the board, restored:
+#
+#   change                                                        correct pixels of 49
+#   none                                                                     8
+#   `var held = packed;` in mix_value, unpack_color and mix_color            22
+#
+# The fourteen that come right with those three lines: circle, drawable_at_one,
+# extrusion_dim, fill, fill_anchored, fill_extrusion, fill_near_half, fill_on_globe,
+# fill_outline, fill_outline_at_two, fill_outline_feathered, fill_past_a_gap, heatmap, and
+# `fill_no_color` keeps its pass for the right reason. `circle` and `heatmap` go from drawing
+# nothing to the exact expected pixel, which is the collapse undone.
+#
+# Then, separately, in TERRAIN_BODY:
+#
+#   `var params/unpack/skirt = ground.<member>;`               terrain correct, 571 pixels
+#   and `var flagged = in.tessella_terrain_skirt;`              terrain_skirt correct too
+#
+# # What that leaves, and why no code change
+#
+# Seven VIV-4 segfaults; the bodies that take components of attributes themselves -- the
+# symbol, line, wall and pattern families; and the three that read a texture, color_relief,
+# hillshade and hillshade_prep. So the prelude's three lines are a third of the distance and
+# the rest is per body.
+#
+# **No code change here**, for the reason the section above gives: this board is a probe
+# target rather than a gating one, and a `var` before every component read is a rule the
+# other four drivers do not need. What the measurement buys is that nothing on this part is
+# unexplained any more -- the 34 wrong pixels are one defect and the 7 segfaults are the
+# other -- and that the cost of changing our mind is known: three lines for fourteen
+# families, and a body edit each for the rest.
+#
+# Measured, by a mutation that corrected the pixel: the twelve collapses through `circle` and
+# `heatmap`, the fourteen transparent blacks, and both terrain cases. Attributed by reading
+# the body against the rule, not yet mutated: the symbol, line, wall and pattern families,
+# the two raised surfaces, and color_relief, hillshade and hillshade_prep. The last of those
+# is the clearest of them -- `scale` is `(tile.dimension.x - 2.0) / tile.dimension.x`, both
+# of them components of a block member, and the pixel it reads is `[128, 128, 255, 255]`,
+# which is the flat normal a zero slope gives.

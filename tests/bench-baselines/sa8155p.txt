@@ -488,3 +488,55 @@
 # the cache in place, `capture_frame` replays `real.tslcap` to the same 6312 colors and the same
 # 28 draws, and the counts `Cache` reports -- 37 pipelines from 66 module handles -- are
 # unchanged, because the driver's cache holds compiled shaders and this one holds pipelines.
+#
+# ---------------------------------------------------------------------------
+# # Every bench, on the Adreno 640 under turnip (2026-10-20)
+#
+# `draw_cost`, `first_pixel` and `pipelines_build` were the three recorded here. The other
+# fourteen run now, and **all fourteen pass** -- which is the result, because turnip's **kgsl**
+# backend is the least-travelled path in any of this: Mesa tests the msm one, and this board has
+# no msm GPU node. It handled the GENERAL-layout handoff, linear staging, host-visible blocks,
+# stencil masks and a two-pass frame without a single failure.
+#
+#   a_frame             3 batches, 4 drawables, 4 draws, 0 unclipped, both passes
+#   a_mesh              2016 texels of about 2048, 75% on the left
+#   block_buffers       nine checks, zeroed through forgotten
+#   capture_frame       real.tslcap: 12 batches, 28 draws, 0 undrawn, 0 unclipped
+#   clip_masks          2048 of 4096 in the masked half; the wrong reference draws nothing
+#   depth_bands         the upper layer wins in both draw orders
+#   descriptor_layouts  84 set and pipeline layouts resident at once
+#   descriptor_sets     84 sets from one pool, widest 12 bindings
+#   geometry_store      round trip, dedup, bind list, refusals
+#   hand_off            64x64 BGRA blue every texel, GENERAL, a ring of three
+#   instance_fetch      firstInstance moves the attribute element and the builtin, 0..3
+#   overdraw_cost       the depth early-out saves 85.7% of a sixteen-layer frame
+#   texture_images      scattered regions, whole texture, staging reuse
+#   two_passes          the child recorded first, 4096 texels of its color
+#
+# ## Five numbers that are the driver's and not the library's
+#
+# Worth writing down because they differ from the Pi 5's for the same code, and a reader
+# comparing the two files would otherwise read a difference as a change.
+#
+#   `a_frame`'s second region runs on **S8_UINT** here and `D24_UNORM_S8_UINT` on V3D. Turnip
+#   offers a standalone stencil format and V3DV does not, so `Attachment::StencilOnly` gets a
+#   true stencil-only attachment on this part.
+#
+#   `descriptor_layouts` reports the widest set as six storage descriptors against a limit of
+#   **16,777,216**. On V3D that limit is **8**, which is where `descriptor-limits-are-unenforced`
+#   gets its two of headroom. The constraint belongs to the gating target alone; this part has no
+#   opinion.
+#
+#   Allocation granularity: `geometry_store` round-trips 136 claimed bytes in **192** here and 768
+#   on V3D; `texture_images` staging is 8192 then 9216 against 4160 then 5440; `block_buffers`
+#   holds 128 bytes resident against 256. Every one of those is an alignment the driver chose.
+#
+#   `overdraw_cost` saves **85.7%** of a sixteen-layer frame against V3D's 89% in #104 -- the
+#   same early-out, measured on a second part, which is what §11.7's depth-write split was for.
+#   Board at load 16, so read the ratio and not the microseconds; the floor with nothing drawn is
+#   343.5 us a frame.
+#
+#   `capture_frame` draws the same frame as the Pi: `[234, 230, 221, 255]` over **533,541**
+#   texels here against **533,544** there, with 6236 colors against 6312. Three texels and 76
+#   colors between two GPUs on one recorded frame, which is rasterization and filtering rather
+#   than anything structural -- 12 batches, 28 draws, 0 undrawn and 0 unclipped on both.

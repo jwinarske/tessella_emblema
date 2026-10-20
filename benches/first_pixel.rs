@@ -806,7 +806,24 @@ fn run() -> Result<usize, String> {
     if cases.is_empty() {
         return Err(format!("no case named {}", only.unwrap_or_default()));
     }
+    let mut measured = 0usize;
     for case in &cases {
+        // A line case reading the row *below* the line's own is reading the second pixel of
+        // mbgl's two-pixel outline, and `device::line_width` falls back to one pixel where the
+        // device reports no `wideLines` -- so that row holds the clear there, and the case is
+        // not measurable rather than failed. Both gate devices have the feature;
+        // the Adreno 640 under Mesa's turnip is the first device here that does not, and it
+        // draws the other two line cases right.
+        if pipelines::sets_line_width(case.topology)
+            && case.at.1 != SIDE / 2
+            && open.line_width() < device::OUTLINE_WIDTH
+        {
+            println!(
+                "  {:<18} not measurable: every line is one pixel wide here",
+                case.name
+            );
+            continue;
+        }
         let drawn = draw_case(&open, &probe, &mut cache, case)?;
         if drawn != case.expect {
             return Err(format!(
@@ -815,6 +832,7 @@ fn run() -> Result<usize, String> {
             ));
         }
         println!("  {:<18} {drawn:?}", case.name);
+        measured += 1;
     }
     println!(
         "  through the library: {} pipelines from {} module handles, {} binds",
@@ -822,7 +840,7 @@ fn run() -> Result<usize, String> {
         cache.modules(),
         cache.bound()
     );
-    Ok(cases.len())
+    Ok(measured)
 }
 
 /// Every family this probe can set up without a texture, and the pixel each should draw.

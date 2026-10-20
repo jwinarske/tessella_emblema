@@ -316,7 +316,8 @@ static VkShaderModule module_of(struct gpu *g, const char *path) {
 
 // One pipeline from two single-entry-point modules. `tweak` varies a harmless piece of state
 // so a driver cannot hand back a pipeline it built earlier.
-static VkPipeline pipeline_of(struct gpu *g, VkShaderModule vs, VkShaderModule fs, int tweak) {
+static VkPipeline pipeline_of(struct gpu *g, VkShaderModule vs, VkShaderModule fs, int tweak,
+                              VkPipelineCache cache) {
     VkPipelineShaderStageCreateInfo stages[2] = {
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
           .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "vs_main" },
@@ -352,7 +353,7 @@ static VkPipeline pipeline_of(struct gpu *g, VkShaderModule vs, VkShaderModule f
                                           .pMultisampleState = &ms, .pColorBlendState = &cb,
                                           .layout = g->layout, .renderPass = g->pass };
     VkPipeline p;
-    CHECK(vkCreateGraphicsPipelines(g->device, VK_NULL_HANDLE, 1, &gpci, NULL, &p));
+    CHECK(vkCreateGraphicsPipelines(g->device, cache, 1, &gpci, NULL, &p));
     return p;
 }
 
@@ -436,7 +437,7 @@ static void bench_pipelines(struct gpu *g) {
         double create[REPEATS], cold;
         for (int r = 0; r < REPEATS; r++) {
             double start = now_us();
-            VkPipeline p = pipeline_of(g, vs, fs, r + 1);
+            VkPipeline p = pipeline_of(g, vs, fs, r + 1, VK_NULL_HANDLE);
             create[r] = now_us() - start;
             vkDestroyPipeline(g->device, p, NULL);
         }
@@ -448,10 +449,95 @@ static void bench_pipelines(struct gpu *g) {
     vkDestroyShaderModule(g->device, vs, NULL);
 }
 
+// Does the driver honor a VkPipelineCache -- in process, and across processes?
+//
+// The question the table without one leaves open. `--cache <path>` loads that file into a
+// cache object before the first create and writes the cache back at the end, so the second
+// invocation of this program is the case an application actually ships: a cache persisted from
+// a previous run. Three numbers a shader: the first create against a cache that is empty (or
+// preloaded), the repeats, and what the cache weighs.
+static void bench_cache(struct gpu *g, const char *cache_path) {
+    unsigned char *initial = NULL;
+    size_t initial_size = 0;
+    if (cache_path) {
+        FILE *f = fopen(cache_path, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long n = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (n > 0) {
+                initial = malloc((size_t)n);
+                initial_size = fread(initial, 1, (size_t)n, f);
+            }
+            fclose(f);
+        }
+    }
+    printf("  pipeline cache: %s, %zu bytes loaded\n",
+           cache_path ? cache_path : "(none, in process only)", initial_size);
+
+    VkPipelineCacheCreateInfo pcci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+                                       .initialDataSize = initial_size,
+                                       .pInitialData = initial_size ? initial : NULL };
+    VkPipelineCache cache;
+    double start = now_us();
+    VkResult made = vkCreatePipelineCache(g->device, &pcci, NULL, &cache);
+    double create_us = now_us() - start;
+    if (made != VK_SUCCESS) {
+        // A driver may reject data it did not write; an empty cache still answers the
+        // in-process half of the question.
+        printf("  vkCreatePipelineCache rejected the data (%d), retrying empty\n", (int)made);
+        pcci.initialDataSize = 0;
+        pcci.pInitialData = NULL;
+        CHECK(vkCreatePipelineCache(g->device, &pcci, NULL, &cache));
+        initial_size = 0;
+    }
+    printf("  vkCreatePipelineCache     %9.1f us\n", create_us);
+
+    const char *names[] = { "fs-const", "fs-alu", "fs-tex" };
+    VkShaderModule vs = module_of(g, "vs-quad.spv");
+    for (unsigned i = 0; i < sizeof names / sizeof *names; i++) {
+        char path[64];
+        snprintf(path, sizeof path, "%s.spv", names[i]);
+        VkShaderModule fs = module_of(g, path);
+        double create[REPEATS];
+        for (int r = 0; r < REPEATS; r++) {
+            double t = now_us();
+            VkPipeline p = pipeline_of(g, vs, fs, r + 1, cache);
+            create[r] = now_us() - t;
+            vkDestroyPipeline(g->device, p, NULL);
+        }
+        printf("  with a cache  %-10s      %9.1f us first   %8.1f us p50\n", names[i],
+               create[0], p50(create + 1, REPEATS - 1));
+        vkDestroyShaderModule(g->device, fs, NULL);
+    }
+    vkDestroyShaderModule(g->device, vs, NULL);
+
+    size_t written = 0;
+    if (vkGetPipelineCacheData(g->device, cache, &written, NULL) == VK_SUCCESS) {
+        printf("  vkGetPipelineCacheData    %9zu bytes\n", written);
+        if (cache_path && written) {
+            unsigned char *blob = malloc(written);
+            if (vkGetPipelineCacheData(g->device, cache, &written, blob) == VK_SUCCESS) {
+                FILE *f = fopen(cache_path, "wb");
+                if (f) {
+                    fwrite(blob, 1, written, f);
+                    fclose(f);
+                    printf("  wrote %zu bytes to %s\n", written, cache_path);
+                }
+            }
+            free(blob);
+        }
+    } else {
+        printf("  vkGetPipelineCacheData    refused\n");
+    }
+    vkDestroyPipelineCache(g->device, cache, NULL);
+    free(initial);
+}
+
 static void bench_record(struct gpu *g) {
     VkShaderModule vs = module_of(g, "vs-quad.spv");
     VkShaderModule fs = module_of(g, "fs-const.spv");
-    VkPipeline p = pipeline_of(g, vs, fs, 1);
+    VkPipeline p = pipeline_of(g, vs, fs, 1, VK_NULL_HANDLE);
     const int draws = 20000;
     double per_draw[REPEATS], per_bind[REPEATS];
     for (int r = 0; r < REPEATS; r++) {
@@ -486,7 +572,7 @@ static void bench_record(struct gpu *g) {
 static void bench_submit(struct gpu *g) {
     VkShaderModule vs = module_of(g, "vs-quad.spv");
     VkShaderModule fs = module_of(g, "fs-const.spv");
-    VkPipeline p = pipeline_of(g, vs, fs, 1);
+    VkPipeline p = pipeline_of(g, vs, fs, 1, VK_NULL_HANDLE);
     double wall[REPEATS], gpu[REPEATS];
     for (int r = 0; r < REPEATS; r++) {
         double g_us = 0.0;
@@ -505,7 +591,7 @@ static void bench_gpu(struct gpu *g, const char *label, const char *vs_path, con
                       int draws, int vertices) {
     VkShaderModule vs = module_of(g, vs_path);
     VkShaderModule fs = module_of(g, fs_path);
-    VkPipeline p = pipeline_of(g, vs, fs, 1);
+    VkPipeline p = pipeline_of(g, vs, fs, 1, VK_NULL_HANDLE);
     double wall[REPEATS], gpu[REPEATS];
     for (int r = 0; r < REPEATS; r++) {
         double g_us = 0.0;
@@ -525,6 +611,7 @@ static void bench_gpu(struct gpu *g, const char *label, const char *vs_path, con
 
 int main(int argc, char **argv) {
     const char *what = argc > 1 ? argv[1] : "all";
+    const char *cache_path = argc > 2 ? argv[2] : NULL;
     struct gpu g = { 0 };
     double start = now_us();
     open_gpu(&g);
@@ -536,6 +623,7 @@ int main(int argc, char **argv) {
 
     int all = strcmp(what, "all") == 0;
     if (all || !strcmp(what, "pipeline")) bench_pipelines(&g);
+    if (all || !strcmp(what, "cache")) bench_cache(&g, cache_path);
     if (all || !strcmp(what, "record")) bench_record(&g);
     if (all || !strcmp(what, "submit")) bench_submit(&g);
     if (all || !strcmp(what, "fill")) {

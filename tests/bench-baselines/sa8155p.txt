@@ -1,8 +1,12 @@
 # `draw_cost` and `first_pixel` on an sa8155p (Adreno 640), against the desktop and the Pi 5.
 #
-# `sa81x5-guest`, Cockpit SDK(IVI) v12.9.0 (Yocto dunfell), kernel 5.4.219, 6 cores,
-# glibc 2.31. Vulkan 1.2.198 through `/usr/lib/libvulkan_adreno.so` -- Qualcomm's own
-# loader, so there is no `icd.d` and no validation layer to debug with.
+# `sa81x5-guest`, a Yocto dunfell image, kernel 5.4.219, 6 cores, glibc 2.31. The board
+# ships a vendor Vulkan stack with its own loader, which predates 1.3 and leaves no `icd.d`
+# and no validation layer to debug with.
+#
+# Figures here are this crate's own and the open drivers': Mesa's turnip on this part, V3DV,
+# RADV. The vendor stack appears only as capabilities it reports and constraints it imposed on
+# the shaders.
 #
 # Reached over `adb`, which is the transport only: this is Linux, not Android. Push to
 # /tmp and run.
@@ -32,8 +36,7 @@
 #
 # Two things, both of which RADV and V3DV accept and this driver does not:
 #
-# A `mat4x4<f32>` read from a storage buffer makes the shader compiler assert --
-# `matOpnd->isMatrix()` in its own CodeGenHelper.cpp -- and pipeline creation returns
+# A `mat4x4<f32>` read from a storage buffer is refused: pipeline creation returns
 # `VK_ERROR_UNKNOWN`. Matrices are declared as four `vec4` columns for this reason; see
 # `preamble::MATRIX`.
 #
@@ -46,45 +49,42 @@
 # 640 drawables recorded into one command buffer, 60 frames a shape, strictly additive:
 # each row is the one above plus the state named.
 #
-#                     record p50               per draw              submit p50
-# shape          desktop   pi5   sa8155p  desktop   pi5  sa8155p  desktop  pi5  sa8155p
-# instance           9.3  57.8     769.8   0.0146 0.090   1.203      25.9 104.0  1493.9
-# push              14.5 636.8     985.8   0.0227 0.995   1.540      34.5 112.4  1510.4
-# buffers           26.3 651.9    1234.5   0.0411 1.019   1.929      59.3 112.5  1501.7
-# descriptors       29.6 656.1    1582.7   0.0463 1.025   2.473      58.8 112.3  1547.9
+#                     record p50               per draw
+# shape          desktop   pi5   a640      desktop   pi5   a640
+# instance           9.3  57.8   573.6      0.0146 0.090  0.8962
+# push              14.5 636.8   829.3      0.0227 0.995  1.2958
+# buffers           26.3 651.9  1027.5      0.0411 1.019  1.6055
+# descriptors       29.6 656.1  1366.1      0.0463 1.025  2.1345
 #
-# All times in microseconds.
+# All times in microseconds. The a640 column is **Mesa's turnip** on this board, re-taken
+# 2026-10-20.
 #
 # # What the numbers say
 #
-# **The merge is not worth porting on any of the three.** The dearest shape costs 2.47 us a
+# **The merge is not worth porting on any of the three.** The dearest shape costs 2.13 us a
 # draw here against the Flutter GPU sibling's ~62 us a draw on its own board, half of which
 # is Dart walking batches.
 #
 # **Per-draw state costs real money here and almost none on V3D.** Going from `descriptors`
-# to `instance` is 2.47 to 1.20 us, about 0.81 ms over a 640-drawable frame. On V3D the
+# to `instance` is 2.13 to 0.90 us, about 0.79 ms over a 640-drawable frame. On V3D the
 # same span is 1.025 to 0.090 and nearly all of it is the push constant alone, with buffers
 # and descriptors free on top. So the arena and a shared descriptor set earn their place on
 # Adreno for a reason V3D does not show, and `firstInstance` earns its place on both.
 #
-# The three drivers share no ratio: 6x/44x/25x/22x for pi5 over desktop, and
-# 82x/68x/47x/53x for sa8155p over desktop. There is no scaling factor from a desktop
-# measurement to a board one for command recording, which is the whole reason these files
-# exist.
+# The three share no ratio: 6x/44x/25x/22x for pi5 over desktop, and 62x/57x/39x/46x for the
+# a640 over desktop. There is no scaling factor from a desktop measurement to a board one
+# for command recording, which is the whole reason these files exist.
 #
-# # Re-run after the slot moved to `firstInstance`
+# # The slot moved to `firstInstance`, and it is verified here
 #
-# shape          record p50   per draw   submit p50
-# instance            835.5     1.3055       1419.6
-# push               1080.6     1.6885       1505.0
-# buffers            1350.0     2.1094       1474.9
-# descriptors        1724.1     2.6939       1510.4
+# The four shapes were re-taken after that change; the table above carries the current figures.
 #
-# `firstInstance reaches the shader as slot 613` here too, by readback. Adreno has had base
-# instance quirks and the failure mode is silent -- every drawable reading slot zero -- so
-# the bench checks it on every device before it times anything.
+# What matters more than the figures is that **`firstInstance` reaches the shader as slot 613**
+# here, by readback. Adreno parts have had base-instance quirks and the failure mode is silent
+# -- every drawable reading slot zero -- so the bench checks it on every device before it times
+# anything, and it has passed here under both of this board's drivers.
 #
-# The spread between `instance` and `descriptors` is 1.39 us a draw, 0.89 ms over a
+# The spread between `instance` and `descriptors` is 1.24 us a draw, 0.79 ms over a
 # 640-drawable frame, which is why the arena and a shared descriptor set are worth having
 # here. On V3D the same span is 0.96 us and almost all of it is the push constant alone.
 #
@@ -95,15 +95,18 @@
 # a placement that puts every vertex outside the clip volume so neither variant rasterizes
 # a fragment. Submit to fence, p50 of 20.
 #
-#   control  1575.8 us
-#   sampled  1850.7 us
-#   delta     274.9 us over 1,048,576 fetches = 0.262 ns a fetch
+#   control  1556.9 us
+#   sampled  1549.9 us
+#   delta       0.0 us over 1,048,576 fetches = 0.000 ns a fetch
 #
-# **So the fetch is not what costs 38.9 ms.** Accounting for that figure at this price
-# needs about 148 million reads in a frame, which is 8,500 tiles' worth of terrain mesh at
-# 17,415 vertices a tile. A pitched z14 cover is tens of tiles. Even a generous count of
-# every raised vertex in such a frame lands in the low millions, which is a millisecond or
-# two.
+# Those are turnip's, re-taken 2026-10-20. An earlier run on the other driver reached the same
+# conclusion with a small positive delta rather than none.
+#
+# **So the fetch is not what costs 38.9 ms.** At a cost indistinguishable from zero over a
+# million fetches there is no frame-sized vertex count that reaches it: a pitched z14 cover is
+# tens of tiles at 17,415 vertices a tile, so even a generous count of every raised vertex in
+# such a frame lands in the low millions, and the dearest per-fetch figure either driver has
+# produced here would still put that at a millisecond or two.
 #
 # The remaining candidates are all about the path to the read rather than the read: whether
 # the image view or descriptor is re-bound per draw where GLES caches it -- terrain scenes
@@ -140,88 +143,36 @@
 # Compare `imx8mp.txt`, where 2 of the same 24 build.
 
 # ---------------------------------------------------------------------------
-# # The board draws again, on Mesa's turnip rather than the blob (2026-10-20)
+# # The board draws, on Mesa's turnip (2026-10-20)
 #
 # #144 records that no bench in this tree can open a device here: `benches/common` asks for
-# `VkPhysicalDeviceVulkan13Features::dynamicRendering`, and Qualcomm's driver is Vulkan
-# 1.1.128 with neither the feature nor `VK_KHR_dynamic_rendering`. That is still true of the
-# blob, and the blob cannot be rebuilt -- it is a vendor binary from the SA8155 BSP, not in
-# AOSP and not open.
+# `VkPhysicalDeviceVulkan13Features::dynamicRendering`, and the vendor driver is a Vulkan 1.1
+# stack with neither the feature nor `VK_KHR_dynamic_rendering`. That is a capability it
+# reports and not a measurement of it. Nor can it be rebuilt -- it is a vendor binary from the
+# BSP, not in AOSP and not open anywhere.
 #
-# Mesa's open driver for this part can be built, and it has what the blob lacks:
+# Mesa's driver for this part can be built, and it has what the pass needs:
 #
 #   device                Turnip Adreno (TM) 640
-#   api                   1.3.363          (blob: 1.1.128)
+#   api                   1.3.363
 #   driverInfo            Mesa 27.0.0-devel (git-7f13762f3f)
-#   device extensions     162              (blob: 77)
-#   dynamicRendering      YES              (blob: absent, feature and extension both)
-#   vkCreateDevice        SUCCESS with the exact feature struct the benches ask for
-#   wideLines             no, lineWidthRange 1.0..1.0 -- and **the blob reports the same**,
-#                         so this is the part rather than the driver
+#   device extensions     162
+#   dynamicRendering      YES, and vkCreateDevice succeeds with the benches' own struct
+#   wideLines             no, lineWidthRange 1.0..1.0 -- and the part lacks it under either
+#                         driver, so that is the hardware rather than Mesa
 #
-# ## first_pixel: 48 measured, 48 correct
-#
-# Every family in the 49-case probe draws the pixel the oracle derived, through the library's
-# own pass rather than the probe's old Vulkan. The 2026-10-03 run above was 24 of 24 with the
-# blob and a render pass the probe owned; this is twice the cases and none of its own Vulkan.
-#
-# The 49th, `fill_outline_at_two`, is **not measurable** here rather than wrong: it samples
-# the row below the line's own, which only the second pixel of mbgl's two-pixel outline
-# covers, and `device::line_width` falls back to one pixel on a device that reports no
-# `wideLines`. The probe says so now instead of failing -- both gate devices have the
-# feature, and this part has it under neither driver. The other two line cases sample the
-# line's own row and pass.
-#
-# ## pipelines_build: all six checks
-#
-#   depth-stencil format  D24_UNORM_S8_UINT
-#   every pipeline        168 pipelines, all resident at once
-#   the cache reuses      252 asks, 84 built, 168 modules
-#   a handle per stage    two handles, vertex then fragment
-#
-# That last line is #139's per-stage split running on Adreno 640 **hardware**, which is new.
-# It is not a verification of what #139 fixed: the blob is what refuses one module for two
-# stages, and turnip does not, so the arrangement is exercised rather than tested here.
-#
-# ## draw_cost under turnip, against the blob's own numbers
-#
-#                     record p50              per draw
-# shape            blob    turnip        blob    turnip
-# instance        736.1     573.6      1.1502    0.8962
-# push           1080.6     829.3      1.6885    1.2958
-# buffers        1350.0    1027.5      2.1094    1.6055
-# descriptors    1698.3    1366.1      2.6536    2.1345
-#
-# All in microseconds, 640 drawables a frame, 60 frames a shape. Turnip records every shape
-# cheaper than the blob, by a fifth or so, and the ordering of the four is identical. Not a
-# clean comparison -- load average was 13 for the blob's run and 11.6 for this one, on a
-# board that is never idle -- but the gap is the same sign and size across all four rows.
-# `firstInstance` reaches the shader (slot 613), and the vertex-fetch delta is 0.0 ns.
-#
-# ## What this does not say
-#
-# **Nothing about the vendor stack.** Both findings this board forced -- no `mat4x4` in a
-# storage buffer, and one entry point per SPIR-V module -- are the blob's, and turnip accepts
-# what the blob refused. A run here says the shaders and the library are right on Adreno 640
-# hardware; it does not re-test the driver that ships on it.
-#
-# ## How the driver was built
-#
-# Mesa main, cross-compiled for the board's glibc 2.31 sysroot, Vulkan driver only:
+# **`kgsl`, not `msm`.** The GPU here is only on `/dev/kgsl-3d0`; `/dev/dri/renderD128` is
+# `msm_drm` for the *display* controller (`qcom,mdss_mdp`, `sde-kms`), so there is no msm DRM
+# node for the GPU and turnip's msm backend has nothing to open.
 #
 #   meson setup build-a640 --cross-file a640.ini -Dbuildtype=release \
 #     -Dvulkan-drivers=freedreno -Dgallium-drivers= -Dfreedreno-kmds=kgsl \
 #     -Dplatforms= -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dopengl=false \
 #     -Dllvm=disabled -Dshared-glapi=disabled -Dgles1=disabled -Dgles2=disabled
 #
-# **`kgsl`, not `msm`.** The GPU here is only on `/dev/kgsl-3d0`; `/dev/dri/renderD128` is
-# `msm_drm` for the *display* controller (`qcom,mdss_mdp`, `sde-kms`), so there is no msm DRM
-# node for the GPU and turnip's msm backend has nothing to open.
-#
-# The loader matters too: the board's is 1.2.198, so an instance asking for 1.3 fails
-# whatever the ICD reports. Vulkan-Loader built from source alongside it (1.4.365) is what
-# makes the 1.3 instance work. Both go in /tmp with the ICD json, which is where this board
-# allows exec, and the run is
+# The board's own loader predates 1.3, so an instance asking for it fails whatever the ICD
+# reports; Vulkan-Loader built from source beside turnip (1.4.365) is what makes it work. Both
+# go in /tmp with the ICD json, which is where this board allows exec, and the run is
 #
 #   LD_LIBRARY_PATH=/tmp/turnip VK_ICD_FILENAMES=/tmp/turnip/freedreno_icd.json ./first_pixel
 #
@@ -233,310 +184,180 @@
 # them is turnip's doing; they are what cross-building a 2026 toolchain against a 2020 glibc
 # costs.
 #
-# ---------------------------------------------------------------------------
-# # The two drivers, side by side (2026-10-20)
+# ## first_pixel: 48 measured, 48 correct
 #
-# `tools/drvprof` is a C probe that renders through a `VkRenderPass`, so it runs on **both**
-# drivers -- the blob's missing dynamic rendering is what keeps `benches/` off it. One binary,
-# one loader, two ICD paths, so the driver is the only variable. Five naga modules, one entry
-# point each and no matrices, which is what the blob accepts.
+# Every family in the 49-case probe draws the pixel the oracle derived, through the library's
+# own pass. The 2026-10-03 run above was 24 of 24 with a render pass the probe owned itself;
+# this is twice the cases and none of its own Vulkan.
 #
-# Two rounds of blob / turnip / turnip-without-Mesa's-cache, interleaved, load average 16.8.
+# The 49th, `fill_outline_at_two`, is **not measurable** here rather than wrong: it samples the
+# row below the line's own, which only the second pixel of mbgl's two-pixel outline covers, and
+# `device::line_width` falls back to one pixel where the device reports no `wideLines`. The
+# probe says so now instead of failing -- both gate devices have the feature and this part has
+# it under neither driver. The other two line cases sample the line's own row and pass.
 #
-# ## Pipeline creation: turnip wins by between three times and a thousand
+# ## pipelines_build: all six checks
 #
-#   microseconds, per vkCreateGraphicsPipelines
+#   depth-stencil format  D24_UNORM_S8_UINT
+#   every pipeline        168 pipelines, all resident at once
+#   the cache reuses      252 asks, 84 built, 168 modules
+#   a handle per stage    two handles, vertex then fragment
 #
-#   fragment shader     blob cold   blob warm    turnip cold   with its cache   turnip warm
-#   fs-const  (88 w)      7816         3912         1159             162            5.4
-#   fs-alu   (254 w)      6930         5986         1640              80            5.5
-#   fs-tex   (358 w)     10870        10882         4691              91            5.4
+# That last line is #139's per-stage split running on Adreno 640 **hardware**, which is new. It
+# is not a verification of what #139 fixed: the vendor driver is what refuses one module for
+# two stages, and turnip does not, so the arrangement is exercised rather than tested here.
 #
-# Three readings, in order of how much they matter.
+# ## capture_frame: a real frame replays
 #
-# **The blob's warm column is its cold column**: create the same pipeline nine times and it
-# compiles nine times. Turnip has two caches -- an on-disk one at
-# `/home/root/.cache/mesa_shader_cache` and an in-process one -- and
-# `MESA_SHADER_CACHE_DISABLE=true` is the only way to measure its compiler rather than its
-# cache, so the `turnip cold` column above is with the cache **off**.
+# `real.tslcap`, a recorded Mercator view: 12 batches, 19 geometries, 7 families, **12
+# pipelines from 7 modules**, 28 drawables, 28 draws, 0 undrawn, 0 unclipped, and no texel left
+# at the clear. Not the 168 `pipelines_build` brings up -- `Cache` builds what the frame asks
+# for, which is the number that matters for a first frame.
 #
-# **Corrected 2026-10-20: that is not a defect, it is Vulkan.** Those creates pass
-# `VK_NULL_HANDLE` for `pipelineCache`, and a driver owes nothing without a cache object. RADV
-# does exactly the same when its own caches are out of the way -- `MESA_SHADER_CACHE_DISABLE=true`
-# and no cache object: 534 us cold against 453 p50 for `fs-alu`, recompiling every time. What
-# the comparison above really shows is a difference in *defaults*: Mesa ships an implicit disk
-# cache and Qualcomm does not. The question that matters to an application -- whether the blob
-# honors a `VkPipelineCache` it is handed -- is a separate one, and `tools/drvprof cache`
-# answers it.
+# The same capture on the Pi 5 draws `[234, 230, 221, 255]` over **533,544** texels against
+# **533,541** here, with 6312 colors against 6236. Three texels and seventy-six colors between
+# two GPUs on one recorded frame, which is rasterization and filtering rather than anything
+# structural.
 #
-# **Answered for two drivers, open for the blob** (2026-10-20): RADV and V3DV both honor a
-# serialized cache across processes, dropping a first create from 1.6 ms to 3.4 us, and V3DV
-# keeps something even with no cache object where RADV recompiles. The blob's row needs a run on
-# this board. `raspberry-pi-5.txt` has the table.
+# ## Every other bench
 #
-# **Compiling, turnip is 3 to 7 times faster**: 1.6 ms against 6.9 for the ALU shader, 4.7
-# against 10.9 for the sampling one. Both compilers slow down with shader size, turnip from 1.2
-# to 4.7 ms and the blob from 7.8 to 10.9.
-#
-# **With its cache, turnip is 5 us.** For this crate that is the difference between ~168
-# pipelines costing a second and a half of compile on every process start and costing nothing
-# the second time a device is opened. `vkCreateShaderModule` is noise either way: 3.3 us cold
-# for the blob, 7.0 for turnip.
-#
-# ## Recording: turnip is nearly four times cheaper a draw
-#
-#   vkCmdDraw                 blob 0.1102..0.1285 us      turnip 0.0293..0.0301 us
-#   vkCmdBindDescriptorSets   blob 0.0188..0.0418 us      turnip 0.0212..0.0220 us
-#   instance + device + pass  blob 15.1..23.8 ms          turnip 20.8..24.9 ms
-#
-# The draw figure is the one `draw_cost` already saw from the other side: that bench records a
-# fifth cheaper under turnip, and this says why. Descriptor binds and device creation are a
-# wash.
-#
-# ## GPU work: turnip's fragment ALU is 40% behind, and nothing else is
-#
-#   microseconds, GPU timestamps, min of fifteen, both drivers measured back to back
-#
-#   pass                                   blob    turnip   turnip vs blob
-#   fill 512x512, 1 draw, constant         72.9      76.1      4% slower
-#   fill 512x512, 8 draws, constant       302.3     283.9      6% faster
-#   256 dependent mads, 1 draw           1159.1    1623.6     40% slower
-#   256 dependent mads, 8 draws          8934.5   12612.0     41% slower
-#   16 samples a fragment, 1 draw         543.2     708.9     31% slower
-#   16 samples a fragment, 8 draws       4075.0    4144.7      2% slower
-#   1M degenerate vertices               1052.0    1058.6      1% slower
-#   4M degenerate vertices               4099.5    4106.3      0% slower
-#
-# **Fill rate, vertex rate and warm sampling are the hardware's**, and the two drivers are
-# within a few percent of each other on all three. The vertex rows are the sharpest: 1052
-# against 1058 and 4099 against 4106, which is the part's primitive rate showing through both.
-#
-# **Fragment ALU is turnip's weak point here, by 40%, at both scales.** The same SPIR-V, the
-# same 256-deep dependent chain of a multiply and an add; ir3 takes 1.4x the time Qualcomm's
-# E031 compiler does. The obvious suspect is multiply-add fusion -- 256 mads against 512
-# separate instructions would be 2x, and 1.4x is what partial fusion would look like -- but
-# that is a guess until someone counts instructions, which `TU_DEBUG=shaderdb` would do.
-#
-# **Cold sampling is 31% behind and warm sampling is not**, which makes it a cache-warming
-# difference rather than a sampler-rate one: the blob scales 7.5x from one draw to eight and
-# turnip 5.8x, so turnip is getting more out of the second draw onward.
-#
-# ## A caveat that cost two rounds to find
-#
-# The blob's fragment numbers **halved between round one and round two** -- 140.5 us then 72.9
-# for the same constant fill, 2253.7 then 1159.1 for the same ALU pass -- while turnip's moved
-# by less than half a percent across four runs, and the vertex rows did not move for either.
-# That is the GPU clock ramping, and it is why the table above is the min of fifteen within a
-# round where both drivers ran back to back. A single comparison taken after an idle board
-# would have read turnip as **twice as fast** at fragment work, and it is not.
-#
-# ---------------------------------------------------------------------------
-# # The cache row, answered: it works in a process and not across one (2026-10-20)
-#
-# `drvprof cache`, both drivers, two invocations each so the second loads what the first wrote.
-# Load average 16.5, so these are compile times on a contended CPU -- but both drivers ran back
-# to back and the ratios are forty to a hundred fold.
-#
-#   microseconds, per vkCreateGraphicsPipelines      fs-const    fs-alu    fs-tex
-#   BLOB   run 1, empty cache, first create             7582      8874     12972
-#          run 1, repeats against that cache              88        91       112
-#          run 2, cache preloaded, first create          6229     15800     13268
-#          run 2, repeats                                 205       176       112
-#   TURNIP run 1, empty cache, first create             2276      1606      4798
-#          run 1, repeats                                  5.2       5.3       5.7
-#          run 2, cache preloaded, first create           77        27        48
-#          run 2, repeats                                  20        20        21
-#
-# **The blob honors a cache object within a process**: 88 us against 7582 for the same pipeline,
-# an eighty-fold drop. #151's "no cache behind `vkCreateGraphicsPipelines`" was the absence of a
-# cache object and nothing more, as the correction in #152 said.
-#
-# **And its serialized data does not carry across a process.** Run 2 loaded the 12,808 bytes run
-# 1 wrote, and still paid 6.2 to 15.8 ms for the first create of every shader -- full recompiles.
-# `vkGetPipelineCacheData` then returned **25,593** bytes, twice what went in, so the loaded
-# entries were kept and not matched: the blob appended new ones beside them.
-#
-# Turnip's does carry: 27 us where a compile is 1606, and its cache came back the same 28,573
-# bytes it went in as, so every entry was recognized.
-#
-# **What that costs us.** This crate builds 168 pipelines. On the blob that is one to two seconds
-# of compile on **every process start**, and a cache shipped with the application does not avoid
-# it -- only keeping the process alive does. On turnip the same cache makes it a few milliseconds.
-# For a product that starts a map once and runs for hours, this is a startup-latency question
-# rather than a frame-rate one; for anything that respawns, it is the whole cost.
-#
-# # And the 40% fragment-ALU gap was the loop, not the ALU
-#
-# #151 reports turnip 40% behind on 256 dependent multiply-adds and guesses at multiply-add
-# fusion. The guess was wrong and so was the framing. Two more shader pairs say why.
-#
-#   microseconds, GPU timestamps, min of fifteen, both drivers back to back
-#
-#   fragment shader                              blob   turnip
-#   256 mads, rolled loop  (fs-alu)             2253.7   3156.3     turnip 40% slower
-#   the same, written flat (fs-alu-flat)         140.4    768.3     see below
-#   256 squarings, rolled  (fs-sq)              2157.6   3158.2     turnip 46% slower
-#   the same, written flat (fs-sq-flat)          440.5    447.8     **level, 1.7%**
-#
-# `fs-sq` squares rather than scaling, which no compiler can fold -- `acc * k + c` repeated is
-# affine and collapses to one multiply-add, `acc * acc + c` does not. That pair is the one that
-# measures arithmetic:
-#
-# **Unrolled, the two drivers are within 1.7% of each other.** The ALU is not turnip's weak
-# point. What is 46% slower is the *rolled* form of the same arithmetic.
-#
-# `IR3_SHADER_DEBUG=disasm` says what ir3 did, per fragment shader:
-#
-#   shader           instr   nops   non-nops   loops
-#   fs-const             5      0          5       0
-#   fs-alu              30     15         15       1   <- not unrolled
-#   fs-alu-flat       1038    774        264       0
-#   fs-sq               30     15         15       1   <- not unrolled
-#   fs-sq-flat        1042    777        265       0
-#   fs-tex             158      6        152       0   <- sixteen iterations, unrolled
-#
-# So ir3 unrolls a sixteen-iteration loop and leaves a 256-iteration one rolled, and the rolled
-# form pays loop overhead on top of the stalls a dependent chain causes either way -- three
-# quarters of the flat form's slots are nops too. The blob's compiler handles the long loop
-# better; given the same straight-line code they are equal.
-#
-# **The affine pair measures something else again.** The blob returns 140.4 us for `fs-alu-flat`,
-# which is exactly its cost for a constant color: it folded 256 affine steps into nothing.
-# Turnip kept all 256 (1038 instructions) and took 768.3. So Qualcomm's compiler does an
-# algebraic simplification turnip does not -- a real difference, on a shape no shader in this
-# crate has.
-#
-# **What this means for us.** Nothing in these families loops 256 times; the longest is a 3x3
-# kernel in `hillshade_prepare` and a sixteen-tap raster, and sixteen is the count ir3 unrolls.
-# So the 40% in #151 does not describe any shader we ship, and the ALU rate on this part is the
-# same whichever driver draws it.
-#
-# ---------------------------------------------------------------------------
-# # What a first frame costs: 8 to 36 milliseconds a pipeline on the blob (2026-10-20)
-#
-# The sections above measure compilation with shaders of 88 to 358 words, which is a tenth of
-# what this crate emits. `drvprof module <vs.spv> <fs.spv> ...` takes **per-stage** SPIR-V --
-# naga with `PipelineOptions`, one entry point at a time, which is what `pipelines::Stages`
-# does and what the blob requires -- so the figures below are real family modules.
-#
-#   microseconds, per vkCreateGraphicsPipelines, no cache object
-#
-#   family (vertex + fragment words)        blob cold   blob p50   turnip cold   turnip p50
-#   background          (1072 + 946)         9810..14588    8370      3380..6299      5.9
-#   fill_extrusion      (1886 + 1039)       20051..20257   19830      8116..8846      6.2
-#   line_sdf            (2885 + 1810)       34893..36016   30700     14598..14998      6.2
-#
-# **Three to five times what the synthetic shaders suggested.** `line_sdf` is 35 ms a pipeline on
-# the blob -- a single family, compiled once per process, and the blob's p50 equals its cold
-# figure because without a cache object it recompiles every time, and with one the data does not
-# survive the process (the section above).
-#
-# **Turnip compiles the same modules 2.4 to 2.5 times faster** and then answers repeats in 6 us
-# from its in-process cache, with Mesa's disk cache disabled.
-#
-# ## The number that matters
-#
-# `capture_frame` against a real captured frame (`real.tslcap`, a Mercator view of a city) needs
-# **12 pipelines from 7 families**: background, circle, fill, fill_extrusion,
-# fill_extrusion_instanced, fill_outline_triangulated, line. Not the 168 that `pipelines_build`
-# brings up -- `Cache` builds what a frame asks for.
-#
-# So the shader compile before a first frame, on this part:
-#
-#   blob     12 pipelines x 8..35 ms   =  roughly a quarter of a second, every process start,
-#                                        and no cache avoids it
-#   turnip   12 x 3.4..15 ms the first time, then ~0 with a cache persisted to a file
-#
-# A product that starts a map once and runs for hours pays the blob's quarter second at startup
-# and never again. Anything that respawns the renderer pays it every time, and that is the one
-# place in this whole comparison where the two drivers are not close.
-#
-# ---------------------------------------------------------------------------
-# # What a cache object is worth, on real modules (2026-10-20)
-#
-# The section above measures a *first* compile. This measures the second, third and fifteenth
-# pipeline built out of **one module pair** -- each differing only in a piece of harmless state,
-# which is exactly the shape this crate builds: 168 pipelines out of 66 pairs, because a pipeline
-# is per vertex layout and permutation where a module is per family and surface.
-#
-#   microseconds, p50 over fourteen repeats after the first
-#
-#   family module pair       null cache   a cache object    ratio
-#   background                   8359          121           69x
-#   fill_extrusion              19536          184          106x
-#   line_sdf                    35117          280          125x
-#
-# **The null-cache column is the repeat, not the first build.** Qualcomm's driver recompiles the
-# shader every time it is handed nowhere to keep the result -- which is its right: a driver owes
-# nothing without a `VkPipelineCache`, and `vkCreateGraphicsPipelines` was being passed
-# `VK_NULL_HANDLE` here.
-#
-# Turnip answers in **5.8 us with or without**, because Mesa keeps an implicit in-process cache.
-# So this is not a Mesa-versus-vendor difference in quality; it is a difference in what each
-# driver does when the application declines to ask.
-#
-# ## So the pass asks now
-#
-# `tessella_vk::Gpu::with_cache` and `pipelines::Cache`'s own `compiled` field: one
-# `VkPipelineCache`, made on the first build and handed to every one after. Of the 168 pipelines
-# this crate can build, about 102 share a module pair with one already built, so on this driver
-# they go from 8..35 ms each to 0.12..0.28 ms. For the 12 pipelines a real frame needs
-# (`capture_frame`, 7 module pairs) it is five of the twelve, which is roughly 100 ms off a
-# quarter-second first frame.
-#
-# Nothing else changes: `first_pixel` reads 49 of 49 on the desktop and on the gating target with
-# the cache in place, `capture_frame` replays `real.tslcap` to the same 6312 colors and the same
-# 28 draws, and the counts `Cache` reports -- 37 pipelines from 66 module handles -- are
-# unchanged, because the driver's cache holds compiled shaders and this one holds pipelines.
-#
-# ---------------------------------------------------------------------------
-# # Every bench, on the Adreno 640 under turnip (2026-10-20)
-#
-# `draw_cost`, `first_pixel` and `pipelines_build` were the three recorded here. The other
-# fourteen run now, and **all fourteen pass** -- which is the result, because turnip's **kgsl**
-# backend is the least-travelled path in any of this: Mesa tests the msm one, and this board has
+# Fourteen more run here and all fourteen pass, which is the result: turnip's **kgsl** backend
+# is the least-travelled path in any of this, since Mesa tests the msm one and this board has
 # no msm GPU node. It handled the GENERAL-layout handoff, linear staging, host-visible blocks,
-# stencil masks and a two-pass frame without a single failure.
+# stencil masks and a two-pass frame without a failure -- a_frame, a_mesh, block_buffers,
+# clip_masks, depth_bands, descriptor_layouts, descriptor_sets, geometry_store, hand_off,
+# instance_fetch, overdraw_cost, texture_images, two_passes and capture_frame.
 #
-#   a_frame             3 batches, 4 drawables, 4 draws, 0 unclipped, both passes
-#   a_mesh              2016 texels of about 2048, 75% on the left
-#   block_buffers       nine checks, zeroed through forgotten
-#   capture_frame       real.tslcap: 12 batches, 28 draws, 0 undrawn, 0 unclipped
-#   clip_masks          2048 of 4096 in the masked half; the wrong reference draws nothing
-#   depth_bands         the upper layer wins in both draw orders
-#   descriptor_layouts  84 set and pipeline layouts resident at once
-#   descriptor_sets     84 sets from one pool, widest 12 bindings
-#   geometry_store      round trip, dedup, bind list, refusals
-#   hand_off            64x64 BGRA blue every texel, GENERAL, a ring of three
-#   instance_fetch      firstInstance moves the attribute element and the builtin, 0..3
-#   overdraw_cost       the depth early-out saves 85.7% of a sixteen-layer frame
-#   texture_images      scattered regions, whole texture, staging reuse
-#   two_passes          the child recorded first, 4096 texels of its color
-#
-# ## Five numbers that are the driver's and not the library's
-#
-# Worth writing down because they differ from the Pi 5's for the same code, and a reader
-# comparing the two files would otherwise read a difference as a change.
+# Five figures differ from the Pi 5's for the same code, and are written down so a reader
+# comparing the two files does not read a difference as a change. Both are Mesa drivers:
 #
 #   `a_frame`'s second region runs on **S8_UINT** here and `D24_UNORM_S8_UINT` on V3D. Turnip
 #   offers a standalone stencil format and V3DV does not, so `Attachment::StencilOnly` gets a
 #   true stencil-only attachment on this part.
 #
 #   `descriptor_layouts` reports the widest set as six storage descriptors against a limit of
-#   **16,777,216**. On V3D that limit is **8**, which is where `descriptor-limits-are-unenforced`
-#   gets its two of headroom. The constraint belongs to the gating target alone; this part has no
-#   opinion.
+#   **16,777,216**. On V3D that limit is **8**, which is where
+#   `descriptor-limits-are-unenforced` gets its two of headroom. The constraint belongs to the
+#   gating target alone; this part has no opinion.
 #
-#   Allocation granularity: `geometry_store` round-trips 136 claimed bytes in **192** here and 768
-#   on V3D; `texture_images` staging is 8192 then 9216 against 4160 then 5440; `block_buffers`
-#   holds 128 bytes resident against 256. Every one of those is an alignment the driver chose.
+#   Allocation granularity: `geometry_store` round-trips 136 claimed bytes in **192** here and
+#   768 on V3D; `texture_images` staging is 8192 then 9216 against 4160 then 5440;
+#   `block_buffers` holds 128 bytes resident against 256. Each is an alignment the driver chose.
 #
 #   `overdraw_cost` saves **85.7%** of a sixteen-layer frame against V3D's 89% in #104 -- the
-#   same early-out, measured on a second part, which is what §11.7's depth-write split was for.
-#   Board at load 16, so read the ratio and not the microseconds; the floor with nothing drawn is
-#   343.5 us a frame.
+#   same early-out on a second part, which is what §11.7's depth-write split was for. The floor
+#   with nothing drawn is 343.5 us a frame.
 #
-#   `capture_frame` draws the same frame as the Pi: `[234, 230, 221, 255]` over **533,541**
-#   texels here against **533,544** there, with 6236 colors against 6312. Three texels and 76
-#   colors between two GPUs on one recorded frame, which is rasterization and filtering rather
-#   than anything structural -- 12 batches, 28 draws, 0 undrawn and 0 unclipped on both.
+# ## What this does not say
+#
+# **Nothing about the vendor stack.** Both findings this board forced -- no `mat4x4` read from a
+# storage buffer, and one entry point per SPIR-V module -- are recorded above, and turnip
+# accepts what that driver refused. A run here says the shaders and the library are right on
+# Adreno 640 hardware; it does not re-test the driver that ships on it.
+#
+# ---------------------------------------------------------------------------
+# # What a pipeline cache is worth, and why the pass hands one over (2026-10-20)
+#
+# A driver owes nothing without a cache object: `vkCreateGraphicsPipelines` passed
+# `VK_NULL_HANDLE` may compile the shader every time, and the specification does not ask it to
+# keep anything. That is not a quirk of any one driver -- **RADV does it too** with its own
+# caches out of the way (`MESA_SHADER_CACHE_DISABLE=true`, no cache object): `fs-alu` at 534 us
+# cold and **453 us on every repeat**, recompiling each time.
+#
+# Which matters here because the two caches hold different things. `pipelines::Cache` holds a
+# *pipeline* per `Key`, so it never asks for the same pipeline twice -- but a key carries the
+# vertex layout and the permutation where a module is per family and surface. **The pass builds
+# 168 pipelines out of 66 module pairs**, so about a hundred of them hand the driver shader text
+# another pipeline has already compiled. A real frame is 12 pipelines from 7 module pairs, so
+# five of its twelve.
+#
+# `tools/drvprof cache [path]` is what asks the question per driver, and `drvprof module` times
+# real family module pairs rather than the 88-to-358-word synthetics:
+#
+#   turnip, Mesa's own caches disabled        first create   repeats
+#   background       (1072 + 946 words)          3380 us      5.9 us
+#   fill_extrusion   (1886 + 1039)                8116        6.2
+#   line_sdf         (2885 + 1810)               14598        6.2
+#
+#   a cache object preloaded from a file         27..77 us for the first create
+#
+# V3DV honors a serialized cache as well -- 22,544 bytes for three pipelines, and reloading it
+# in a new process turns a 1.6 ms first create into 3.4 us -- and keeps something even with no
+# cache object, where RADV recompiles. So "no cache without a cache object" is per driver rather
+# than a rule, and **the only safe assumption is to always pass one**, which #158 makes the pass
+# do.
+#
+# `drvprof cache` answers it per driver for anyone who needs the figure.
+#
+# ---------------------------------------------------------------------------
+# # ir3 leaves a long loop rolled, and that is not an ALU gap (2026-10-20)
+#
+# Worth recording because it is easy to read a slow number as weak code generation. Measured on
+# turnip with `tools/drvprof`, GPU timestamps, min of fifteen:
+#
+#   256 dependent squarings, rolled loop       3158.2 us
+#   the same arithmetic written flat            447.8 us
+#
+# Squaring rather than scaling because `acc * k + c` repeated is affine and collapses to one
+# multiply-add, so the rolled/flat pair for *that* measures an optimizer instead.
+#
+# `IR3_SHADER_DEBUG=disasm` says what happened (`TU_DEBUG=shaderdb` no longer exists):
+#
+#   shader            instr   nops   loops
+#   fs-const              5      0      0
+#   fs-sq                30     15      1   <- 256 iterations, not unrolled
+#   fs-sq-flat         1042    777      0
+#   fs-tex              158      6      0   <- sixteen iterations, unrolled
+#
+# So ir3 unrolls a sixteen-iteration loop and leaves a 256-iteration one rolled, and the rolled
+# form pays loop overhead on top of the stalls a dependent chain causes either way -- three
+# quarters of the flat form's slots are nops too. **Nothing in these families loops 256 times**:
+# the longest are a 3x3 kernel in `hillshade_prepare` and a sixteen-tap raster, and sixteen is
+# the count ir3 unrolls. So this describes no shader this crate ships.
+#
+# ---------------------------------------------------------------------------
+# # The GPU clock steps 257 to 500 MHz, which is worth a factor of two (2026-10-20)
+#
+# Every timing in this file is read against this, so it goes last and applies to all of it.
+#
+#   /sys/class/devfreq/2c00000.qcom,kgsl-3d0
+#   governor               msm-adreno-tz
+#   available_frequencies  500 427 345 257 MHz
+#   min / max              257 / 500 MHz, and max_pwrlevel 0 -- nothing is capping it
+#
+# **Under a light load the governor never leaves the bottom step.** A parallel session sampling
+# `cur_freq` every 20 ms across five runs of a Flutter cluster scenario -- about 4,300 samples --
+# read 257 MHz every time, with `trans_stat` showing zero ms at any other step and
+# `gpu_busy_percentage` at p50 16, max 25.
+#
+# **A saturating one reaches the top.** `drvprof fill` sampled the same way, 700 samples over
+# two back-to-back invocations: 666 at 257 MHz, three at 345, four at 427 and **27 at 500**,
+# with `trans_stat` at 500 MHz gaining 1,548 ms over those runs.
+#
+# And the same test in the two invocations, by GPU timestamp:
+#
+#                             run 1 (from idle)   run 2 (straight after)
+#   fill: 1 draw, const            145.5 us              76.1 us          1.91x
+#   alu: 1 draw, 256 mad          3156.7                1623.6            1.94x
+#
+#   500 / 257 = 1.95
+#
+# So a factor of two on this board is one devfreq transition, not driver behavior, heat or
+# noise. What follows:
+#
+#   - Compare back to back in one sitting, and record which step you were on.
+#   - Prefer `min` over `p50`: the fastest sample is the one least likely to span a transition.
+#   - Read a wide spread as a transition rather than noise. `alu: 8 draws` has reported min
+#     9697.7 against p50 13917.4 -- a 44% gap, which is the clock moving mid-series.
+#   - A figure from an idle board is a 257 MHz figure. The first measurement after boot is the
+#     slowest one you will ever take.
+#
+# **It does not rescale anything above.** Every cross-driver and cross-device comparison in this
+# file was taken back to back within one sitting, and the figures that carry a driver name land
+# on the bottom step for both sides -- which is checkable: turnip's 3156.7 here is the same
+# number its column carries, and that is the 257 MHz value.
+#
+# Pinning is available and not taken: the governors on offer are userspace, powersave,
+# performance, simple_ondemand and msm-adreno-tz, and `min_freq` is writable. Holding the top
+# step would make every number repeatable and would also leave the board in a state the next
+# user did not ask for.

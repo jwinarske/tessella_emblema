@@ -34,7 +34,21 @@ carrying two -- and no matrices, because it refuses a `mat4x4` read from a stora
 | `vs-degenerate` | one multiply a vertex and a shared position, so vertex work has no fragments |
 | `fs-const` | a constant color: fill rate and the pass's own cost |
 | `fs-alu` | 256 dependent multiply-adds a fragment, seeded from the position |
+| `fs-alu-flat` | the same arithmetic written out, so the pair says what the loop costs |
+| `fs-sq` | 256 dependent **squarings**, which no compiler can fold |
+| `fs-sq-flat` | the same, written out: the pair that measures arithmetic rather than an optimizer |
 | `fs-tex` | sixteen samples a fragment at coordinates that move with the pixel |
+
+**Why two pairs.** `acc * k + c` repeated is affine and collapses to a single multiply-add, and
+Qualcomm's compiler does collapse it -- `fs-alu-flat` returns that driver's constant-color cost
+exactly. So the `fs-alu` pair measures an optimizer. `acc * acc + c` does not collapse, which is
+what makes `fs-sq-flat` the ALU-throughput number: the two drivers come within 1.7% on it, where
+the rolled form differs by 46%.
+
+**Reading ir3's own numbers.** `IR3_SHADER_DEBUG=disasm` prints a `; FRAG prog N/M: U instr, U
+nops, ...` line per shader, which is how the loop story was settled: ir3 unrolls `fs-tex`'s
+sixteen iterations (158 instructions, 0 loops) and leaves 256 rolled (30 instructions, half of
+them nops, 1 loop). `TU_DEBUG=shaderdb` does not exist in current Mesa; this is the flag.
 
 ## Reading the output
 

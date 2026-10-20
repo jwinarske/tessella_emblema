@@ -530,3 +530,67 @@
 # is the clearest of them -- `scale` is `(tile.dimension.x - 2.0) / tile.dimension.x`, both
 # of them components of a block member, and the pixel it reads is `[128, 128, 255, 255]`,
 # which is the flat normal a zero slope gives.
+
+# # 49 of 49, and VIV-4 is VIV-2
+#
+# The section above attributed nineteen of the thirty-four wrong pixels by reading the bodies
+# against the rule rather than by mutating them. Measured 2026-10-20, by hoisting **every**
+# component read in the shader text behind a `Function` variable -- two mechanical rules over
+# the WGSL strings in `src/shaders.rs` and `src/surface.rs`:
+#
+#   let X = <name>_ubo[...]      ->  var X = <name>_ubo[...]
+#   fn vertex_main(in: In) {     ->  ... { var held = in;      and every `in.` -> `held.`
+#
+# plus a `var` inside the three prelude helpers that take `packed.x`.
+#
+#   change                                              correct of 49   segfaults
+#   none                                                       8            7
+#   the three prelude helpers only                            22            7
+#   the two rules only                                        20            0
+#   both                                                    **49**          0
+#
+# **The board reads every expected pixel.** The seven VIV-4 segfaults included: `raster`,
+# `raster_adjusted`, `raster_interleaved`, `raster_raised_skirt`, `background_pattern` and both
+# `fill_extrusion_pattern` cases build and draw correctly, which none of them has ever done
+# here. And the same shader text reads 49 of 49 on RADV, unchanged, which is the control that
+# says the hoist is value-preserving rather than quietly different arithmetic.
+#
+# So **VIV-2 and VIV-4 are one condition with two outcomes**: a composite read whose operand
+# comes straight out of another composite read on a whole-struct *value*. Where the second
+# read is a construct the back end segfaults; where it is an extract or a swizzle it answers
+# member 0.
+#
+# # The third row is the one to read twice
+#
+# Hoisting every *interface* read -- the two rules, without the prelude -- fixes the geometry
+# of every family and clears all seven segfaults, and **breaks fourteen cases the prelude fix
+# had fixed**. It moves the chained read rather than removing it: `paint_<name>(held)` passes
+# the struct **by value**, and a by-value parameter is a whole-struct load, so the component
+# read inside `mix_value` is a chained read again. `member/m-byvalue.spv` in the crash
+# repository is that shape on its own, against `m-byvalue-var` which copies inside the helper.
+#
+# The rule that follows: the `var` belongs where the component is taken, not where the struct
+# is bound.
+#
+# # The inlining layer is still required
+#
+# With both hoists and `VIV_SPV_INLINE_DISABLE=1`: 18 correct, 18 segfaults, 13 wrong pixels.
+# VIV-1 -- a construct in a called function whose operand is a value parameter -- is a
+# separate condition, and `VK_LAYER_viv_spv_inline` is still what answers it. Layer-off went
+# from 7 correct to 18, and no further.
+#
+# # Still no code change, and now the price is exact
+#
+# What adopting it would be: 51 `var held = in;` lines, 84 `let` -> `var` on block bindings,
+# three `var`s in the prelude, and no other edit -- 425 insertions against 374 deletions,
+# almost all of it one-token. What it would also be:
+#
+#   - `tests/properties.rs`'s `every_body_reads_its_properties_through_their_functions` fails,
+#     because it asserts each body calls `paint_color(in)` by name. A guard doing its job.
+#   - a convention every later body has to keep, with nothing but that test to keep it, and
+#     the reason for it invisible at the point of use -- a `var` that reads as a style tic.
+#   - re-measurement on V3D and the Adreno 640, neither of which is this part.
+#
+# For a board that is a probe target rather than a gating one, that is still churn. What the
+# measurement buys is that it is now a decision with a number on both sides rather than a
+# guess: three lines and 135 one-token edits, against a part that draws every pixel.

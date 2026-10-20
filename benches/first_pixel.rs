@@ -811,9 +811,9 @@ fn run() -> Result<usize, String> {
         // A line case reading the row *below* the line's own is reading the second pixel of
         // mbgl's two-pixel outline, and `device::line_width` falls back to one pixel where the
         // device reports no `wideLines` -- so that row holds the clear there, and the case is
-        // not measurable rather than failed. Both gate devices have the feature;
-        // the Adreno 640 under Mesa's turnip is the first device here that does not, and it
-        // draws the other two line cases right.
+        // not measurable rather than failed. Both gate devices have the feature; the Adreno
+        // 640 is the first part measured here without it -- under either of its drivers, so
+        // it is the part and not the driver -- and it draws the other two line cases right.
         if pipelines::sets_line_width(case.topology)
             && case.at.1 != SIDE / 2
             && open.line_width() < device::OUTLINE_WIDTH

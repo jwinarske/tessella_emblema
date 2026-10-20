@@ -1,0 +1,50 @@
+# Two drivers for one Adreno 640
+
+`drvprof.c` measures what a Vulkan driver costs, in pieces small enough to attribute: shader
+compilation, pipeline creation, command recording, submit latency, and four GPU-bound passes.
+It exists because the SA8155P has **two** drivers for the same part -- Qualcomm's
+`libvulkan_adreno.so` and Mesa's turnip -- and the interesting question is not whether either
+works but where each is weak.
+
+It uses a `VkRenderPass` rather than dynamic rendering, which is the whole point: the blob has
+neither the Vulkan 1.3 feature nor `VK_KHR_dynamic_rendering`, so nothing in `benches/` can open
+a device on it. One binary and one loader run both drivers, so the driver is the only variable.
+
+## Building and running
+
+No Rust, no crate, nothing in the workspace: it is one C file and five shaders. Cross-compile it
+the way the baseline records for this board, push it with the `.spv` files beside it, then
+
+    export LD_LIBRARY_PATH=/tmp/turnip          # the loader built for the board
+    VK_ICD_FILENAMES=/etc/vulkan/icd.d/adreno-vk.json ./drvprof all   # the blob
+    VK_ICD_FILENAMES=/tmp/turnip/freedreno_icd.json  ./drvprof all   # turnip
+    MESA_SHADER_CACHE_DISABLE=true VK_ICD_FILENAMES=.../freedreno_icd.json ./drvprof all
+
+`all`, or one of `pipeline`, `record`, `submit`, `fill`, `sample`, `vertex`.
+
+## The shaders
+
+Five WGSL files through naga, each with **one** entry point, because the blob refuses a module
+carrying two -- and no matrices, because it refuses a `mat4x4` read from a storage buffer. The
+`.spv` beside each one is naga 23.1.0 output, `--release`, which is what the crate emits.
+
+| module | what it is for |
+|---|---|
+| `vs-quad` | one oversized triangle covering the target, no vertex buffer |
+| `vs-degenerate` | one multiply a vertex and a shared position, so vertex work has no fragments |
+| `fs-const` | a constant color: fill rate and the pass's own cost |
+| `fs-alu` | 256 dependent multiply-adds a fragment, seeded from the position |
+| `fs-tex` | sixteen samples a fragment at coordinates that move with the pixel |
+
+## Reading the output
+
+Every figure is a p50 over fifteen repeats, and the GPU-side ones also carry a `min`, because
+this board's load average sits above ten and its GPU clock ramps: a full-screen fragment pass
+measured 140 us in one process and 73 us in the next, from the same binary. Compare runs taken
+back to back, and prefer the `min` -- `p50` on a contended board is a ceiling, not a figure.
+
+Pipeline creation is reported **cold and warm separately** for the same reason it has to be:
+Mesa caches compiled shaders in process and on disk, so the second create of one shader is a
+cache hit rather than a compile, and a median over a loop would report the cache.
+
+The numbers, and what they say about each driver, are in `../../tests/bench-baselines/sa8155p.txt`.

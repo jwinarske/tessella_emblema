@@ -329,3 +329,84 @@
 # That is the GPU clock ramping, and it is why the table above is the min of fifteen within a
 # round where both drivers ran back to back. A single comparison taken after an idle board
 # would have read turnip as **twice as fast** at fragment work, and it is not.
+#
+# ---------------------------------------------------------------------------
+# # The cache row, answered: it works in a process and not across one (2026-10-20)
+#
+# `drvprof cache`, both drivers, two invocations each so the second loads what the first wrote.
+# Load average 16.5, so these are compile times on a contended CPU -- but both drivers ran back
+# to back and the ratios are forty to a hundred fold.
+#
+#   microseconds, per vkCreateGraphicsPipelines      fs-const    fs-alu    fs-tex
+#   BLOB   run 1, empty cache, first create             7582      8874     12972
+#          run 1, repeats against that cache              88        91       112
+#          run 2, cache preloaded, first create          6229     15800     13268
+#          run 2, repeats                                 205       176       112
+#   TURNIP run 1, empty cache, first create             2276      1606      4798
+#          run 1, repeats                                  5.2       5.3       5.7
+#          run 2, cache preloaded, first create           77        27        48
+#          run 2, repeats                                  20        20        21
+#
+# **The blob honors a cache object within a process**: 88 us against 7582 for the same pipeline,
+# an eighty-fold drop. #151's "no cache behind `vkCreateGraphicsPipelines`" was the absence of a
+# cache object and nothing more, as the correction in #152 said.
+#
+# **And its serialized data does not carry across a process.** Run 2 loaded the 12,808 bytes run
+# 1 wrote, and still paid 6.2 to 15.8 ms for the first create of every shader -- full recompiles.
+# `vkGetPipelineCacheData` then returned **25,593** bytes, twice what went in, so the loaded
+# entries were kept and not matched: the blob appended new ones beside them.
+#
+# Turnip's does carry: 27 us where a compile is 1606, and its cache came back the same 28,573
+# bytes it went in as, so every entry was recognized.
+#
+# **What that costs us.** This crate builds 168 pipelines. On the blob that is one to two seconds
+# of compile on **every process start**, and a cache shipped with the application does not avoid
+# it -- only keeping the process alive does. On turnip the same cache makes it a few milliseconds.
+# For a product that starts a map once and runs for hours, this is a startup-latency question
+# rather than a frame-rate one; for anything that respawns, it is the whole cost.
+#
+# # And the 40% fragment-ALU gap was the loop, not the ALU
+#
+# #151 reports turnip 40% behind on 256 dependent multiply-adds and guesses at multiply-add
+# fusion. The guess was wrong and so was the framing. Two more shader pairs say why.
+#
+#   microseconds, GPU timestamps, min of fifteen, both drivers back to back
+#
+#   fragment shader                              blob   turnip
+#   256 mads, rolled loop  (fs-alu)             2253.7   3156.3     turnip 40% slower
+#   the same, written flat (fs-alu-flat)         140.4    768.3     see below
+#   256 squarings, rolled  (fs-sq)              2157.6   3158.2     turnip 46% slower
+#   the same, written flat (fs-sq-flat)          440.5    447.8     **level, 1.7%**
+#
+# `fs-sq` squares rather than scaling, which no compiler can fold -- `acc * k + c` repeated is
+# affine and collapses to one multiply-add, `acc * acc + c` does not. That pair is the one that
+# measures arithmetic:
+#
+# **Unrolled, the two drivers are within 1.7% of each other.** The ALU is not turnip's weak
+# point. What is 46% slower is the *rolled* form of the same arithmetic.
+#
+# `IR3_SHADER_DEBUG=disasm` says what ir3 did, per fragment shader:
+#
+#   shader           instr   nops   non-nops   loops
+#   fs-const             5      0          5       0
+#   fs-alu              30     15         15       1   <- not unrolled
+#   fs-alu-flat       1038    774        264       0
+#   fs-sq               30     15         15       1   <- not unrolled
+#   fs-sq-flat        1042    777        265       0
+#   fs-tex             158      6        152       0   <- sixteen iterations, unrolled
+#
+# So ir3 unrolls a sixteen-iteration loop and leaves a 256-iteration one rolled, and the rolled
+# form pays loop overhead on top of the stalls a dependent chain causes either way -- three
+# quarters of the flat form's slots are nops too. The blob's compiler handles the long loop
+# better; given the same straight-line code they are equal.
+#
+# **The affine pair measures something else again.** The blob returns 140.4 us for `fs-alu-flat`,
+# which is exactly its cost for a constant color: it folded 256 affine steps into nothing.
+# Turnip kept all 256 (1038 instructions) and took 768.3. So Qualcomm's compiler does an
+# algebraic simplification turnip does not -- a real difference, on a shape no shader in this
+# crate has.
+#
+# **What this means for us.** Nothing in these families loops 256 times; the longest is a 3x3
+# kernel in `hillshade_prepare` and a sixteen-tap raster, and sixteen is the count ir3 unrolls.
+# So the 40% in #151 does not describe any shader we ship, and the ALU rate on this part is the
+# same whichever driver draws it.

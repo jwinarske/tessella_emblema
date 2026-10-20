@@ -631,6 +631,14 @@ int main(int argc, char **argv) {
         bench_gpu(&g, "fill: 8 draws, const", "vs-quad.spv", "fs-const.spv", 8, 3);
         bench_gpu(&g, "alu: 1 draw, 256 mad", "vs-quad.spv", "fs-alu.spv", 1, 3);
         bench_gpu(&g, "alu: 8 draws, 256 mad", "vs-quad.spv", "fs-alu.spv", 8, 3);
+        // The same arithmetic unrolled. ir3 leaves the 256-iteration loop rolled and half its
+        // instruction slots are nops, so this pair says what the loop costs rather than the
+        // arithmetic.
+        bench_gpu(&g, "alu: 1 draw, flat", "vs-quad.spv", "fs-alu-flat.spv", 1, 3);
+        bench_gpu(&g, "alu: 8 draws, flat", "vs-quad.spv", "fs-alu-flat.spv", 8, 3);
+        // And the same pair with a chain neither compiler can fold -- squaring is not affine.
+        bench_gpu(&g, "sq: 1 draw, rolled", "vs-quad.spv", "fs-sq.spv", 1, 3);
+        bench_gpu(&g, "sq: 1 draw, flat", "vs-quad.spv", "fs-sq-flat.spv", 1, 3);
     }
     if (all || !strcmp(what, "sample")) {
         bench_gpu(&g, "sample: 1 draw, 16 taps", "vs-quad.spv", "fs-tex.spv", 1, 3);

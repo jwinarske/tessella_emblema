@@ -254,11 +254,20 @@
 #
 # Three readings, in order of how much they matter.
 #
-# **The blob's warm column is its cold column.** Create the same pipeline nine times and it
-# compiles nine times; there is no cache behind `vkCreateGraphicsPipelines` that this probe can
-# find. Turnip has two -- an on-disk one at `/home/root/.cache/mesa_shader_cache` and an
-# in-process one -- and `MESA_SHADER_CACHE_DISABLE=true` is the only way to measure its
-# compiler rather than its cache. The `turnip cold` column above is with the cache **off**.
+# **The blob's warm column is its cold column**: create the same pipeline nine times and it
+# compiles nine times. Turnip has two caches -- an on-disk one at
+# `/home/root/.cache/mesa_shader_cache` and an in-process one -- and
+# `MESA_SHADER_CACHE_DISABLE=true` is the only way to measure its compiler rather than its
+# cache, so the `turnip cold` column above is with the cache **off**.
+#
+# **Corrected 2026-10-20: that is not a defect, it is Vulkan.** Those creates pass
+# `VK_NULL_HANDLE` for `pipelineCache`, and a driver owes nothing without a cache object. RADV
+# does exactly the same when its own caches are out of the way -- `MESA_SHADER_CACHE_DISABLE=true`
+# and no cache object: 534 us cold against 453 p50 for `fs-alu`, recompiling every time. What
+# the comparison above really shows is a difference in *defaults*: Mesa ships an implicit disk
+# cache and Qualcomm does not. The question that matters to an application -- whether the blob
+# honors a `VkPipelineCache` it is handed -- is a separate one, and `tools/drvprof cache`
+# answers it; see below.
 #
 # **Compiling, turnip is 3 to 7 times faster**: 1.6 ms against 6.9 for the ALU shader, 4.7
 # against 10.9 for the sampling one. Both compilers slow down with shader size, turnip from 1.2

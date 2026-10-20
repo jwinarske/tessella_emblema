@@ -48,3 +48,30 @@ Mesa caches compiled shaders in process and on disk, so the second create of one
 cache hit rather than a compile, and a median over a loop would report the cache.
 
 The numbers, and what they say about each driver, are in `../../tests/bench-baselines/sa8155p.txt`.
+
+## The cache question, and why it needs its own subcommand
+
+The table in the baseline was taken with `pipelineCache` as `VK_NULL_HANDLE`, which asks a
+driver to compile and tells it nothing may be kept. Read naively it makes the blob look like it
+has no cache. It does not mean that: **RADV behaves identically** under the same conditions --
+`MESA_SHADER_CACHE_DISABLE=true`, no cache object -- recompiling `fs-alu` in 534 us cold and
+453 us on every repeat. A driver owes nothing without a cache object.
+
+So `drvprof cache [path]` asks the question an application actually has:
+
+    ./drvprof cache ./pipeline.cache     # first run: empty cache, compiles, writes the file
+    ./drvprof cache ./pipeline.cache     # second run: loads it, and the creates should be cheap
+
+Three states are distinguishable, and on RADV with its own caches disabled all three show:
+
+| state | fs-const | fs-alu | fs-tex |
+|---|---|---|---|
+| no cache object, every create | 6701 / 296 p50 | 534 / 453 p50 | 1024 / 937 p50 |
+| cache object, empty: first create | 1216 | 550 | 949 |
+| the same object, repeats | 2.1 | 2.1 | 2.1 |
+| cache object preloaded from the file: first create | 45.1 | 4.0 | 4.7 |
+
+Microseconds. The second row is a compile, the third is the in-process cache, and the fourth is
+the serialized cache surviving a process boundary -- which is the one worth knowing per driver,
+because it is what a product can ship. Run it on both drivers before concluding anything about
+startup cost.

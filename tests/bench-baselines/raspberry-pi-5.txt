@@ -118,3 +118,68 @@
 # present.
 #
 # llvmpipe would also pass all 24 cases, so a software fallback is invisible in the pixels.
+
+# ---------------------------------------------------------------------------
+# # `tools/drvprof` on V3DV (2026-10-20)
+#
+# The driver-level profile the sa8155p file introduced, run on the gating target. Built on the
+# board with its own gcc 14, `MESA_SHADER_CACHE_DISABLE=true` throughout so the figures are
+# V3DV's compiler rather than Mesa's disk cache, load average 0.01 -- which is the thing this
+# board has and the sa8155p does not.
+#
+# ## Pipeline creation, and a pipeline cache
+#
+#   microseconds                                     fs-const   fs-alu   fs-tex
+#   no cache object, first create                       966       1123     3760
+#   no cache object, repeats (p50)                        2.9        2.9      2.9
+#   cache object, empty, first create                   742       1019     3730
+#   cache object, repeats                                 2.9        2.8      2.9
+#   cache object preloaded from a file, first create     11.9        3.4      3.3
+#
+# `vkGetPipelineCacheData` is 22,544 bytes for those three pipelines, and reloading it in a new
+# process is what turns the first create from 1.6 ms into 3.4 us. So **V3DV honors a serialized
+# pipeline cache**, which is the question the sa8155p file leaves open for the blob.
+#
+# **And V3DV keeps something even without a cache object**: repeats answer in 2.9 us where the
+# first create took 1.1 ms, with Mesa's disk cache disabled. RADV under the same conditions
+# recompiles every time -- 534 us cold against 453 p50 for `fs-alu` -- so this is not "what Mesa
+# does", it is per driver. Three drivers, three behaviors, and only one of them is a surprise:
+#
+#   driver                      repeats with no cache object
+#   RADV, caches disabled       recompiles (453 us)
+#   V3DV, caches disabled       2.9 us -- something is kept anyway
+#   Adreno 640, Qualcomm's      recompiles (3912..12835 us)
+#
+# ## GPU work, against the Adreno 640
+#
+#   microseconds, GPU timestamps, min of fifteen
+#
+#   pass                                V3D 7.1.7.0   a640 blob   a640 turnip
+#   fill 512x512, 1 draw, constant          154.7          72.9         76.1
+#   fill 512x512, 8 draws, constant         642.6         302.3        283.9
+#   256 dependent mads, 1 draw             8803.1        1159.1       1623.6
+#   256 dependent mads, 8 draws           70290.8        8934.5      12612.0
+#   16 samples a fragment, 1 draw          1194.9         543.2        708.9
+#   16 samples a fragment, 8 draws         8837.5        4075.0       4144.7
+#   1M degenerate vertices                 2175.0        1052.0       1058.6
+#   4M degenerate vertices                 8425.2        4099.5       4106.3
+#
+# The Pi 5's GPU is **half the Adreno's vertex rate, half its fill rate, two to three times
+# slower at sampling, and six to eight times slower at fragment ALU**. The last column is worth
+# keeping beside the others for scale: turnip's 40% ALU deficit against the blob, which the
+# sa8155p file reports, is a fifth of the gap between these two parts. A shader that is
+# comfortable here has room on either Adreno driver.
+#
+# These numbers are also the ones to trust of the three: this board is idle, its governor is
+# `performance`, and nothing moved between runs -- where the sa8155p's blob figures halved
+# between two rounds as its clock ramped.
+#
+# ## Recording
+#
+#   vkCmdDraw                 0.0417 us a draw      (a640: 0.110 blob, 0.029 turnip)
+#   vkCmdBindDescriptorSets   0.0100 us a bind      (a640: 0.019 blob, 0.021 turnip)
+#   instance + device + pass  41.5 ms once          (a640: 15..24 blob, 21..25 turnip)
+#
+# Recording a draw costs more here than under turnip and less than under the blob, on a slower
+# CPU than either -- so it is the driver's work and not the core's. Binding a descriptor set is
+# half what either Adreno driver charges.

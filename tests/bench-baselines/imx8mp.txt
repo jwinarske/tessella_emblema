@@ -349,20 +349,38 @@
 # The section above notes that the probe never calls it. `first_pixel` calls it before the
 # enumeration now.
 #
-# # `draw_cost`'s control still draws nothing, and the cause is this bench
+# # `firstInstance` is verified here now, and it was this bench all along
 #
-# Re-run on the same board, same driver, layer on: `SLOT NOT DELIVERED: the control drew
-# nothing ... the center pixel is [0, 0, 0, 255]`. So `firstInstance` is still unverified
-# here -- but the elimination list above can be closed out, because the shader is now known
-# to draw. `first_pixel`'s `background` case builds **the same family body** through the
-# library's dynamic-rendering path and reads `[0, 0, 255, 255]`, correct, in the same run of
-# the same board. What differs is the probe: this bench builds its own `VkRenderPass`,
-# framebuffer and static-viewport pipeline, where the library records into a dynamic
-# rendering pass. That is where to look, and it is not the SPIR-V, the storage buffer, the
-# vertex formats or the attachment's tiling.
+#   firstInstance reaches the shader as slot 613
+#
+# The section above says the probe cannot draw on this device and that `firstInstance` is
+# unverified here. Both were wrong, and so was the guess that followed them -- that the
+# difference was this bench's render pass against the library's dynamic rendering. It was two
+# stale constants in the bench, and the first of them makes the point this file keeps making
+# about invalid usage:
+#
+# - **The verification pipeline declared `R32G32B32_SFLOAT` at location 0, stride 12**, which
+#   is what `AttributeInfo` said for `idBackgroundPosVertexAttribute` until tessella#326 took
+#   the declared type from the shader text and made it `Short2`. A format whose numeric type
+#   differs from the shader input's is invalid usage --
+#   `VUID-VkGraphicsPipelineCreateInfo-Input-08733`, "format (VK_FORMAT_R32G32B32_SFLOAT) at
+#   Location 0 does not match vertex shader input type (vec2 of sint32)" -- and **no driver
+#   reports it**: RADV drew nothing either, in the same state, and had been since #326. The
+#   board was being read as the odd one out for something every device was failing.
+# - **The slots were written 64 bytes apart**, which is `BackgroundDrawableUBO`'s own size.
+#   The consolidated array pads every block to the widest family's stride, 96 here, so the
+#   identity landed short of the slot the shader reads: a zero matrix, and no triangle.
+#
+# Both now come from the crate -- `device::{vertex_format, stride_of}` and `slots::stride` --
+# so a table change cannot desync them again. The control draws and the slot check passes on
+# RADV and on this board, which closes the elimination list above: not the readback, not the
+# storage buffer, not the tiling, not the loader, not the render pass, and not the driver.
+#
+# The one thing that found it was the Khronos validation layer on the desktop. Run the bench
+# under it whenever the ABI's declared types or the block strides move.
 #
 # Also re-measured, for provenance rather than as a correction -- a different binary and a
 # different tessella ABI from the rows above, so the two are not a before and after:
 #
-#   instance 0.6178 us a draw, push 0.7494, buffers 0.7162, descriptors 2.0156
-#   vertex fetch 3.431 ns (3.312 above)
+#   instance 0.6135 us a draw, push 0.5691, buffers 0.7043, descriptors 2.0295
+#   vertex fetch 3.310 ns, against 3.312 above -- the same number two weeks apart

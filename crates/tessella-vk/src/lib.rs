@@ -107,6 +107,13 @@ pub struct Requirements {
 pub struct Gpu<'d> {
     device: &'d ash::Device,
     memory: &'d vk::PhysicalDeviceMemoryProperties,
+    /// The cache `vkCreateGraphicsPipelines` is handed, or null.
+    ///
+    /// Null is what [`Gpu::new`] leaves, so a caller that does not care is unaffected;
+    /// [`Gpu::with_cache`] is how the pass opts in. It is a handle rather than a borrow because a
+    /// `Gpu` is copied freely and must stay cheap -- the object itself is a [`PipelineCache`] the
+    /// caller owns and outlives the copies.
+    cache: vk::PipelineCache,
 }
 
 impl core::fmt::Debug for Gpu<'_> {
@@ -124,7 +131,71 @@ impl<'d> Gpu<'d> {
     /// is a little over four kilobytes and a `Gpu` is copied freely.
     #[must_use]
     pub fn new(device: &'d ash::Device, memory: &'d vk::PhysicalDeviceMemoryProperties) -> Self {
-        Self { device, memory }
+        Self {
+            device,
+            memory,
+            cache: vk::PipelineCache::null(),
+        }
+    }
+
+    /// The same device, handing `cache` to every pipeline it creates.
+    ///
+    /// # Why bother
+    ///
+    /// A driver owes nothing without a cache object: `vkCreateGraphicsPipelines` with a null cache
+    /// may compile the shader every time, and some do. Measured on an Adreno 640 with Qualcomm's
+    /// driver by `tools/drvprof` in `tessella_emblema`, building pipelines that differ in state
+    /// out of one module pair -- which is what this pass does:
+    ///
+    /// | family module pair | null cache | a cache object |
+    /// |---|---|---|
+    /// | `background` | 8359 us | **121 us** |
+    /// | `fill_extrusion` | 19536 us | **184 us** |
+    /// | `line_sdf` | 35117 us | **280 us** |
+    ///
+    /// Seventy to a hundred and twenty fold, and the null-cache column is the *repeat* rather than
+    /// the first build: that driver recompiles every time it is given nowhere to keep the result.
+    /// RADV does the same with its own caches out of the way. Mesa's drivers happen to keep an
+    /// implicit one -- turnip answers in 5.8 us either way on the same board -- but a vendor
+    /// driver need not, and the specification does not ask it to.
+    ///
+    /// That matters here because a pipeline is per [vertex layout and permutation] and a *module*
+    /// is per family and surface: the pass builds 168 pipelines out of 66 module pairs, so about a
+    /// hundred of them compile shaders another pipeline already compiled.
+    ///
+    /// [vertex layout and permutation]: https://github.com/jwinarske/tessella_emblema
+    #[must_use]
+    pub fn with_cache(self, cache: &PipelineCache<'d>) -> Self {
+        Self {
+            cache: cache.raw(),
+            ..self
+        }
+    }
+
+    /// A pipeline cache, destroyed when dropped.
+    ///
+    /// Starts empty. Nothing here serializes it: `vkGetPipelineCacheData` is how a host would
+    /// persist one across runs, and on the one driver measured for it the data did not produce a
+    /// hit in a new process, so the win being banked here is the within-process one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Call`] if `vkCreatePipelineCache` fails.
+    pub fn pipeline_cache(self) -> Result<PipelineCache<'d>, Error> {
+        let create = vk::PipelineCacheCreateInfo::default();
+        // SAFETY: the info is fully initialized and borrowed only for the call; the device
+        // outlives the returned cache by the lifetime on `Gpu`.
+        let raw =
+            unsafe { self.device.create_pipeline_cache(&create, None) }.map_err(|result| {
+                Error::Call {
+                    call: "vkCreatePipelineCache",
+                    result,
+                }
+            })?;
+        Ok(PipelineCache {
+            device: self.device,
+            raw,
+        })
     }
 
     /// The device, for the parts of the pass this crate does not cover yet.
@@ -404,7 +475,7 @@ impl<'d> Gpu<'d> {
         // call; the device outlives the returned pipeline by the lifetime on `Gpu`.
         let raw = unsafe {
             self.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &infos, None)
+                .create_graphics_pipelines(self.cache, &infos, None)
         }
         .map_err(|(_, result)| Error::Call {
             call: "vkCreateGraphicsPipelines",
@@ -1574,6 +1645,38 @@ impl Drop for Pipeline<'_> {
     fn drop(&mut self) {
         // SAFETY: made by this device, which outlives this, and destroyed exactly once.
         unsafe { self.device.destroy_pipeline(self.raw, None) };
+    }
+}
+
+/// A pipeline cache, destroyed when dropped.
+///
+/// Made by [`Gpu::pipeline_cache`] and handed to a `Gpu` by [`Gpu::with_cache`], which says why
+/// one is worth having.
+pub struct PipelineCache<'d> {
+    device: &'d ash::Device,
+    raw: vk::PipelineCache,
+}
+
+impl core::fmt::Debug for PipelineCache<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("PipelineCache").field(&self.raw).finish()
+    }
+}
+
+impl PipelineCache<'_> {
+    /// The handle, for `Gpu::with_cache`.
+    ///
+    /// Copying it out does not extend its life, as for [`Buffer::raw`].
+    #[must_use]
+    pub fn raw(&self) -> vk::PipelineCache {
+        self.raw
+    }
+}
+
+impl Drop for PipelineCache<'_> {
+    fn drop(&mut self) {
+        // SAFETY: made by this device, which outlives this, and destroyed exactly once.
+        unsafe { self.device.destroy_pipeline_cache(self.raw, None) };
     }
 }
 

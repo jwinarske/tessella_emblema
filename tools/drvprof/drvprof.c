@@ -395,16 +395,33 @@ static VkPipeline pipeline_of(struct gpu *g, VkShaderModule vs, VkShaderModule f
 static void bench_module(struct gpu *g, const char *vs_path, const char *fs_path) {
     VkShaderModule vs = module_of(g, vs_path);
     VkShaderModule fs = module_of(g, fs_path);
-    double create[REPEATS];
+
+    // Twice over: with no cache object, and with one. Each iteration varies a piece of harmless
+    // state, so these are *different pipelines sharing one module pair* -- which is exactly what
+    // tessella_emblema builds, 168 pipelines out of 66 pairs. The second column is what a cache
+    // object is worth to that.
+    double bare[REPEATS], cached[REPEATS];
     for (int r = 0; r < REPEATS; r++) {
         double start = now_us();
         VkPipeline p = pipeline_of_named(g, vs, fs, r + 1, VK_NULL_HANDLE, "vertex_main",
                                          "fragment_main", g->wide_layout);
-        create[r] = now_us() - start;
+        bare[r] = now_us() - start;
         vkDestroyPipeline(g->device, p, NULL);
     }
-    printf("  %-28s %9.1f us cold   %8.1f us p50\n", vs_path, create[0],
-           p50(create + 1, REPEATS - 1));
+    VkPipelineCacheCreateInfo pcci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+    VkPipelineCache cache;
+    CHECK(vkCreatePipelineCache(g->device, &pcci, NULL, &cache));
+    for (int r = 0; r < REPEATS; r++) {
+        double start = now_us();
+        VkPipeline p = pipeline_of_named(g, vs, fs, r + 1, cache, "vertex_main", "fragment_main",
+                                         g->wide_layout);
+        cached[r] = now_us() - start;
+        vkDestroyPipeline(g->device, p, NULL);
+    }
+    vkDestroyPipelineCache(g->device, cache, NULL);
+
+    printf("  %-26s  no cache %9.1f first %9.1f p50   cached %9.1f first %8.1f p50\n", vs_path,
+           bare[0], p50(bare + 1, REPEATS - 1), cached[0], p50(cached + 1, REPEATS - 1));
     vkDestroyShaderModule(g->device, fs, NULL);
     vkDestroyShaderModule(g->device, vs, NULL);
 }

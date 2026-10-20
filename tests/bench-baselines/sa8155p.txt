@@ -540,3 +540,63 @@
 #   texels here against **533,544** there, with 6236 colors against 6312. Three texels and 76
 #   colors between two GPUs on one recorded frame, which is rasterization and filtering rather
 #   than anything structural -- 12 batches, 28 draws, 0 undrawn and 0 unclipped on both.
+#
+# ---------------------------------------------------------------------------
+# # The 2x clock swing, measured rather than inferred (2026-10-20)
+#
+# Two sections above warn that this board's GPU clock ramps and that a fragment-bound figure
+# can move by two between runs. That was inferred from two processes ten minutes apart. It is
+# now measured, and it is a devfreq step.
+#
+#   /sys/class/devfreq/2c00000.qcom,kgsl-3d0
+#   governor               msm-adreno-tz
+#   available_frequencies  500 427 345 257 MHz
+#   min / max              257 / 500 MHz -- max_pwrlevel is 0, so nothing is capping it
+#
+# **Under a light load the governor never leaves the bottom step.** A parallel session sampling
+# `cur_freq` every 20 ms across five runs of a Flutter cluster scenario -- about 4,300 samples --
+# read **257 MHz every time**, with `trans_stat` showing zero ms at any other step and
+# `gpu_busy_percentage` at p50 16, max 25.
+#
+# **Under a saturating one it reaches the top.** `drvprof fill` sampled the same way, 400 samples
+# over its passes:
+#
+#   257 MHz   377 samples
+#   345 MHz     4
+#   427 MHz     4
+#   500 MHz    15
+#
+# and `trans_stat` over that one run went from 0 ms at 500 MHz to **860**, and 0 to 212 at 427.
+# A 512x512 pass with 256 dependent multiply-adds a pixel is what it takes; a map frame is not.
+#
+# ## The two numbers in one process
+#
+# The same run measured, by GPU timestamp:
+#
+#   fill: 1 draw, const        140.5 us
+#   alu:  1 draw, flat          72.8 us
+#
+# Those are the same GPU work. `fs-alu-flat` is 256 affine steps that this driver folds to
+# nothing -- the section above establishes that, where it measured **140.4 us against
+# `fs-const`'s 140.5** at a settled clock. Here they are 140.5 and 72.8 in one process, because
+# the heavy `alu: 256 mad` passes ran between them and took the governor to the top step.
+#
+#   140.5 / 72.8 = 1.93        500 / 257 = 1.95
+#
+# So the factor of two in those earlier sections was never driver behavior, a thermal effect or
+# measurement noise: it is one devfreq transition, and the ratio lands on the step.
+#
+# ## What to do about it
+#
+#   - Compare drivers **back to back in one sitting**, which the sections above do.
+#   - Prefer `min` over `p50`: the fastest sample is the one least likely to span a transition.
+#   - Read a wide spread as a transition rather than noise. In this run `alu: 8 draws` reported
+#     min 9697.7 against p50 13917.4 -- a 44% gap, which is the clock stepping mid-series, not
+#     a contended CPU.
+#   - A figure taken on an idle board is a 257 MHz figure. The first measurement after boot is
+#     the slowest one you will ever take.
+#
+# Pinning is available and not taken: the governors on offer are userspace, powersave,
+# performance, simple_ondemand and msm-adreno-tz, and `min_freq` is writable. Holding the top
+# step would make every number here repeatable -- and would also leave the board in a state the
+# next user did not ask for, so it stays a note rather than a practice.

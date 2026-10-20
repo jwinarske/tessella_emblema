@@ -268,3 +268,101 @@
 #
 # That the shaders are wrong. The same modules draw 24 for 24 on Adreno and on two desktop
 # drivers, bit-identical, and the pixels are derived from mbgl's own arithmetic.
+
+# ---------------------------------------------------------------------------
+# Re-measured 2026-10-19, with the inlining layer, which everything above predates.
+#
+# `VK_LAYER_viv_spv_inline` hooks `vkCreateShaderModule` and runs SPIRV-Tools'
+# `InlineExhaustivePass`. It is installed per-user on this board and active by default, so
+# **every measurement here from 2026-10-08 on is a layer-on measurement**, and a layer-off
+# run is a control that attributes an effect to it rather than a configuration anyone
+# runs. The write-up and the reproducers are in `jwinarske/vivante-spirv-crash`; this
+# board's defects are numbered VIV-1..6 there, with reproducers for five of the six.
+#
+# `first_pixel` at emblema `3f7f003` against tessella `be402e4`, 49 cases (26 when the
+# table above was taken), one case per process via `TSL_ONLY`, weston stopped:
+#
+#                                 layer off (control)   layer on
+#   correct pixel                            7              8
+#   built, wrong pixel                      17             34
+#     -- of those, nothing drawn             7             16
+#   segfault in pipeline creation           25              7
+#
+# Correct: `background`, `background_blended`, `background_faded`, `background_faded_over`,
+# `circle_constant`, `fill_constant`, `fill_no_color`, `heatmap_texture`.
+#
+# Segfaulting: the four raster cases, `background_pattern`, `fill_extrusion_pattern` and
+# `fill_extrusion_pattern_wall`.
+#
+# Nothing drawn (reads the clear, `[51, 102, 153, 255]`): `both_as_glyph`, `both_as_icon`,
+# `circle`, `extrusion_wall`, `extrusion_wall_dim`, `fill_extrusion_raised`, `fill_raised`,
+# `heatmap`, `line_gradient`, `line_pattern`, `line_sdf`, `symbol_below`, `symbol_icon`,
+# `symbol_sdf`, `terrain`, `terrain_skirt`. Reading the clear and reading a wrong color are
+# different findings, and the counts above are the first ones here to separate them.
+#
+# # #326 is not what cost the six families
+#
+# All six build with the layer on and all six still segfault without it, so what the table
+# above recorded is a driver crash an inlining pass works around -- not a cost of taking
+# the declared type from the shader text:
+#
+#   case              layer off   layer on
+#   both_as_glyph      segfault   built, reads the clear
+#   both_as_icon       segfault   built, reads the clear
+#   extrusion_dim      segfault   built, [7, 7, 7, 255] against [125, 125, 125, 255]
+#   fill_extrusion     segfault   built, [15, 15, 15, 255] against [255, 115, 12, 255]
+#   symbol_below       segfault   built, reads the clear
+#   symbol_sdf         segfault   built, reads the clear
+#
+# And the "before #326" column cannot be rebuilt any more. Reverting the six attributes the
+# generated table disagrees on -- `idBackgroundPosVertexAttribute` to `Float3`, the five
+# `idFillExtrusion*`/`idSymbol*` to `Float`, 17 sites -- fails in **naga validation** for 17
+# of the 49 cases, because this crate's shader text is now written against the corrected
+# types: `cannot cast a vec3<f32> to a vec2<f32>`, and `paint_opacity`/`paint_base` called
+# with a `vec2` where a `vec3` is required. tessella#330 is closed on that basis.
+#
+# # "Float vertex attributes read zero" is withdrawn
+#
+# The section above says integer vertex attributes fetch and float ones do not. They fetch.
+# A quad whose `uv` is `(0.3, 0.7)` at every vertex, read in a vertex stage that takes its
+# three attributes as **separate entry-point parameters**, reads exactly right on this part:
+# `[166, 217, 153, 255]` at two sample points, the same as RADV. `attr/attr-flat.spv` in the
+# crash repository, through `repro-attr.c`.
+#
+# What those rungs were reading is VIV-6. **A vertex entry point whose position is built
+# straight out of the struct parameter the translator rebuilds loses the draw** -- naga
+# emits `OpCompositeConstruct` of the input loads, `OpCompositeExtract` to read a member,
+# and where that extract's result is an operand of the construct stored to `gl_Position`,
+# no pixel is written. No crash and no validation message. 193-word module; the same extract
+# through a `var`, times 1.0, by components, or as a separate parameter all draw, and it is
+# identical with the layer on and off. Against a black clear a lost draw and a zeroed color
+# are the same pixel, which is what made those rungs read as a failed fetch.
+#
+# It is not established for the families here: `vertex_main` in
+# `family-mods/background_pattern.spv` has no construct whose operand is an extract, so the
+# sixteen cases that draw nothing reach that by some other path. VIV-2 -- every extract from
+# a rebuilt *fragment* input struct answering member 0 -- is the candidate for the wrong
+# colors, and is confirmed in the vertex stage too (`attr/attr-mixed-read.spv`).
+#
+# # The `check_vertex_formats` gap is closed
+#
+# The section above notes that the probe never calls it. `first_pixel` calls it before the
+# enumeration now.
+#
+# # `draw_cost`'s control still draws nothing, and the cause is this bench
+#
+# Re-run on the same board, same driver, layer on: `SLOT NOT DELIVERED: the control drew
+# nothing ... the center pixel is [0, 0, 0, 255]`. So `firstInstance` is still unverified
+# here -- but the elimination list above can be closed out, because the shader is now known
+# to draw. `first_pixel`'s `background` case builds **the same family body** through the
+# library's dynamic-rendering path and reads `[0, 0, 255, 255]`, correct, in the same run of
+# the same board. What differs is the probe: this bench builds its own `VkRenderPass`,
+# framebuffer and static-viewport pipeline, where the library records into a dynamic
+# rendering pass. That is where to look, and it is not the SPIR-V, the storage buffer, the
+# vertex formats or the attachment's tiling.
+#
+# Also re-measured, for provenance rather than as a correction -- a different binary and a
+# different tessella ABI from the rows above, so the two are not a before and after:
+#
+#   instance 0.6178 us a draw, push 0.7494, buffers 0.7162, descriptors 2.0156
+#   vertex fetch 3.431 ns (3.312 above)

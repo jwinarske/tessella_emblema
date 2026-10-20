@@ -156,7 +156,8 @@
 #   device extensions     162              (blob: 77)
 #   dynamicRendering      YES              (blob: absent, feature and extension both)
 #   vkCreateDevice        SUCCESS with the exact feature struct the benches ask for
-#   wideLines             no, lineWidthRange 1.0..1.0
+#   wideLines             no, lineWidthRange 1.0..1.0 -- and **the blob reports the same**,
+#                         so this is the part rather than the driver
 #
 # ## first_pixel: 48 measured, 48 correct
 #
@@ -168,8 +169,8 @@
 # the row below the line's own, which only the second pixel of mbgl's two-pixel outline
 # covers, and `device::line_width` falls back to one pixel on a device that reports no
 # `wideLines`. The probe says so now instead of failing -- both gate devices have the
-# feature, and this is the first device here that does not. The other two line cases sample
-# the line's own row and pass.
+# feature, and this part has it under neither driver. The other two line cases sample the
+# line's own row and pass.
 #
 # ## pipelines_build: all six checks
 #
@@ -231,3 +232,86 @@
 # `_dl_find_object` -- the last returning -1 so the unwinder takes its pre-2.35 path. None of
 # them is turnip's doing; they are what cross-building a 2026 toolchain against a 2020 glibc
 # costs.
+#
+# ---------------------------------------------------------------------------
+# # The two drivers, side by side (2026-10-20)
+#
+# `tools/drvprof` is a C probe that renders through a `VkRenderPass`, so it runs on **both**
+# drivers -- the blob's missing dynamic rendering is what keeps `benches/` off it. One binary,
+# one loader, two ICD paths, so the driver is the only variable. Five naga modules, one entry
+# point each and no matrices, which is what the blob accepts.
+#
+# Two rounds of blob / turnip / turnip-without-Mesa's-cache, interleaved, load average 16.8.
+#
+# ## Pipeline creation: turnip wins by between three times and a thousand
+#
+#   microseconds, per vkCreateGraphicsPipelines
+#
+#   fragment shader     blob cold   blob warm    turnip cold   with its cache   turnip warm
+#   fs-const  (88 w)      7816         3912         1159             162            5.4
+#   fs-alu   (254 w)      6930         5986         1640              80            5.5
+#   fs-tex   (358 w)     10870        10882         4691              91            5.4
+#
+# Three readings, in order of how much they matter.
+#
+# **The blob's warm column is its cold column.** Create the same pipeline nine times and it
+# compiles nine times; there is no cache behind `vkCreateGraphicsPipelines` that this probe can
+# find. Turnip has two -- an on-disk one at `/home/root/.cache/mesa_shader_cache` and an
+# in-process one -- and `MESA_SHADER_CACHE_DISABLE=true` is the only way to measure its
+# compiler rather than its cache. The `turnip cold` column above is with the cache **off**.
+#
+# **Compiling, turnip is 3 to 7 times faster**: 1.6 ms against 6.9 for the ALU shader, 4.7
+# against 10.9 for the sampling one. Both compilers slow down with shader size, turnip from 1.2
+# to 4.7 ms and the blob from 7.8 to 10.9.
+#
+# **With its cache, turnip is 5 us.** For this crate that is the difference between ~168
+# pipelines costing a second and a half of compile on every process start and costing nothing
+# the second time a device is opened. `vkCreateShaderModule` is noise either way: 3.3 us cold
+# for the blob, 7.0 for turnip.
+#
+# ## Recording: turnip is nearly four times cheaper a draw
+#
+#   vkCmdDraw                 blob 0.1102..0.1285 us      turnip 0.0293..0.0301 us
+#   vkCmdBindDescriptorSets   blob 0.0188..0.0418 us      turnip 0.0212..0.0220 us
+#   instance + device + pass  blob 15.1..23.8 ms          turnip 20.8..24.9 ms
+#
+# The draw figure is the one `draw_cost` already saw from the other side: that bench records a
+# fifth cheaper under turnip, and this says why. Descriptor binds and device creation are a
+# wash.
+#
+# ## GPU work: turnip's fragment ALU is 40% behind, and nothing else is
+#
+#   microseconds, GPU timestamps, min of fifteen, both drivers measured back to back
+#
+#   pass                                   blob    turnip   turnip vs blob
+#   fill 512x512, 1 draw, constant         72.9      76.1      4% slower
+#   fill 512x512, 8 draws, constant       302.3     283.9      6% faster
+#   256 dependent mads, 1 draw           1159.1    1623.6     40% slower
+#   256 dependent mads, 8 draws          8934.5   12612.0     41% slower
+#   16 samples a fragment, 1 draw         543.2     708.9     31% slower
+#   16 samples a fragment, 8 draws       4075.0    4144.7      2% slower
+#   1M degenerate vertices               1052.0    1058.6      1% slower
+#   4M degenerate vertices               4099.5    4106.3      0% slower
+#
+# **Fill rate, vertex rate and warm sampling are the hardware's**, and the two drivers are
+# within a few percent of each other on all three. The vertex rows are the sharpest: 1052
+# against 1058 and 4099 against 4106, which is the part's primitive rate showing through both.
+#
+# **Fragment ALU is turnip's weak point here, by 40%, at both scales.** The same SPIR-V, the
+# same 256-deep dependent chain of a multiply and an add; ir3 takes 1.4x the time Qualcomm's
+# E031 compiler does. The obvious suspect is multiply-add fusion -- 256 mads against 512
+# separate instructions would be 2x, and 1.4x is what partial fusion would look like -- but
+# that is a guess until someone counts instructions, which `TU_DEBUG=shaderdb` would do.
+#
+# **Cold sampling is 31% behind and warm sampling is not**, which makes it a cache-warming
+# difference rather than a sampler-rate one: the blob scales 7.5x from one draw to eight and
+# turnip 5.8x, so turnip is getting more out of the second draw onward.
+#
+# ## A caveat that cost two rounds to find
+#
+# The blob's fragment numbers **halved between round one and round two** -- 140.5 us then 72.9
+# for the same constant fill, 2253.7 then 1159.1 for the same ALU pass -- while turnip's moved
+# by less than half a percent across four runs, and the vertex rows did not move for either.
+# That is the GPU clock ramping, and it is why the table above is the min of fifteen within a
+# round where both drivers ran back to back. A single comparison taken after an idle board
+# would have read turnip as **twice as fast** at fragment work, and it is not.

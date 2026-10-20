@@ -280,3 +280,25 @@
 # **And nothing would tell us if we crossed it**: `within the limits` records that 9 of 8 was
 # accepted on this very device. One more storage buffer in the widest family reaches the limit;
 # two more pass it, and the only sign would be a driver that happens to care.
+#
+# # `capture_frame`: a real frame replays here, which no board had done
+#
+# Two captures from the parity corpus, replayed on the gating target 2026-10-20. This is the
+# only bench that starts from a recorded producer's frame rather than values a case wrote, so it
+# is the one that says the join, the batching and the clipping survive real input on real
+# hardware.
+#
+#   real.tslcap      63 records, 12 batches, 19 geometries, 7 families, 9 of 9 programs placed
+#                    12 pipelines for 12 batches, 7 modules, 28 drawables, 28 draws
+#                    0 of 786432 texels at the clear, 6312 colors
+#   pitched.tslcap   89 records, 12 batches, 32 geometries, the same 7 families
+#                    12 pipelines, 54 drawables, 54 draws, 0 undrawn, 0 unclipped
+#                    0 of 786432 texels at the clear, 5497 colors
+#
+# The seven families are background, circle, fill, fill_extrusion, fill_extrusion_instanced,
+# fill_outline_triangulated and line. **Twelve pipelines, not 168** -- `Cache` builds what the
+# frame asks for, which is what makes the compile figures in `sa8155p.txt` a quarter of a second
+# on one driver rather than twenty.
+#
+# Both frames leave no texel at the clear and nothing undrawn or unclipped, and the state splits
+# three ways (depth 2, depth+color 3, depth+stencil+color 7) exactly as it does on a desktop.

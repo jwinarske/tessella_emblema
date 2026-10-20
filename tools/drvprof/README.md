@@ -61,6 +61,25 @@ Pipeline creation is reported **cold and warm separately** for the same reason i
 Mesa caches compiled shaders in process and on disk, so the second create of one shader is a
 cache hit rather than a compile, and a median over a loop would report the cache.
 
+## Timing this crate's own modules
+
+The five shaders here are 88 to 358 words; a family in `shaders.rs` is one to three thousand, and
+the drivers do not scale the same way. `drvprof module <vs.spv> <fs.spv> [more pairs]` times
+pipeline creation for real module pairs against a layout wide enough for any family -- six storage
+buffers, four sampled images, four samplers, which the widest family (six, three and three) fits
+inside. A layout wider than the module is valid; one that does not cover it is invalid usage, and
+some drivers answer that with a segfault.
+
+The modules have to be **per stage**, one entry point each, because that is what the Adreno blob
+requires -- the same reason `pipelines::Stages` splits them. naga will emit one if asked:
+
+    naga::back::spv::write_vec(&module, &info, &options, Some(&PipelineOptions {
+        shader_stage: naga::ShaderStage::Vertex, entry_point: "vertex_main".into(),
+    }))
+
+They are not checked in: a dump goes stale the moment a body changes, and the word counts beside
+each figure in the baseline are what make the numbers readable.
+
 The numbers, and what they say about each driver, are in `../../tests/bench-baselines/sa8155p.txt`.
 
 ## The cache question, and why it needs its own subcommand

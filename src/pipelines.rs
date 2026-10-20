@@ -1432,6 +1432,23 @@ pub struct Cache<'d> {
     modules: HashMap<(i32, Surface, u64), [tessella_vk::ShaderModule<'d>; 2]>,
     layouts: HashMap<(i32, Surface), Layout<'d>>,
     pipelines: HashMap<Key, tessella_vk::Pipeline<'d>>,
+    /// The driver's own cache, made on the first build and handed to every one after.
+    ///
+    /// # Why, when this struct is already a cache
+    ///
+    /// Because the two cache different things. This one holds a pipeline per [`Key`], so it never
+    /// asks for the same pipeline twice; the driver's holds *compiled shaders*, and a key carries
+    /// the vertex layout and the permutation where a module does not. The pass builds 168
+    /// pipelines out of 66 module pairs, so about a hundred of them hand the driver shader text
+    /// another pipeline has already compiled -- and with a null cache a driver is free to compile
+    /// it again, which Qualcomm's does: 8 to 35 ms a family module pair, against 0.12 to 0.28 ms
+    /// when it is given somewhere to keep the result -- seventy to a hundred and twenty fold.
+    /// [`tessella_vk::Gpu::with_cache`] has the measurement, and it costs nothing on a driver that
+    /// already keeps one: turnip answers in 5.8 us with or without.
+    ///
+    /// `None` until the first build, because making one needs a `Gpu` and this is constructed
+    /// without one.
+    compiled: Option<tessella_vk::PipelineCache<'d>>,
     built: usize,
     bound: usize,
 }
@@ -1461,6 +1478,7 @@ impl<'d> Cache<'d> {
             modules: HashMap::new(),
             layouts: HashMap::new(),
             pipelines: HashMap::new(),
+            compiled: None,
             built: 0,
             bound: 0,
         }
@@ -1564,7 +1582,16 @@ impl<'d> Cache<'d> {
             slot.insert(layout(gpu, bindings)?);
         }
         let stages = Stages::of(&self.modules[&text]);
-        let pipeline = build(gpu, key, &self.layouts[&at], stages, targets)?;
+        // `build` takes the `Gpu` by value and this hands it a copy carrying the cache, so every
+        // pipeline the pass builds is offered one without `build`'s callers having to know.
+        if self.compiled.is_none() {
+            self.compiled = Some(gpu.pipeline_cache()?);
+        }
+        let with_cache = match &self.compiled {
+            Some(cache) => gpu.with_cache(cache),
+            None => gpu,
+        };
+        let pipeline = build(with_cache, key, &self.layouts[&at], stages, targets)?;
         let raw = pipeline.raw();
         self.pipelines.insert(key.clone(), pipeline);
         self.built += 1;

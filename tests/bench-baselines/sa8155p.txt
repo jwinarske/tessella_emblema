@@ -450,3 +450,41 @@
 # A product that starts a map once and runs for hours pays the blob's quarter second at startup
 # and never again. Anything that respawns the renderer pays it every time, and that is the one
 # place in this whole comparison where the two drivers are not close.
+#
+# ---------------------------------------------------------------------------
+# # What a cache object is worth, on real modules (2026-10-20)
+#
+# The section above measures a *first* compile. This measures the second, third and fifteenth
+# pipeline built out of **one module pair** -- each differing only in a piece of harmless state,
+# which is exactly the shape this crate builds: 168 pipelines out of 66 pairs, because a pipeline
+# is per vertex layout and permutation where a module is per family and surface.
+#
+#   microseconds, p50 over fourteen repeats after the first
+#
+#   family module pair       null cache   a cache object    ratio
+#   background                   8359          121           69x
+#   fill_extrusion              19536          184          106x
+#   line_sdf                    35117          280          125x
+#
+# **The null-cache column is the repeat, not the first build.** Qualcomm's driver recompiles the
+# shader every time it is handed nowhere to keep the result -- which is its right: a driver owes
+# nothing without a `VkPipelineCache`, and `vkCreateGraphicsPipelines` was being passed
+# `VK_NULL_HANDLE` here.
+#
+# Turnip answers in **5.8 us with or without**, because Mesa keeps an implicit in-process cache.
+# So this is not a Mesa-versus-vendor difference in quality; it is a difference in what each
+# driver does when the application declines to ask.
+#
+# ## So the pass asks now
+#
+# `tessella_vk::Gpu::with_cache` and `pipelines::Cache`'s own `compiled` field: one
+# `VkPipelineCache`, made on the first build and handed to every one after. Of the 168 pipelines
+# this crate can build, about 102 share a module pair with one already built, so on this driver
+# they go from 8..35 ms each to 0.12..0.28 ms. For the 12 pipelines a real frame needs
+# (`capture_frame`, 7 module pairs) it is five of the twelve, which is roughly 100 ms off a
+# quarter-second first frame.
+#
+# Nothing else changes: `first_pixel` reads 49 of 49 on the desktop and on the gating target with
+# the cache in place, `capture_frame` replays `real.tslcap` to the same 6312 colors and the same
+# 28 draws, and the counts `Cache` reports -- 37 pipelines from 66 module handles -- are
+# unchanged, because the driver's cache holds compiled shaders and this one holds pipelines.

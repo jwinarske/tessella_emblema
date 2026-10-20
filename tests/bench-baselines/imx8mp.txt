@@ -277,7 +277,7 @@
 # **every measurement here from 2026-10-08 on is a layer-on measurement**, and a layer-off
 # run is a control that attributes an effect to it rather than a configuration anyone
 # runs. The write-up and the reproducers are in `jwinarske/vivante-spirv-crash`; this
-# board's defects are numbered VIV-1..6 there, with reproducers for five of the six.
+# board's defects are numbered VIV-1..6 there, and every one of them has a reproducer.
 #
 # `first_pixel` at emblema `3f7f003` against tessella `be402e4`, 49 cases (26 when the
 # table above was taken), one case per process via `TSL_ONLY`, weston stopped:
@@ -384,3 +384,52 @@
 #
 #   instance 0.6135 us a draw, push 0.5691, buffers 0.7043, descriptors 2.0295
 #   vertex fetch 3.310 ns, against 3.312 above -- the same number two weeks apart
+#
+# # The seven remaining segfaults are one driver defect, and it is one token away
+#
+# The table above lists seven cases that still segfault in pipeline creation with the layer
+# on: the four raster cases, `background_pattern`, `fill_extrusion_pattern` and
+# `fill_extrusion_pattern_wall`. They are **one** defect. All seven stop in the same eleven
+# frames, to the instruction address -- `VIR_Operand_SetSymbol` under `vscCompileShader` in
+# `libVSC.so` -- which is the driver's *back end*, not the SPIR-V front end VIV-1 crashes in
+# (`gcSPV_Decode` in `libSPIRV_viv.so`, a different stack entirely). So the earlier reading of
+# the raster four as a separate trigger that exhaustive inlining does not reach is withdrawn:
+# inlining does not reach this one because this one has nothing to do with inlining. Every
+# reproducer for it segfaults identically under `VIV_SPV_INLINE_DISABLE=1`.
+#
+# The trigger, reduced to a 285-word module with a 279-word control: in a **fragment** stage,
+# an `OpCompositeConstruct` whose operand is an `OpCompositeExtract` from a block struct
+# loaded whole, where that struct has **four or more scalar members**. Four conditions, each
+# with a one-token control that builds -- the operand must be the extract itself, something
+# must be constructed from it, four or more scalar members, fragment stage. `splat/` in
+# `jwinarske/vivante-spirv-crash` carries the ladder; this is VIV-4 there, and its "no minimal
+# reproducer exists" is superseded.
+#
+# Which makes every case here one expression away from it. Mutating this crate's own shader
+# text, one body at a time, rebuilt and re-run on the board:
+#
+#   BACKGROUND_PATTERN_BODY           props.mix -> a constant        builds (2026-10-08)
+#   FILL_EXTRUSION_PATTERN_BODY       props.fade -> 0.5              builds and draws
+#   FILL_EXTRUSION_PATTERN_INSTANCED  props.fade -> 0.5              builds
+#   RASTER_BODY                       props.fade_t -> 0.5            still segfaults
+#     ... and vec3<f32>(props.brightness_low/high) -> constants      all four build and draw
+#
+# `mix(vec4, vec4, f32)` makes naga splat the scalar, and `vec3<f32>(props.brightness_low)` is
+# a splat written out: both are a construct whose operand is an extract. Raster needed three
+# substitutions because that body has three of them.
+#
+# And the other direction, which is the part worth remembering: `background` -- the simplest
+# family here and one of the eight that read a *correct* pixel on this part -- segfaults when
+# its fragment stage is written
+#
+#   return props.color * vec4<f32>(props.opacity);   // 1181 words, SEGV
+#
+# instead of
+#
+#   return props.color * props.opacity;              // 1174 words, builds, correct pixel
+#
+# Same value, same arithmetic, seven words apart. **No code change here.** The board is not a
+# target, every passing family already avoids the shape by writing the arithmetic the shorter
+# way, and a rule against building a vector out of a block's scalar would be churn for one
+# driver. What this buys is that the seven are explained and attributed, and that a body
+# written the longer way on purpose would now be recognized rather than investigated.

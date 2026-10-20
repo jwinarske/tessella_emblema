@@ -527,8 +527,10 @@ fn binding_name(type_name: &str) -> String {
 /// Two components, not three. The ABI recorded this attribute as `Float3` until tessella#326; it
 /// is `Short2`, which is what the producer sends and what mbgl's own shader declares --
 /// `vec4(in_position, 0.0, 1.0)`, supplying the third component itself. This body read three
-/// floats from two 16-bit integers for as long as the table said so, and nothing caught it:
-/// the bench that drew with this pipeline writes its own vertices as three floats.
+/// floats from two 16-bit integers for as long as the table said so, and nothing caught it --
+/// nor did anything catch `draw_cost`, which went on declaring a float-three vertex input
+/// against this `vec2<i32>` and drew nothing on any device for it. Its pipeline takes the
+/// format and the stride from the table now.
 pub const BACKGROUND_BODY: &str = r"
 struct Out {
     @builtin(position) clip: vec4<f32>,

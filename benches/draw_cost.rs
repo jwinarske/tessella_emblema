@@ -41,8 +41,9 @@ use std::time::{Duration, Instant};
 use ash::vk;
 use tessella_capture_abi::generated::shader_attributes::BACKGROUND_SHADER;
 use tessella_capture_abi::generated::ubo_layouts::{BACKGROUND_DRAWABLE_UBO, BACKGROUND_PROPS_UBO};
-use tessella_emblema::device::preferred;
+use tessella_emblema::device::{preferred, stride_of, vertex_format};
 use tessella_emblema::shaders::{BACKGROUND_BODY, Paint, module};
+use tessella_emblema::slots;
 use tessella_emblema::surface::Surface;
 
 /// Drawables a recorded frame holds. The sibling's unmerged basemap is 640.
@@ -852,17 +853,29 @@ impl Gpu {
             };
 
             // A triangle over the whole of clip space, so an identity matrix covers the target.
-            put(
-                self.offsets[0],
-                &[-1.0, -1.0, 0.0, 3.0, -1.0, 0.0, -1.0, 3.0, 0.0],
-            );
+            // In the family's declared type, which is `Short2`: the position a background bucket
+            // puts on the wire is integral, and the pipeline binds the format the table names.
+            let corners: [i16; 6] = [-1, -1, 3, -1, -1, 3];
+            let mut corner_bytes = Vec::with_capacity(corners.len() * 2);
+            for value in corners {
+                corner_bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            base.add(self.offsets[0] as usize)
+                .copy_from_nonoverlapping(corner_bytes.as_ptr(), corner_bytes.len());
 
             // Zeros everywhere, which send every vertex to the origin, and an identity in the
-            // one slot under test. The block is 64 bytes of column-major matrix and nothing else.
+            // one slot under test.
+            //
+            // The step between slots is `slots::stride`, not the layout's own size: every block
+            // in the consolidated array is padded to the widest family's stride so that one array
+            // can hold any of them, and `BackgroundDrawableUBO` is one of the eight that differ --
+            // 64 bytes of column-major matrix, 96 of stride. Written at 64 the identity lands
+            // short of the slot the shader reads, which is a zero matrix and no triangle.
+            let stride = u64::from(slots::stride(&BACKGROUND_DRAWABLE_UBO));
             base.add(self.offsets[2] as usize)
-                .write_bytes(0, (u64::from(SLOT) + 1) as usize * 64);
+                .write_bytes(0, ((u64::from(SLOT) + 1) * stride) as usize);
             put(
-                self.offsets[2] + u64::from(slot) * 64,
+                self.offsets[2] + u64::from(slot) * stride,
                 &[
                     1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
                 ],
@@ -1706,6 +1719,15 @@ fn buffers(
 }
 
 /// The pipeline, with the family's own vertex input.
+///
+/// The format and the stride come from the family's declared type rather than being written out
+/// here, because a hard-coded pair goes stale silently. This one did: it said
+/// `R32G32B32_SFLOAT` and stride 12, which is what `AttributeInfo` declared for
+/// `idBackgroundPosVertexAttribute` until tessella#326 took the declared type from the shader
+/// text instead and made it `Short2`. A format whose numeric type differs from the shader's
+/// input is invalid usage -- `VUID-VkGraphicsPipelineCreateInfo-Input-08733` -- and no driver
+/// reports it without the validation layer, so the verification below simply stopped drawing,
+/// on every device. Derived from the table, it cannot drift again.
 fn graphics(
     device: &ash::Device,
     pass: vk::RenderPass,
@@ -1723,15 +1745,17 @@ fn graphics(
             .module(fragment)
             .name(c"fragment_main"),
     ];
+    let declared = BACKGROUND_SHADER[0].declared;
     let bindings = [vk::VertexInputBindingDescription {
         binding: 0,
-        stride: 12,
+        stride: stride_of(declared).ok_or_else(|| format!("no stride for {declared:?}"))?,
         input_rate: vk::VertexInputRate::VERTEX,
     }];
     let attributes = [vk::VertexInputAttributeDescription {
         location: 0,
         binding: 0,
-        format: vk::Format::R32G32B32_SFLOAT,
+        format: vertex_format(declared)
+            .ok_or_else(|| format!("no vertex format for {declared:?}"))?,
         offset: 0,
     }];
     let input = vk::PipelineVertexInputStateCreateInfo::default()

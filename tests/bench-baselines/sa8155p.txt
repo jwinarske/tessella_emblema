@@ -410,3 +410,43 @@
 # kernel in `hillshade_prepare` and a sixteen-tap raster, and sixteen is the count ir3 unrolls.
 # So the 40% in #151 does not describe any shader we ship, and the ALU rate on this part is the
 # same whichever driver draws it.
+#
+# ---------------------------------------------------------------------------
+# # What a first frame costs: 8 to 36 milliseconds a pipeline on the blob (2026-10-20)
+#
+# The sections above measure compilation with shaders of 88 to 358 words, which is a tenth of
+# what this crate emits. `drvprof module <vs.spv> <fs.spv> ...` takes **per-stage** SPIR-V --
+# naga with `PipelineOptions`, one entry point at a time, which is what `pipelines::Stages`
+# does and what the blob requires -- so the figures below are real family modules.
+#
+#   microseconds, per vkCreateGraphicsPipelines, no cache object
+#
+#   family (vertex + fragment words)        blob cold   blob p50   turnip cold   turnip p50
+#   background          (1072 + 946)         9810..14588    8370      3380..6299      5.9
+#   fill_extrusion      (1886 + 1039)       20051..20257   19830      8116..8846      6.2
+#   line_sdf            (2885 + 1810)       34893..36016   30700     14598..14998      6.2
+#
+# **Three to five times what the synthetic shaders suggested.** `line_sdf` is 35 ms a pipeline on
+# the blob -- a single family, compiled once per process, and the blob's p50 equals its cold
+# figure because without a cache object it recompiles every time, and with one the data does not
+# survive the process (the section above).
+#
+# **Turnip compiles the same modules 2.4 to 2.5 times faster** and then answers repeats in 6 us
+# from its in-process cache, with Mesa's disk cache disabled.
+#
+# ## The number that matters
+#
+# `capture_frame` against a real captured frame (`real.tslcap`, a Mercator view of a city) needs
+# **12 pipelines from 7 families**: background, circle, fill, fill_extrusion,
+# fill_extrusion_instanced, fill_outline_triangulated, line. Not the 168 that `pipelines_build`
+# brings up -- `Cache` builds what a frame asks for.
+#
+# So the shader compile before a first frame, on this part:
+#
+#   blob     12 pipelines x 8..35 ms   =  roughly a quarter of a second, every process start,
+#                                        and no cache avoids it
+#   turnip   12 x 3.4..15 ms the first time, then ~0 with a cache persisted to a file
+#
+# A product that starts a map once and runs for hours pays the blob's quarter second at startup
+# and never again. Anything that respawns the renderer pays it every time, and that is the one
+# place in this whole comparison where the two drivers are not close.

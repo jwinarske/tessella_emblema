@@ -26,6 +26,8 @@
         }                                                                             \
     } while (0)
 
+#define REPEATS 15
+
 static double now_us(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -78,6 +80,8 @@ struct gpu {
     VkFramebuffer fb;
     VkDescriptorSetLayout set_layout;
     VkPipelineLayout layout;
+    VkDescriptorSetLayout wide_set_layout;
+    VkPipelineLayout wide_layout;
     VkDescriptorSet set;
     VkQueryPool queries;
     double timestamp_period;   // ns per tick, 0 when timestamps are unusable
@@ -210,6 +214,29 @@ static void open_gpu(struct gpu *g) {
                                          .pSetLayouts = &g->set_layout };
     CHECK(vkAllocateDescriptorSets(g->device, &dsai, &g->set));
 
+    // And a layout wide enough for a real tessella_emblema family: its widest set is six
+    // storage buffers with three sampled images and three samplers, and a layout wider than the
+    // module is valid. Pipeline creation against a layout that does *not* cover the module's
+    // resources is invalid usage, which some drivers answer with a segfault.
+    VkDescriptorSetLayoutBinding wide[14];
+    for (uint32_t i = 0; i < 6; i++)
+        wide[i] = (VkDescriptorSetLayoutBinding){ i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                                  VK_SHADER_STAGE_VERTEX_BIT |
+                                                  VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+    for (uint32_t i = 0; i < 4; i++)
+        wide[6 + i] = (VkDescriptorSetLayoutBinding){ 6 + i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                                                      VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+    for (uint32_t i = 0; i < 4; i++)
+        wide[10 + i] = (VkDescriptorSetLayoutBinding){ 10 + i, VK_DESCRIPTOR_TYPE_SAMPLER, 1,
+                                                       VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+    VkDescriptorSetLayoutCreateInfo wlci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 14, .pBindings = wide };
+    CHECK(vkCreateDescriptorSetLayout(g->device, &wlci, NULL, &g->wide_set_layout));
+    VkPipelineLayoutCreateInfo wplci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                         .setLayoutCount = 1, .pSetLayouts = &g->wide_set_layout };
+    CHECK(vkCreatePipelineLayout(g->device, &wplci, NULL, &g->wide_layout));
+
     if (g->timestamp_period > 0.0) {
         VkQueryPoolCreateInfo qpci = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
                                        .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 };
@@ -316,13 +343,14 @@ static VkShaderModule module_of(struct gpu *g, const char *path) {
 
 // One pipeline from two single-entry-point modules. `tweak` varies a harmless piece of state
 // so a driver cannot hand back a pipeline it built earlier.
-static VkPipeline pipeline_of(struct gpu *g, VkShaderModule vs, VkShaderModule fs, int tweak,
-                              VkPipelineCache cache) {
+static VkPipeline pipeline_of_named(struct gpu *g, VkShaderModule vs, VkShaderModule fs, int tweak,
+                                    VkPipelineCache cache, const char *vs_entry,
+                                    const char *fs_entry, VkPipelineLayout layout) {
     VkPipelineShaderStageCreateInfo stages[2] = {
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "vs_main" },
+          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = vs_entry },
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "fs_main" },
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = fs_entry },
     };
     VkPipelineVertexInputStateCreateInfo vi = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
@@ -351,10 +379,34 @@ static VkPipeline pipeline_of(struct gpu *g, VkShaderModule vs, VkShaderModule f
                                           .pVertexInputState = &vi, .pInputAssemblyState = &ia,
                                           .pViewportState = &vp, .pRasterizationState = &rs,
                                           .pMultisampleState = &ms, .pColorBlendState = &cb,
-                                          .layout = g->layout, .renderPass = g->pass };
+                                          .layout = layout, .renderPass = g->pass };
     VkPipeline p;
     CHECK(vkCreateGraphicsPipelines(g->device, cache, 1, &gpci, NULL, &p));
     return p;
+}
+
+static VkPipeline pipeline_of(struct gpu *g, VkShaderModule vs, VkShaderModule fs, int tweak,
+                              VkPipelineCache cache) {
+    return pipeline_of_named(g, vs, fs, tweak, cache, "vs_main", "fs_main", g->layout);
+}
+
+// What one real family's module pair costs to compile, which the shaders above cannot say:
+// they are 88 to 358 words and a family is one to three thousand.
+static void bench_module(struct gpu *g, const char *vs_path, const char *fs_path) {
+    VkShaderModule vs = module_of(g, vs_path);
+    VkShaderModule fs = module_of(g, fs_path);
+    double create[REPEATS];
+    for (int r = 0; r < REPEATS; r++) {
+        double start = now_us();
+        VkPipeline p = pipeline_of_named(g, vs, fs, r + 1, VK_NULL_HANDLE, "vertex_main",
+                                         "fragment_main", g->wide_layout);
+        create[r] = now_us() - start;
+        vkDestroyPipeline(g->device, p, NULL);
+    }
+    printf("  %-28s %9.1f us cold   %8.1f us p50\n", vs_path, create[0],
+           p50(create + 1, REPEATS - 1));
+    vkDestroyShaderModule(g->device, fs, NULL);
+    vkDestroyShaderModule(g->device, vs, NULL);
 }
 
 // One submitted pass of `draws` draws with `pipeline`, timed on the GPU where timestamps work
@@ -405,8 +457,6 @@ static double one_pass(struct gpu *g, VkPipeline pipeline, int draws, int vertic
     }
     return wall;
 }
-
-#define REPEATS 15
 
 static void bench_pipelines(struct gpu *g) {
     const char *names[] = { "fs-const", "fs-alu", "fs-tex" };
@@ -624,6 +674,12 @@ int main(int argc, char **argv) {
     int all = strcmp(what, "all") == 0;
     if (all || !strcmp(what, "pipeline")) bench_pipelines(&g);
     if (all || !strcmp(what, "cache")) bench_cache(&g, cache_path);
+    if (!strcmp(what, "module")) {
+        // Pairs of per-stage modules from this crate's own families, emitted by naga one entry
+        // point at a time -- which is what the Adreno blob requires and what `pipelines::Stages`
+        // does. Named on the command line, vertex then fragment.
+        for (int i = 2; i + 1 < argc; i += 2) bench_module(&g, argv[i], argv[i + 1]);
+    }
     if (all || !strcmp(what, "record")) bench_record(&g);
     if (all || !strcmp(what, "submit")) bench_submit(&g);
     if (all || !strcmp(what, "fill")) {

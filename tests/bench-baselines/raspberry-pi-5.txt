@@ -234,3 +234,49 @@
 #
 # Identical to the Adreno 640's six, including the 168 and the 252/84 -- so the cache's reuse
 # arithmetic is the library's and not a driver's.
+
+# ---------------------------------------------------------------------------
+# # Every other bench, on the gating target (2026-10-20)
+#
+# Three of this crate's seventeen benches had ever been recorded on hardware -- `draw_cost`,
+# `first_pixel` and, as of today, `pipelines_build`. Twelve more run here without an input of
+# their own, and all twelve pass on V3D 7.1.7.0. Load average 0.08, nothing else running.
+#
+#   a_frame             3 batches, 4 drawables, 4 draws, 0 unclipped, both passes
+#                       20 records, 2 masks, 8 uploads; 1280 texels a half, 1024 in the band
+#   a_mesh              2016 texels of about 2048, 75% on the left; 1520 of 2016 either side
+#   block_buffers       nine checks: zeroed, scattered, merged, overwritten, forgotten, separate
+#   clip_masks          2048 of 4096 texels in the masked half; the wrong reference draws nothing
+#   depth_bands         the upper layer wins in both draw orders; translucent keeps both
+#   descriptor_layouts  84 set and pipeline layouts resident at once
+#   descriptor_sets     84 sets from one pool, widest 12 bindings; eight refusals leave nothing
+#   geometry_store      768 bytes for 136 claimed; dedup to one buffer; 3 bindings, 1 handle
+#   hand_off            64x64 BGRA blue every texel, GENERAL, a ring of three with no bleed
+#   instance_fetch      firstInstance moves the attribute element *and* the builtin, 0..3
+#   texture_images      3 rects placed, 50 texels left clear; staging reused at 4160 then 5440
+#   two_passes          16 records, the child recorded first, 4096 texels of the child's color
+#
+# **`a_frame` is the one worth having.** It is the only bench that starts from bytes on a ring and
+# ends at pixels -- decode, join, batch, plan, upload, partition, record -- and its assertion is
+# about clipping, which no single-drawable check reaches. It had never run on a board. It passes
+# here, which says the join and the stencil work on the gating target and not only on a desktop.
+#
+# `instance_fetch` passing here is the other one: it confirms on this part what
+# `first-instance-moves-the-fetch` claims, that `firstInstance` addresses the instance-rate
+# attribute fetch as well as the builtin, so a per-draw slot cannot ride it.
+#
+# # The headroom is two now, not three
+#
+#   headroom   6 storage of 8 allowed, 10 bindings (fill_extrusion_pattern_instanced on Terrain)
+#              images 2 of 16, samplers 2 of 24, resources 128
+#
+# `descriptor_layouts` reports the widest set this crate builds against the device's own limits.
+# The widest is `fill_extrusion_pattern_instanced` on `Terrain` at **6 storage descriptors**, and
+# V3D's `maxPerStageDescriptorStorageBuffers` is **8**. That is two of headroom, where the earlier
+# measurement behind `descriptor-limits-are-unenforced` found three: a family has grown by one
+# storage buffer since. The same bench on a desktop reports the same 6, against a limit of
+# 8,388,606 -- so the 6 is this crate's and the 8 is the gating target's.
+#
+# **And nothing would tell us if we crossed it**: `within the limits` records that 9 of 8 was
+# accepted on this very device. One more storage buffer in the widest family reaches the limit;
+# two more pass it, and the only sign would be a driver that happens to care.

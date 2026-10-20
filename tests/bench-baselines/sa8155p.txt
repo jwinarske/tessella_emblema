@@ -138,3 +138,96 @@
 # an integrated part -- and the probe opens it through `TSL_VULKAN_LIB` as `draw_cost` does.
 #
 # Compare `imx8mp.txt`, where 2 of the same 24 build.
+
+# ---------------------------------------------------------------------------
+# # The board draws again, on Mesa's turnip rather than the blob (2026-10-20)
+#
+# #144 records that no bench in this tree can open a device here: `benches/common` asks for
+# `VkPhysicalDeviceVulkan13Features::dynamicRendering`, and Qualcomm's driver is Vulkan
+# 1.1.128 with neither the feature nor `VK_KHR_dynamic_rendering`. That is still true of the
+# blob, and the blob cannot be rebuilt -- it is a vendor binary from the SA8155 BSP, not in
+# AOSP and not open.
+#
+# Mesa's open driver for this part can be built, and it has what the blob lacks:
+#
+#   device                Turnip Adreno (TM) 640
+#   api                   1.3.363          (blob: 1.1.128)
+#   driverInfo            Mesa 27.0.0-devel (git-7f13762f3f)
+#   device extensions     162              (blob: 77)
+#   dynamicRendering      YES              (blob: absent, feature and extension both)
+#   vkCreateDevice        SUCCESS with the exact feature struct the benches ask for
+#   wideLines             no, lineWidthRange 1.0..1.0
+#
+# ## first_pixel: 48 measured, 48 correct
+#
+# Every family in the 49-case probe draws the pixel the oracle derived, through the library's
+# own pass rather than the probe's old Vulkan. The 2026-10-03 run above was 24 of 24 with the
+# blob and a render pass the probe owned; this is twice the cases and none of its own Vulkan.
+#
+# The 49th, `fill_outline_at_two`, is **not measurable** here rather than wrong: it samples
+# the row below the line's own, which only the second pixel of mbgl's two-pixel outline
+# covers, and `device::line_width` falls back to one pixel on a device that reports no
+# `wideLines`. The probe says so now instead of failing -- both gate devices have the
+# feature, and this is the first device here that does not. The other two line cases sample
+# the line's own row and pass.
+#
+# ## pipelines_build: all six checks
+#
+#   depth-stencil format  D24_UNORM_S8_UINT
+#   every pipeline        168 pipelines, all resident at once
+#   the cache reuses      252 asks, 84 built, 168 modules
+#   a handle per stage    two handles, vertex then fragment
+#
+# That last line is #139's per-stage split running on Adreno 640 **hardware**, which is new.
+# It is not a verification of what #139 fixed: the blob is what refuses one module for two
+# stages, and turnip does not, so the arrangement is exercised rather than tested here.
+#
+# ## draw_cost under turnip, against the blob's own numbers
+#
+#                     record p50              per draw
+# shape            blob    turnip        blob    turnip
+# instance        736.1     573.6      1.1502    0.8962
+# push           1080.6     829.3      1.6885    1.2958
+# buffers        1350.0    1027.5      2.1094    1.6055
+# descriptors    1698.3    1366.1      2.6536    2.1345
+#
+# All in microseconds, 640 drawables a frame, 60 frames a shape. Turnip records every shape
+# cheaper than the blob, by a fifth or so, and the ordering of the four is identical. Not a
+# clean comparison -- load average was 13 for the blob's run and 11.6 for this one, on a
+# board that is never idle -- but the gap is the same sign and size across all four rows.
+# `firstInstance` reaches the shader (slot 613), and the vertex-fetch delta is 0.0 ns.
+#
+# ## What this does not say
+#
+# **Nothing about the vendor stack.** Both findings this board forced -- no `mat4x4` in a
+# storage buffer, and one entry point per SPIR-V module -- are the blob's, and turnip accepts
+# what the blob refused. A run here says the shaders and the library are right on Adreno 640
+# hardware; it does not re-test the driver that ships on it.
+#
+# ## How the driver was built
+#
+# Mesa main, cross-compiled for the board's glibc 2.31 sysroot, Vulkan driver only:
+#
+#   meson setup build-a640 --cross-file a640.ini -Dbuildtype=release \
+#     -Dvulkan-drivers=freedreno -Dgallium-drivers= -Dfreedreno-kmds=kgsl \
+#     -Dplatforms= -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dopengl=false \
+#     -Dllvm=disabled -Dshared-glapi=disabled -Dgles1=disabled -Dgles2=disabled
+#
+# **`kgsl`, not `msm`.** The GPU here is only on `/dev/kgsl-3d0`; `/dev/dri/renderD128` is
+# `msm_drm` for the *display* controller (`qcom,mdss_mdp`, `sde-kms`), so there is no msm DRM
+# node for the GPU and turnip's msm backend has nothing to open.
+#
+# The loader matters too: the board's is 1.2.198, so an instance asking for 1.3 fails
+# whatever the ICD reports. Vulkan-Loader built from source alongside it (1.4.365) is what
+# makes the 1.3 instance work. Both go in /tmp with the ICD json, which is where this board
+# allows exec, and the run is
+#
+#   LD_LIBRARY_PATH=/tmp/turnip VK_ICD_FILENAMES=/tmp/turnip/freedreno_icd.json ./first_pixel
+#
+# Three shims were needed because the host's bare aarch64 cross toolchain has no target libc
+# or libstdc++ of its own and the staged ones are newer than the board's glibc 2.31: a
+# `libatomic_asneeded` linker script, a `libgcc.a` script pulling a real `libgcc_eh.a` beside
+# it, and an object defining `__libc_single_threaded`, the `__isoc23_*` redirects and
+# `_dl_find_object` -- the last returning -1 so the unwinder takes its pre-2.35 path. None of
+# them is turnip's doing; they are what cross-building a 2026 toolchain against a 2020 glibc
+# costs.

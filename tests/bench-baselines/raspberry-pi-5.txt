@@ -118,6 +118,9 @@
 # present.
 #
 # llvmpipe would also pass all 24 cases, so a software fallback is invisible in the pixels.
+#
+# (Those 24 are the probe as it stood on 2026-10-03. It has 49 cases now, and the section at
+# the end of this file is the current run.)
 
 # ---------------------------------------------------------------------------
 # # `tools/drvprof` on V3DV (2026-10-20)
@@ -183,3 +186,51 @@
 # Recording a draw costs more here than under turnip and less than under the blob, on a slower
 # CPU than either -- so it is the driver's work and not the core's. Binding a descriptor set is
 # half what either Adreno driver charges.
+
+# ---------------------------------------------------------------------------
+# # `first_pixel` is 49 of 49 here, and the 24-case record above was two weeks stale
+#
+# Re-run 2026-10-20, emblema `c33f968`: every case in the probe passes on the gating target,
+# and **25 of them had never run on it** -- the section above predates the raised surfaces,
+# both terrain cases, the two extrusion walls, three of the four pattern variants, the symbol
+# and text-and-icon cases, `circle_constant`, `drawable_at_one`, `fill_no_color`, `hillshade`
+# and `color_relief`. The right time to find that out is not the next time this board is the
+# only one left.
+#
+#   49 cases: ok, 37 pipelines from 66 module handles, 49 binds
+#
+#   fill [0,0,255,255]  fill_near_half [0,0,255,255]  fill_no_color [51,102,153,255]
+#   fill_constant [138,107,46,153]  fill_past_a_gap [184,143,61,204]  drawable_at_one [0,0,255,255]
+#   background [0,0,255,255]  background_blended [0,0,255,255]  background_faded [0,0,240,240]
+#   background_faded_over [3,6,249,255]  fill_outline [255,255,255,255]  fill_outline_feathered [215,215,215,215]
+#   fill_outline_at_two [40,40,40,40]  fill_extrusion [255,115,12,255]  fill_extrusion_raised [255,115,12,255]
+#   extrusion_dim [125,125,125,255]  extrusion_wall [12,213,255,255]  extrusion_wall_dim [8,149,255,255]
+#   fill_extrusion_pattern [54,27,143,191]  fill_extrusion_pattern_wall [38,19,100,191]  raster [64,32,64,64]
+#   raster_interleaved [64,32,64,64]  raster_adjusted [54,37,87,255]  heatmap_texture [128,64,0,128]
+#   color_relief [10,90,55,128]  symbol_sdf [200,100,50,255]  symbol_below [0,0,0,0]
+#   hillshade_prep [194,144,255,255]  hillshade [95,47,24,118]  heatmap [80,255,255,255]
+#   background_pattern [48,24,64,64]  fill_pattern [48,24,64,64]  fill_pattern_at_one [48,24,64,64]
+#   fill_pattern_constant [48,24,64,64]  fill_outline_pattern [96,48,128,128]  line_pattern [32,16,64,64]
+#   line_sdf [151,76,0,151]  line_gradient [144,36,191,191]  symbol_icon [40,20,64,64]
+#   both_as_icon [40,20,64,64]  both_as_glyph [100,50,25,64]  fill_on_globe [0,255,255,255]
+#   fill_anchored [255,255,0,255]  fill_raised [255,0,255,255]  raster_raised_skirt [32,16,64,64]
+#   terrain [51,153,204,255]  terrain_skirt [204,102,51,255]  circle [0,255,0,255]
+#   circle_constant [31,122,69,153]
+#
+# **All 49 measured, none skipped**, which is itself a result: `fill_outline_at_two` samples the
+# row below a line's own and needs mbgl's two-pixel outline, so it is reported "not measurable"
+# on a device without `wideLines`. V3D has the feature -- `lineWidthRange` 1 to 32 -- and the
+# Adreno 640 has it under neither of its drivers, so that skip is the part and not the driver.
+#
+# # `pipelines_build` here too, which nothing had recorded
+#
+#   depth-stencil format  D24_UNORM_S8_UINT
+#   every pipeline        ok   168 pipelines, all resident at once
+#   a bogus location      ok   an input the module lacks was accepted
+#   an unbound input      ok   a module input with no description was accepted
+#   the cache reuses      ok   252 asks, 84 built, 168 modules
+#   a stride differs      ok   two pipelines, one text
+#   a handle per stage    ok   two handles, vertex then fragment
+#
+# Identical to the Adreno 640's six, including the 168 and the 252/84 -- so the cache's reuse
+# arithmetic is the library's and not a driver's.
